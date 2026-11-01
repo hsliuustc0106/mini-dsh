@@ -4,12 +4,34 @@ import { dirname, isAbsolute } from 'node:path'
 import { acquireWriter, lockPathFor } from './lock.js'
 import { assertEvent, createEvent, readSession, unknownOutcomes, unknownReason } from './log.js'
 
+export function validateArguments(schema, value) {
+  if (!schema || schema.type !== 'object') throw new Error('Tool schema must be an object')
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Tool arguments must be an object')
+  const properties = schema.properties ?? {}
+  for (const name of schema.required ?? []) {
+    if (!Object.hasOwn(value, name) || value[name] == null) throw new Error(`${name} is required`)
+  }
+  if (schema.additionalProperties === false) {
+    for (const key of Object.keys(value)) {
+      if (!Object.hasOwn(properties, key)) throw new Error(`${key} is not allowed`)
+    }
+  }
+  for (const [key, spec] of Object.entries(properties)) {
+    if (!Object.hasOwn(value, key) || !spec?.type) continue
+    if (typeof value[key] !== spec.type) throw new Error(`${key} must be a ${spec.type}`)
+  }
+}
+
 export class Tools extends Service {
   constructor(ctx) { super(ctx, 'tools'); this.items = new Map() }
   register(tool) {
+    if (typeof tool?.name !== 'string' || !tool.name) throw new Error('Tool name is required')
+    if (typeof tool.description !== 'string') throw new Error(`Tool ${tool.name} needs a description`)
+    if (!tool.parameters || tool.parameters.type !== 'object') throw new Error(`Tool ${tool.name} needs an object schema`)
+    if (typeof tool.execute !== 'function') throw new Error(`Tool ${tool.name} needs execute`)
     if (this.items.has(tool.name)) throw new Error(`Duplicate tool: ${tool.name}`)
     this.items.set(tool.name, tool)
-    return () => this.items.delete(tool.name)
+    return () => { if (this.items.get(tool.name) === tool) this.items.delete(tool.name) }
   }
   schemas() {
     return [...this.items.values()].map(({ name, description, parameters }) => ({
@@ -19,6 +41,7 @@ export class Tools extends Service {
   async run(name, args) {
     const tool = this.items.get(name)
     if (!tool) throw new Error(`Unknown tool: ${name}`)
+    validateArguments(tool.parameters, args)
     return tool.execute(args)
   }
 }
@@ -259,19 +282,30 @@ export class Checkpoint extends Service {
   }
 }
 
+// Providers register here. Each prepare() is one dispatch of a JSON body.
+// The body is what gets recorded and sent. Credentials never belong in it.
 export class Model extends Service {
-  constructor(ctx, config) { super(ctx, 'model'); this.config = config }
-  async complete(messages, tools) {
-    const { key, baseURL, model } = this.config
-    if (!key) throw new Error('Set DEEPSEEK_API_KEY before sending a message')
-    const response = await fetch(`${baseURL.replace(/\/$/, '')}/chat/completions`, {
-      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model, messages, ...(tools.length ? { tools } : {}) }),
-    })
-    if (!response.ok) throw new Error(`Model HTTP ${response.status}: ${(await response.text()).slice(0, 2000)}`)
-    const data = await response.json()
-    const message = data.choices?.[0]?.message
-    if (!message || message.role !== 'assistant') throw new Error('Model returned an invalid response')
-    return message
+  constructor(ctx) { super(ctx, 'model'); this.providers = new Map() }
+  register(provider) {
+    if (typeof provider?.name !== 'string' || !provider.name) throw new Error('Provider name is required')
+    if (typeof provider.prepare !== 'function' || typeof provider.dispatch !== 'function') throw new Error('Provider needs prepare and dispatch')
+    if (this.providers.has(provider.name)) throw new Error(`Duplicate provider: ${provider.name}`)
+    this.providers.set(provider.name, provider)
+    return () => { if (this.providers.get(provider.name) === provider) this.providers.delete(provider.name) }
+  }
+  prepare(input) {
+    if (this.providers.size !== 1) throw new Error('A single model provider is required')
+    const provider = [...this.providers.values()][0]
+    const body = structuredClone(provider.prepare(input))
+    let used = false
+    return {
+      provider: provider.name,
+      body,
+      dispatch() {
+        if (used) throw new Error('Prepared model call was already used')
+        used = true
+        return provider.dispatch(structuredClone(body))
+      },
+    }
   }
 }

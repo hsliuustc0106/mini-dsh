@@ -39,26 +39,32 @@ export function assertEvent(event, seq) {
   if (event.time != null && typeof event.time !== 'string') throw corrupt('time must be a string')
 }
 
-// Pending tool starts are not corrupt. A finish with no start, or a new
-// conversation message while a tool is still open, is.
+// A model tool call is open from the assistant message until its tool result.
+// An execution is open from tool.started until tool.finished. Either one still
+// open is an unknown outcome. This does not invent the missing record.
 export function unknownOutcomes(events) {
-  const pending = new Map()
+  const conversation = new Set()
+  const execution = new Set()
   for (const event of events) {
     if (event.type === 'tool.started') {
-      pending.set(event.callId, event.callId)
+      if (execution.has(event.callId)) throw corrupt(`tool already started (${event.callId})`)
+      execution.add(event.callId)
     } else if (event.type === 'tool.finished') {
-      if (!pending.delete(event.callId)) throw corrupt(`tool result without a start (${event.callId})`)
+      if (!execution.delete(event.callId)) throw corrupt(`tool result without a start (${event.callId})`)
     } else if (event.type === 'message') {
       const message = event.message
       if (message.role === 'assistant' && message.tool_calls?.length) {
-        if (pending.size) throw corrupt('unresolved tool calls')
-        for (const call of message.tool_calls) pending.set(call.id, call.id)
+        if (conversation.size || execution.size) throw corrupt('unresolved tool calls')
+        for (const call of message.tool_calls) {
+          if (conversation.has(call.id)) throw corrupt('duplicate tool call')
+          conversation.add(call.id)
+        }
       } else if (message.role === 'tool') {
-        if (!pending.delete(message.tool_call_id)) throw corrupt('unexpected tool result')
-      } else if (pending.size) throw corrupt('unresolved tool calls')
+        if (!conversation.delete(message.tool_call_id)) throw corrupt('unexpected tool result')
+      } else if (conversation.size || execution.size) throw corrupt('unresolved tool calls')
     }
   }
-  return [...pending.keys()]
+  return [...new Set([...conversation, ...execution])]
 }
 
 export function unknownReason(callIds) {

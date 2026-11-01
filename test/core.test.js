@@ -3,10 +3,11 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Context, Service } from '@deepseek-ai/cordis'
-import { Agent } from '../src/agent.js'
+import { Context } from '@deepseek-ai/cordis'
+import { boot } from '../src/boot.js'
 import { coding } from '../src/coding.js'
-import { Checkpoint, Session, Tools } from '../src/services.js'
+import { fakeProvider } from '../src/provider.js'
+import { Session, Tools, Workspace } from '../src/services.js'
 
 const tick = () => new Promise(setImmediate)
 
@@ -21,52 +22,61 @@ async function ready(fibers) {
 
 test('Cordis removes tool effects and reactivates consumers when dependencies return', async () => {
   const ctx = new Context()
+  const workspace = ctx.plugin(Workspace, { root: tmpdir() })
   const codingFiber = ctx.plugin(coding)
   const first = ctx.plugin(Tools)
-  await tick()
+  await ready([workspace, codingFiber, first])
   assert.equal(ctx.tools.schemas().length, 4)
+  assert.throws(() => ctx.tools.register({
+    name: 'read', description: 'again', parameters: { type: 'object', properties: {} }, execute() {},
+  }), /Duplicate tool: read/)
+  await assert.rejects(ctx.tools.run('read', { path: 1 }), /path must be a string/)
+  await assert.rejects(ctx.tools.run('read', {}), /path is required/)
+  await assert.rejects(ctx.tools.run('read', { path: 'a', extra: true }), /extra is not allowed/)
+  await assert.rejects(ctx.tools.run('read', null), /must be an object/)
+  const remove = ctx.tools.register({
+    name: 'extra', description: 'n', parameters: { type: 'object', properties: {}, additionalProperties: false },
+    execute() { throw new Error('ran') },
+  })
+  await assert.rejects(ctx.tools.run('extra', { nope: 1 }), /nope is not allowed/)
+  remove()
+  await assert.rejects(ctx.tools.run('extra', {}), /Unknown tool: extra/)
   await first.dispose()
   assert.equal(ctx.tools, undefined)
   const second = ctx.plugin(Tools)
-  await tick()
+  await ready([codingFiber, second])
   assert.equal(ctx.tools.schemas().length, 4)
   await codingFiber.dispose()
   assert.equal(ctx.tools.schemas().length, 0)
   await second.dispose()
+  await workspace.dispose()
 })
 
 test('agent records a tool call and replays the resulting history', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'mini-agent-'))
-  const path = join(dir, 'session.jsonl'), file = join(dir, 'example.txt')
-  await writeFile(file, 'hello')
-  const seen = []
-  class FakeModel extends Service {
-    constructor(ctx) { super(ctx, 'model') }
-    async complete(messages) {
-      seen.push(structuredClone(messages))
-      return seen.length === 1
-        ? { role: 'assistant', content: null, tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'read', arguments: JSON.stringify({ path: file }) } }] }
-        : { role: 'assistant', content: 'done' }
-    }
-  }
-  const ctx = new Context()
-  const fibers = [ctx.plugin(Agent), ctx.plugin(coding), ctx.plugin(Tools), ctx.plugin(Session, { path }), ctx.plugin(Checkpoint), ctx.plugin(FakeModel)]
-  const reader = new Context()
-  let readerFiber
+  await writeFile(join(dir, 'example.txt'), 'hello')
+  const provider = fakeProvider([
+    { role: 'assistant', content: null, tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'read', arguments: JSON.stringify({ path: 'example.txt' }) } }] },
+    { role: 'assistant', content: 'done' },
+  ])
+  const app = await boot({ workspace: dir, provider })
   try {
-    await ready(fibers)
-    await ctx.agent.turn('Read the file')
-    assert.equal(seen[1].at(-1).content, 'hello')
-    const events = (await readFile(path, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
-    assert.deepEqual(events.map((event) => event.seq), [1, 2, 3, 4])
-    assert.deepEqual(events.map((event) => event.message.role), ['user', 'assistant', 'tool', 'assistant'])
-    assert.deepEqual(ctx.session.messages.map((message) => message.role), ['user', 'assistant', 'tool', 'assistant'])
-    readerFiber = reader.plugin(Session, { path, writable: false })
-    await ready([readerFiber])
-    assert.deepEqual(reader.session.messages, ctx.session.messages)
+    await app.ctx.agent.turn('Read the file')
+    assert.equal(provider.sent[1].messages.at(-1).content, 'hello')
+    const events = app.ctx.session.events
+    const started = events.find((event) => event.type === 'tool.started')
+    const finished = events.find((event) => event.type === 'tool.finished')
+    assert.equal(started.callId, 'call-1')
+    assert.equal(started.workspace, dir)
+    assert.equal(finished.result, 'hello')
+    assert.ok(started.seq < finished.seq)
+    assert.ok(finished.seq < events.find((event) => event.message?.role === 'tool').seq)
+    assert.deepEqual(app.ctx.session.messages.map((message) => message.role), ['user', 'assistant', 'tool', 'assistant'])
+    const reader = await boot({ workspace: dir, writable: false, provider: fakeProvider([]) })
+    try { assert.deepEqual(reader.ctx.session.messages, app.ctx.session.messages) }
+    finally { await reader.dispose() }
   } finally {
-    if (readerFiber) await readerFiber.dispose()
-    await Promise.all(fibers.map((fiber) => fiber.dispose()))
+    await app.dispose()
     await rm(dir, { recursive: true, force: true })
   }
 })
@@ -84,27 +94,25 @@ test('keeps an interrupted tool call readable and refuses to continue it', async
   } finally { await fiber.dispose(); await rm(dir, { recursive: true, force: true }) }
 })
 
-test('model adapter sends the conversation and tool schemas over HTTP', async () => {
-  const { createServer } = await import('node:http')
+test('a prepared provider call is one-use and leaves with its plugin', async () => {
   const { Model } = await import('../src/services.js')
-  let requestBody, authorization
-  const server = createServer(async (request, response) => {
-    authorization = request.headers.authorization
-    let body = ''
-    for await (const chunk of request) body += chunk
-    requestBody = JSON.parse(body)
-    response.setHeader('content-type', 'application/json')
-    response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'hello' } }] }))
-  })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const ctx = new Context()
-  const fiber = ctx.plugin(Model, { key: 'test-key', baseURL: `http://127.0.0.1:${server.address().port}`, model: 'test-model' })
+  const model = ctx.plugin(Model)
+  const plugin = fakeProvider([{ role: 'assistant', content: 'one' }])
+  const fiber = ctx.plugin(plugin)
   try {
-    await tick()
-    const result = await ctx.model.complete([{ role: 'user', content: 'hi' }], [{ type: 'function', function: { name: 'read' } }])
-    assert.equal(result.content, 'hello')
-    assert.equal(authorization, 'Bearer test-key')
-    assert.equal(requestBody.model, 'test-model')
-    assert.equal(requestBody.tools[0].function.name, 'read')
-  } finally { await fiber.dispose(); await new Promise((resolve) => server.close(resolve)) }
+    await ready([model, fiber])
+    const prepared = ctx.model.prepare({
+      instructions: ['Stay'], context: [{ workspace: '/work' }], messages: [{ role: 'user', content: 'hi' }], tools: [],
+    })
+    assert.equal(prepared.provider, 'fake')
+    assert.deepEqual(prepared.body.instructions, ['Stay'])
+    assert.equal(JSON.stringify(prepared.body).includes('secret'), false)
+    assert.equal((await prepared.dispatch()).content, 'one')
+    assert.deepEqual(plugin.sent[0], prepared.body)
+    await assert.rejects(async () => prepared.dispatch(), /already used/)
+    assert.throws(() => ctx.model.register({ name: 'fake', prepare: () => ({}), dispatch() {} }), /Duplicate provider: fake/)
+    await fiber.dispose()
+    assert.throws(() => ctx.model.prepare({ instructions: [], context: [], messages: [], tools: [] }), /single model provider/)
+  } finally { await model.dispose() }
 })

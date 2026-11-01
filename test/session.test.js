@@ -248,6 +248,49 @@ test('recovers a valid prefix, preserves an incomplete tail, and refuses corrupt
   await rm(dir, { recursive: true, force: true })
 })
 
+test('a recorded tool finish without a tool message stays read-only and is not completed', async () => {
+  const dir = await workspace()
+  const path = join(dir, 'session.jsonl')
+  const lines = [
+    { seq: 1, type: 'message', time: 't', message: { role: 'assistant', content: null, tool_calls: [{ id: 'c1' }] } },
+    { seq: 2, type: 'tool.started', time: 't', callId: 'c1', name: 'shell' },
+    { seq: 3, type: 'tool.finished', time: 't', callId: 'c1', result: 'maybe' },
+  ]
+  const body = lines.map((event) => JSON.stringify(event)).join('\n') + '\n'
+  await writeFile(path, body)
+  const opened = await openSession(path, { writable: true })
+  try {
+    assert.equal(opened.session.writable, false)
+    assert.deepEqual(opened.session.unknown, ['c1'])
+    assert.equal(opened.session.events.length, 3)
+    await assert.rejects(opened.session.append({ role: 'tool', tool_call_id: 'c1', content: 'maybe' }), /unknown tool outcome/)
+    assert.equal(await readFile(path, 'utf8'), body)
+  } finally { await opened.close(); await rm(dir, { recursive: true, force: true }) }
+})
+
+test('a finished tool transcript with a start and a tool message stays writable', async () => {
+  const dir = await workspace()
+  const path = join(dir, 'session.jsonl')
+  const { session, close } = await openSession(path)
+  try {
+    await session.append({ role: 'user', content: 'hi' })
+    await session.append({ type: 'model.request', provider: 'fake', body: { model: 'fake' } })
+    await session.append({ role: 'assistant', content: null, tool_calls: [{ id: 'c1' }] })
+    await session.append({ type: 'permission.decided', callId: 'c1', name: 'read', workspace: dir, decision: 'allow' })
+    await session.append({ type: 'tool.started', callId: 'c1', name: 'read', workspace: dir })
+    await session.append({ type: 'tool.finished', callId: 'c1', result: 'ok' })
+    await session.append({ role: 'tool', tool_call_id: 'c1', content: 'ok' })
+    await session.append({ role: 'assistant', content: 'done' })
+    assert.deepEqual(session.messages.map((message) => message.role), ['user', 'assistant', 'tool', 'assistant'])
+  } finally { await close() }
+  const again = await openSession(path)
+  try {
+    assert.equal(again.session.writable, true)
+    assert.deepEqual(again.session.unknown, [])
+    assert.equal(again.session.messages.at(-1).content, 'done')
+  } finally { await again.close(); await rm(dir, { recursive: true, force: true }) }
+})
+
 test('an unknown tool outcome stays read-only after the writer lock is free', async () => {
   const dir = await workspace()
   const path = join(dir, 'session.jsonl')

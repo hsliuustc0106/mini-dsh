@@ -4,18 +4,17 @@ A small coding agent for studying [Cordis](https://github.com/cordiverse/cordis)
 
 ## Run
 
-Requires Node.js 22.13 or newer. `node:sqlite` must stay enabled, which is the default; `--no-experimental-sqlite` disables the session writer lock. A DeepSeek API key is required only when a turn calls the model.
+Requires Node.js 22.13 or newer. `node:sqlite` must stay enabled, which is the default; `--no-experimental-sqlite` disables the session writer lock. This slice does not call DeepSeek. A turn uses the prepared fake provider; the live provider is a later slice.
 
 ```sh
 npm install
-export DEEPSEEK_API_KEY='your-key'
 export MINI_WORKSPACE="$(pwd)"   # absolute directory; this is the default
 npm start
 ```
 
-`MINI_WORKSPACE` is the required absolute workspace. It is where a session starts. It does not confine filesystem or shell access. A relative path is rejected. `MINI_SESSION` selects the JSONL log. A relative session path is resolved against the workspace, and the default is `.mini-session.jsonl` inside it. `DEEPSEEK_MODEL` defaults to `deepseek-chat`; `DEEPSEEK_BASE_URL` defaults to `https://api.deepseek.com`.
+`MINI_WORKSPACE` is the required absolute workspace. It is where a session starts. Relative file paths resolve against it, and shell commands use it as their working directory. It does not confine filesystem or shell access. A relative workspace path is rejected. `MINI_SESSION` selects the JSONL log. A relative session path is resolved against the workspace, and the default is `.mini-session.jsonl` inside it.
 
-The log contains conversation and tool output, which may include sensitive data. Keep it private. The system prompt is defined in `src/agent.js`. Type `/quit` to exit. The terminal waits for a complete model response before printing it. The agent can read, overwrite, edit, and execute commands with your user account's permissions; use a disposable workspace when experimenting.
+The log contains conversation and tool output, which may include sensitive data. Keep it private. Ordered prompt plugins supply the system prompt and the runtime context. Type `/quit` to exit. The terminal waits for a complete model response before printing it. Read is allowed. Each write, edit, and shell call asks for that exact call; without an approval handler the call is denied. This terminal does not grant approval yet. An approved shell command runs with your user account's permissions. The workspace is its working directory, not a sandbox. Use a disposable directory when experimenting.
 
 ## Composition and boot
 
@@ -32,7 +31,9 @@ The log is append-only JSONL. Each complete line is one object with a `seq` star
 - `history(after)` returns events with `seq > after`. `follow(after, listener)` delivers that prefix and then live events with no gap and no duplicate. Pass the last sequence you observed to reconnect. `refresh()` pulls records committed by a writer in another process.
 - Events are written before they are published. A failed write is not published.
 
-Checkpoints go through the `checkpoint` service. `commit()` appends one event. `guard(event, work)` runs `work` only after that write completes. A failed write blocks later commits in the process. The durability target is an agent-process crash while the operating system keeps running: the write syscall returning is the checkpoint. This does not promise durability across power loss or a kernel crash.
+A turn also records `model.request` (the provider body, with no credentials), `permission.decided` (the workspace, the exact arguments, and allow or deny), `tool.started` before the tool body, and `tool.finished` with the observed result. Opening a session does not fill in a missing result.
+
+Checkpoints go through the `checkpoint` service. `commit()` appends one event. `guard(event, work)` runs `work` only after that write completes. The agent guards each tool start, so the body does not run until `tool.started` is durable. A failed write blocks later commits in the process and does not invent a tool result. The durability target is an agent-process crash while the operating system keeps running: the write syscall returning is the checkpoint. This does not promise durability across power loss or a kernel crash.
 
 ## Writer lock
 
@@ -50,10 +51,13 @@ Limitations:
 
 ## Study the core
 
-1. `src/composition.js` selects plugins. `src/main.js` boots that composition.
-2. `src/services.js` defines the workspace, model, tool registry, checkpoint policy, and session. The agent builds model messages from message events.
-3. `src/coding.js` registers tools with `ctx.effect`. Disposing that plugin removes its tools.
-4. `src/agent.js` depends on the model, tools, session, and checkpoint. It records an assistant tool call before running it and the result afterwards. Cordis deactivates it if a required service disappears and reactivates it when the service returns.
-5. `test/core.test.js`, `test/session.test.js`, and `test/boot.test.js` exercise disposal, replay, the writer lock, recovery, and boot. Run `npm test`. No API key is required.
+1. `src/composition.js` selects plugins. `src/main.js` boots that composition. Shutdown disposes consumers first, so a turn can record a known outcome before the session releases its writer lock.
+2. `src/services.js` defines the workspace, the model provider registry, the tool registry, the checkpoint policy, and the session. The agent builds model messages from message events.
+3. `src/coding.js` registers read, write, edit, and shell with `ctx.effect`. Relative paths and the shell working directory come from the boot workspace. Disposing that plugin removes its tools.
+4. `src/prompt.js` collects ordered instruction and runtime-context contributions for the life of the plugin that added them. Context describes the workspace and the permission policy. It does not enforce them.
+5. `src/permissions.js` allows read, asks for each exact write, edit, or shell call, and denies unknown tools. Only an answer of `true` is a grant. Approval is not a sandbox.
+6. `src/provider.js` registers the fake provider. Each model call is prepared once. The prepared body is the request that will be sent.
+7. `src/agent.js` runs one turn at a time. It records that body before dispatch, then checkpoints `tool.started` before each tool body and records the observed result after. A second turn is rejected as busy. Shutdown stops new turns, cancels a pending approval, drains a tool body that already started, and does not invent a result that was never observed.
+8. `test/core.test.js`, `test/session.test.js`, `test/boot.test.js`, and `test/agent.test.js` exercise disposal, replay, the writer lock, recovery, boot, and the keyless loop. Run `npm test`. No API key is required.
 
-Approval, a keyless terminal replay, and the trajectory viewer are later slices. This version has no sandbox, compaction, streaming, or full DeepSeek Harness session compatibility.
+A keyless terminal replay and the trajectory viewer are later slices. This version has no live DeepSeek provider, sandbox, compaction, streaming, or full DeepSeek Harness session compatibility.
