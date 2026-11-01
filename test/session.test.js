@@ -323,6 +323,57 @@ test('an unknown tool outcome stays read-only after the writer lock is free', as
   } finally { await fresh.close(); await rm(dir, { recursive: true, force: true }) }
 })
 
+test('an open stream stays read-only and a finished stream can be read back', async () => {
+  const dir = await workspace()
+  const path = join(dir, 'session.jsonl')
+  const lines = [
+    { seq: 1, type: 'stream.started', time: 't' },
+    { seq: 2, type: 'stream.delta', time: 't', stream: 1, text: 'Hel' },
+  ]
+  await writeFile(path, lines.map((event) => JSON.stringify(event)).join('\n') + '\n')
+  const opened = await openSession(path, { writable: true })
+  try {
+    assert.equal(opened.session.writable, false)
+    assert.deepEqual(opened.session.unknownStreams, [1])
+    assert.match(opened.session.readonlyReason, /unknown stream outcome for 1/)
+    await assert.rejects(opened.session.append({ role: 'assistant', content: 'Hello' }), /unknown stream outcome/)
+    assert.equal(await readFile(path, 'utf8'), lines.map((event) => JSON.stringify(event)).join('\n') + '\n')
+  } finally { await opened.close() }
+
+  const ended = join(dir, 'ended.jsonl')
+  const endedLines = [
+    { seq: 1, type: 'stream.started', time: 't' },
+    { seq: 2, type: 'stream.delta', time: 't', stream: 1, text: 'Hel' },
+    { seq: 3, type: 'stream.ended', time: 't', stream: 1, finish: 'stop' },
+  ]
+  await writeFile(ended, endedLines.map((event) => JSON.stringify(event)).join('\n') + '\n')
+  const partial = await openSession(ended, { writable: true })
+  try {
+    assert.equal(partial.session.writable, false)
+    assert.deepEqual(partial.session.unknownStreams, [1])
+    assert.equal(partial.session.messages.some((message) => message.role === 'assistant'), false)
+    await assert.rejects(partial.session.append({ role: 'assistant', content: 'Hello' }), /unknown stream outcome/)
+    assert.equal(await readFile(ended, 'utf8'), endedLines.map((event) => JSON.stringify(event)).join('\n') + '\n')
+  } finally { await partial.close() }
+
+  const done = join(dir, 'done.jsonl')
+  const { session, close } = await openSession(done)
+  try {
+    await session.append({ type: 'stream.started' })
+    await session.append({ type: 'stream.delta', stream: 1, text: 'Hi' })
+    await assert.rejects(session.append({ type: 'stream.delta', stream: 9, text: 'x' }), /without a start/)
+    await session.append({ type: 'stream.ended', stream: 1, finish: 'stop' })
+    await session.append({ role: 'assistant', content: 'Hi' })
+    assert.equal(session.messages.at(-1).content, 'Hi')
+  } finally { await close() }
+  const again = await openSession(done)
+  try {
+    assert.equal(again.session.writable, true)
+    assert.deepEqual(again.session.unknownStreams, [])
+    assert.equal(again.session.messages.at(-1).content, 'Hi')
+  } finally { await again.close(); await rm(dir, { recursive: true, force: true }) }
+})
+
 test('a second process cannot write until the owner is gone, and a reader can', async () => {
   const dir = await workspace()
   const path = join(dir, 'session.jsonl')

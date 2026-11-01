@@ -2,7 +2,7 @@ import { Service } from '@deepseek-ai/cordis'
 import { appendFile, mkdir, open, readFile, truncate } from 'node:fs/promises'
 import { dirname, isAbsolute } from 'node:path'
 import { acquireWriter, lockPathFor } from './lock.js'
-import { assertEvent, createEvent, readSession, unknownOutcomes, unknownReason } from './log.js'
+import { assertEvent, createEvent, readSession, unknownOutcomes, unknownReason, unknownStreams } from './log.js'
 
 export function validateArguments(schema, value) {
   if (!schema || schema.type !== 'object') throw new Error('Tool schema must be an object')
@@ -66,6 +66,7 @@ export class Session extends Service {
     this.events = []
     this.incompleteTail = Buffer.alloc(0)
     this.unknown = []
+    this.unknownStreams = []
     this.writable = false
     this.readonlyReason = 'Session is not open'
     this.listeners = new Set()
@@ -87,8 +88,9 @@ export class Session extends Service {
     this.events = first.events
     this.incompleteTail = Buffer.from(first.incompleteTail)
     const unknown = unknownOutcomes(first.events)
-    if (unknown.length || !this.wantWriter) {
-      this.finishReadOnly(unknown)
+    const streams = unknownStreams(first.events)
+    if (unknown.length || streams.length || !this.wantWriter) {
+      this.finishReadOnly(unknown, streams)
       return
     }
     await mkdir(dirname(this.path), { recursive: true })
@@ -98,14 +100,16 @@ export class Session extends Service {
       this.events = parsed.events
       this.incompleteTail = Buffer.from(parsed.incompleteTail)
       const unknownNow = unknownOutcomes(parsed.events)
-      if (unknownNow.length) {
-        this.finishReadOnly(unknownNow)
+      const streamsNow = unknownStreams(parsed.events)
+      if (unknownNow.length || streamsNow.length) {
+        this.finishReadOnly(unknownNow, streamsNow)
         await this.release()
         return
       }
       if (parsed.incompleteTail.length) await preserveTail(this.path, parsed)
       this.handle = await open(this.path, 'a', 0o600)
       this.unknown = []
+      this.unknownStreams = []
       this.writable = true
       this.readonlyReason = undefined
       if (!this.events.length && this.workspace) await this._append({ type: 'session.opened', workspace: this.workspace })
@@ -117,10 +121,11 @@ export class Session extends Service {
     }
   }
 
-  finishReadOnly(unknown) {
+  finishReadOnly(unknown, streams = []) {
     this.unknown = unknown
+    this.unknownStreams = streams
     this.writable = false
-    this.readonlyReason = unknown.length ? unknownReason(unknown) : 'Session opened read-only'
+    this.readonlyReason = unknown.length || streams.length ? unknownReason(unknown, streams) : 'Session opened read-only'
   }
 
   get messages() {
@@ -170,7 +175,8 @@ export class Session extends Service {
     const fresh = parsed.events.slice(this.events.length)
     this.incompleteTail = Buffer.from(parsed.incompleteTail)
     this.unknown = unknownOutcomes(parsed.events)
-    if (this.unknown.length) this.readonlyReason = unknownReason(this.unknown)
+    this.unknownStreams = unknownStreams(parsed.events)
+    if (this.unknown.length || this.unknownStreams.length) this.readonlyReason = unknownReason(this.unknown, this.unknownStreams)
     else if (!this.wantWriter) this.readonlyReason = 'Session opened read-only'
     for (const event of fresh) {
       this.events.push(event)
@@ -193,7 +199,9 @@ export class Session extends Service {
     }
     const event = createEvent(input, this.events.length + 1, this.clock)
     assertEvent(event, event.seq)
-    unknownOutcomes([...this.events, event])
+    const next = [...this.events, event]
+    unknownOutcomes(next)
+    unknownStreams(next)
     const line = JSON.stringify(event) + '\n'
     try { await this.writeLine(line) }
     catch (error) {
@@ -284,6 +292,7 @@ export class Checkpoint extends Service {
 
 // Providers register here. Each prepare() is one dispatch of a JSON body.
 // The body is what gets recorded and sent. Credentials never belong in it.
+// dispatch() yields that call's chunks once.
 export class Model extends Service {
   constructor(ctx) { super(ctx, 'model'); this.providers = new Map() }
   register(provider) {
@@ -301,10 +310,10 @@ export class Model extends Service {
     return {
       provider: provider.name,
       body,
-      dispatch() {
+      dispatch(signal) {
         if (used) throw new Error('Prepared model call was already used')
         used = true
-        return provider.dispatch(structuredClone(body))
+        return provider.dispatch(structuredClone(body), signal)
       },
     }
   }

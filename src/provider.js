@@ -1,8 +1,9 @@
 import { readFile } from 'node:fs/promises'
 
-// Prepared providers. prepare() returns the JSON body; dispatch() sends it once.
-// The fake provider replays prepared replies. DeepSeek posts that same body to
-// chat completions. The API key is an Authorization header, never part of the body.
+// Prepared providers. prepare() returns the JSON body; dispatch() sends it once
+// and yields text and tool-call chunks. The fake provider replays prepared
+// replies as those chunks. DeepSeek posts that same body to chat completions
+// with stream true. The API key is an Authorization header, never part of the body.
 
 export const DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
 export const DEEPSEEK_MODEL = 'deepseek-flash'
@@ -24,11 +25,18 @@ export function fakeProvider(replies = []) {
             tools: input.tools,
           }
         },
-        dispatch(body) {
+        async *dispatch(body, signal) {
           sent.push(structuredClone(body))
           if (!queue.length) throw new Error('Fake provider has no prepared reply')
           const reply = queue.shift()
-          return typeof reply === 'function' ? reply(body) : reply
+          const value = typeof reply === 'function' ? await reply(body) : reply
+          const chunks = chunksFrom(value)
+          if (signal?.aborted) throw abortError()
+          yield { start: true }
+          for (const chunk of chunks) {
+            if (signal?.aborted) throw abortError()
+            yield chunk
+          }
         },
       }))
     },
@@ -80,7 +88,7 @@ export function deepseekProvider(options = {}) {
         prepare(input) {
           return chatBody(input, model, toolChoice)
         },
-        async dispatch(body) {
+        async *dispatch(body, signal) {
           const url = `${baseUrl}/chat/completions`
           let response
           try {
@@ -91,19 +99,41 @@ export function deepseekProvider(options = {}) {
                 Authorization: `Bearer ${apiKey}`,
               },
               body: JSON.stringify(body),
+              signal,
             })
           } catch (error) {
+            if (signal?.aborted || error?.name === 'AbortError') throw abortError()
             throw new Error(redact(`DeepSeek request failed: ${error.message}`, apiKey))
           }
-          let parsed = {}
-          const text = await response.text()
-          if (text) {
-            try { parsed = JSON.parse(text) }
-            catch { parsed = { error: { message: text } } }
+          if (!response.ok) {
+            let parsed = {}
+            const text = await response.text()
+            if (text) {
+              try { parsed = JSON.parse(text) }
+              catch { parsed = { error: { message: text } } }
+            }
+            throw new Error(failureText(response.status, parsed, apiKey))
           }
-          if (!response.ok) throw new Error(failureText(response.status, parsed, apiKey))
-          try { return assistantFrom(parsed) }
-          catch (error) { throw new Error(redact(error.message, apiKey)) }
+          if (!response.body) throw new Error('DeepSeek returned an empty stream')
+          yield { start: true }
+          let finish = null
+          let done = false
+          try {
+            for await (const data of readSse(response.body)) {
+              if (signal?.aborted) throw abortError()
+              if (data === '[DONE]') { done = true; break }
+              const payload = parseChunk(data)
+              for (const chunk of chunksFromPayload(payload)) {
+                if (chunk.finish) finish = chunk.finish
+                else yield publicChunk(chunk, apiKey)
+              }
+            }
+          } catch (error) {
+            if (signal?.aborted || error?.name === 'AbortError') throw abortError()
+            throw new Error(redact(error.message, apiKey))
+          }
+          if (!done || typeof finish !== 'string' || !finish) throw new Error('DeepSeek stream ended before a finish')
+          yield { finish }
         },
       }))
     },
@@ -152,13 +182,14 @@ function outgoingMessage(message) {
 }
 
 // The object returned here is the body that is recorded and posted.
-// Thinking stays off so a named tool choice is accepted and the response is one JSON document.
+// Thinking stays off so a named tool choice is accepted. stream is true, so
+// the response is server-sent events rather than one JSON document.
 function chatBody(input, model, toolChoice) {
   const messages = []
   const system = systemText(input)
   if (system) messages.push({ role: 'system', content: system })
   for (const message of input.messages ?? []) messages.push(outgoingMessage(message))
-  const body = { model, messages, stream: false, thinking: { type: 'disabled' } }
+  const body = { model, messages, stream: true, thinking: { type: 'disabled' } }
   if (input.tools?.length) {
     body.tools = input.tools
     const followUp = messages.some((message) => message.role === 'tool')
@@ -176,17 +207,157 @@ function textContent(content) {
   return typeof content === 'string' ? content : JSON.stringify(content)
 }
 
-function assistantFrom(payload) {
-  const message = payload?.choices?.[0]?.message
-  if (!message || message.role !== 'assistant') throw new Error('DeepSeek returned an invalid response')
-  const result = { role: 'assistant', content: textContent(message.content) }
-  if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
-    result.tool_calls = message.tool_calls.map(outgoingCall)
+function abortError() {
+  const error = new Error('Model stream aborted')
+  error.name = 'AbortError'
+  return error
+}
+
+// One complete reply becomes incremental chunks. An explicit stream is yielded
+// as given. The finish is part of the reply; it is not added when missing.
+function chunksFrom(value) {
+  if (value && Array.isArray(value.stream)) return normalizeChunks(value.stream)
+  if (!value || value.role !== 'assistant') throw new Error('Model returned an invalid response')
+  const chunks = []
+  if (typeof value.reasoning_content === 'string' && value.reasoning_content) {
+    for (const part of splitIncremental(value.reasoning_content)) chunks.push({ reasoning: part })
   }
-  if (typeof message.reasoning_content === 'string' && message.reasoning_content) {
-    result.reasoning_content = message.reasoning_content
+  if (typeof value.content === 'string' && value.content) {
+    for (const part of splitIncremental(value.content)) chunks.push({ text: part })
+  } else if (value.content != null && typeof value.content !== 'string') throw new Error('Model returned an invalid response')
+  const calls = value.tool_calls ?? []
+  if (!Array.isArray(calls)) throw new Error('Model returned invalid tool calls')
+  calls.forEach((call, index) => {
+    if (!call?.id || !call.function || typeof call.function.name !== 'string' || typeof call.function.arguments !== 'string') {
+      throw new Error('Model returned invalid tool calls')
+    }
+    const piece = { index, id: call.id, name: call.function.name }
+    if (call.type) piece.type = call.type
+    chunks.push({ tool_call: piece })
+    for (const part of splitIncremental(call.function.arguments)) chunks.push({ tool_call: { index, arguments: part } })
+  })
+  chunks.push({ finish: calls.length ? 'tool_calls' : 'stop' })
+  return chunks
+}
+
+function normalizeChunks(stream) {
+  const chunks = []
+  let finish = null
+  for (const chunk of stream) {
+    if (!chunk || typeof chunk !== 'object') throw new Error('Model returned an invalid response')
+    if (chunk.finish != null) {
+      if (finish) throw new Error('Model stream already finished')
+      if (typeof chunk.finish !== 'string' || !chunk.finish) throw new Error('Model returned an invalid response')
+      finish = chunk.finish
+      chunks.push({ finish: chunk.finish })
+      continue
+    }
+    if (finish) throw new Error('Model stream already finished')
+    const next = {}
+    if (typeof chunk.text === 'string' && chunk.text) next.text = chunk.text
+    if (typeof chunk.reasoning === 'string' && chunk.reasoning) next.reasoning = chunk.reasoning
+    if (chunk.tool_call) next.tool_call = normalizePiece(chunk.tool_call)
+    if (!next.text && !next.reasoning && !next.tool_call) throw new Error('Model returned an invalid response')
+    chunks.push(next)
   }
-  return result
+  if (!finish) throw new Error('Model stream has no finish')
+  return chunks
+}
+
+function normalizePiece(piece) {
+  if (!piece || typeof piece !== 'object' || !Number.isInteger(piece.index) || piece.index < 0) {
+    throw new Error('Model returned invalid tool calls')
+  }
+  const next = { index: piece.index }
+  if (piece.id != null) next.id = piece.id
+  if (piece.type != null) next.type = piece.type
+  if (piece.name != null) next.name = piece.name
+  if (piece.arguments != null) next.arguments = piece.arguments
+  if (next.id == null && next.name == null && next.arguments == null) throw new Error('Model returned invalid tool calls')
+  return next
+}
+
+function splitIncremental(text) {
+  if (typeof text !== 'string' || !text) return []
+  const mid = Math.ceil(text.length / 2)
+  return [text.slice(0, mid), text.slice(mid)].filter((part) => part)
+}
+
+function parseChunk(data) {
+  try { return JSON.parse(data) }
+  catch { throw new Error('DeepSeek stream returned invalid JSON') }
+}
+
+function chunksFromPayload(payload) {
+  const choice = payload?.choices?.[0]
+  if (!choice) return []
+  const delta = choice.delta ?? {}
+  const chunks = []
+  if (typeof delta.content === 'string' && delta.content) chunks.push({ text: delta.content })
+  else if (delta.content != null && typeof delta.content !== 'string') chunks.push({ text: textContent(delta.content) })
+  if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) chunks.push({ reasoning: delta.reasoning_content })
+  if (Array.isArray(delta.tool_calls)) {
+    for (const call of delta.tool_calls) {
+      if (!Number.isInteger(call?.index) || call.index < 0) throw new Error('DeepSeek stream tool call is missing an index')
+      const piece = { index: call.index }
+      if (call.id) piece.id = call.id
+      if (call.type) piece.type = call.type
+      if (call.function?.name) piece.name = call.function.name
+      if (typeof call.function?.arguments === 'string' && call.function.arguments) piece.arguments = call.function.arguments
+      if (piece.id || piece.name || piece.arguments) chunks.push({ tool_call: piece })
+    }
+  }
+  if (typeof choice.finish_reason === 'string' && choice.finish_reason) chunks.push({ finish: choice.finish_reason })
+  return chunks
+}
+
+function publicChunk(chunk, apiKey) {
+  const next = {}
+  if (chunk.text) next.text = redact(chunk.text, apiKey)
+  if (chunk.reasoning) next.reasoning = redact(chunk.reasoning, apiKey)
+  if (chunk.tool_call) {
+    const piece = { index: chunk.tool_call.index }
+    if (chunk.tool_call.id) piece.id = redact(chunk.tool_call.id, apiKey)
+    if (chunk.tool_call.type) piece.type = chunk.tool_call.type
+    if (chunk.tool_call.name) piece.name = redact(chunk.tool_call.name, apiKey)
+    if (chunk.tool_call.arguments) piece.arguments = redact(chunk.tool_call.arguments, apiKey)
+    next.tool_call = piece
+  }
+  return next
+}
+
+async function* readSse(body) {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  try {
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      buffer = buffer.replace(/\r\n/g, '\n')
+      let split
+      while ((split = buffer.indexOf('\n\n')) >= 0) {
+        const block = buffer.slice(0, split)
+        buffer = buffer.slice(split + 2)
+        const data = sseData(block)
+        if (data != null) yield data
+      }
+    }
+  } finally {
+    try { await reader.cancel() } catch { /* the consumer already left the stream */ }
+    try { reader.releaseLock() } catch { /* cancel already dropped the reader */ }
+  }
+}
+
+function sseData(block) {
+  const lines = []
+  for (const line of block.split('\n')) {
+    if (!line || line.startsWith(':')) continue
+    if (line.startsWith('data:')) lines.push(line.slice(5).replace(/^ /, ''))
+  }
+  if (!lines.length) return null
+  return lines.join('\n')
 }
 
 function failureText(status, payload, apiKey) {

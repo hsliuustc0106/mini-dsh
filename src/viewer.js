@@ -36,15 +36,16 @@ function grow(span) {
 
 // The page is a view of one projection. It has no prompt and no approval control.
 export function renderPage(projection) {
-  const banner = projection.unknown.length
-    ? `<p class="banner">${esc(unknownReason(projection.unknown))}</p>`
+  const unknownStreams = projection.unknownStreams ?? []
+  const banner = projection.unknown.length || unknownStreams.length
+    ? `<p class="banner">${esc(unknownReason(projection.unknown, unknownStreams))}</p>`
     : ''
   const bars = projection.overview.map((span) => {
     const state = span.status !== 'ok' ? ` ${span.status}` : ''
     const title = [span.kind, span.provider, span.name, span.callId, span.status, span.time, span.endTime].filter(Boolean).join(' · ')
     return `<button type="button" class="bar ${esc(span.kind)}${esc(state)}" data-seq="${span.seq}" style="flex:${grow(span)} ${grow(span)} 4.5rem" title="${esc(title)}">${esc(barText(span))}</button>`
   }).join('')
-  const overview = `<div class="overview" role="list">${bars || '<p class="empty">No timing spans yet.</p>'}</div>`
+  const overview = `<div class="overview" role="list">${bars || '<p class="empty">No timing spans yet.</p>'}</div>${tokenStrip(projection)}`
   const sections = []
   if (projection.preamble.length) sections.push(section('Session', null, projection.preamble))
   for (const turn of projection.turns) sections.push(section(`Turn ${turn.id}`, turn.input, turn.rows))
@@ -75,6 +76,9 @@ export function renderPage(projection) {
   .bar.unknown { background: repeating-linear-gradient(135deg, #8c3030, #8c3030 8px, #a85050 8px, #a85050 16px); }
   .bar.error, .bar.deny { background: #8c3030; }
   .bar.open { background: #6e6246; }
+  .tokens { display: flex; flex-wrap: wrap; gap: 6px; padding: 0; margin: 8px 0 0; list-style: none; }
+  .token { display: inline-flex; gap: 6px; align-items: baseline; border: 1px solid #e3dbd0; background: #fffdf8; border-radius: 8px; padding: 4px 8px; cursor: pointer; font: inherit; }
+  .token time { color: #6d655c; font-size: 12px; font-variant-numeric: tabular-nums; }
   .turn { margin: 0; }
   .input-line { margin: 0 0 8px; }
   ol { list-style: none; padding: 0; margin: 0; }
@@ -167,6 +171,13 @@ export function renderPage(projection) {
 </script>
 </body>
 </html>`
+}
+
+function tokenStrip(projection) {
+  const tokens = projection.overview.filter((span) => span.kind === 'model').flatMap((span) => span.tokens ?? [])
+  if (!tokens.length) return ''
+  const items = tokens.map((token) => `<li><button type="button" class="token" data-seq="${token.seq}"><time datetime="${esc(token.time)}">${esc(token.time)}</time><span>${esc(token.text)}</span></button></li>`).join('')
+  return `<ol class="tokens">${items}</ol>`
 }
 
 function section(title, input, rows) {

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import { boot } from '../src/boot.js'
 import { composition, viewerComposition } from '../src/composition.js'
-import { readSession } from '../src/log.js'
+import { observeStream, readSession } from '../src/log.js'
 import { fakeProvider } from '../src/provider.js'
 import { Session, Workspace } from '../src/services.js'
 import { project } from '../src/trajectory.js'
@@ -167,15 +167,16 @@ test('projects the recorded fixture into turns, timing, and inspectable records'
   const events = (await readSession(join(fixtureDir, 'session.jsonl'))).events
   const view = project(events)
   assert.equal(view.wordmark, 'mini-dsh')
-  assert.equal(view.count, 10)
-  assert.equal(view.cursor, 10)
+  assert.equal(view.count, 19)
+  assert.equal(view.cursor, 19)
   assert.deepEqual(view.unknown, [])
+  assert.deepEqual(view.unknownStreams, [])
   assert.deepEqual(view.overview.map((span) => span.kind), ['input', 'model', 'tool', 'model'])
   assert.deepEqual(view.overview.map((span) => [span.seq, span.endSeq, span.status, span.durationMs]), [
     [2, 2, 'ok', 0],
-    [3, 4, 'ok', 0],
-    [6, 7, 'ok', 0],
-    [9, 10, 'ok', 0],
+    [3, 8, 'ok', 0],
+    [11, 12, 'ok', 0],
+    [14, 18, 'ok', 0],
   ])
   assert.equal(view.overview[2].callId, 'write-hello')
   assert.equal(view.overview[2].name, 'write')
@@ -185,11 +186,11 @@ test('projects the recorded fixture into turns, timing, and inspectable records'
   assert.equal(view.turns[0].id, 1)
   assert.equal(view.turns[0].input, 'Write hello.txt')
   assert.deepEqual(view.turns[0].rows.map((row) => row.label), [
-    'message:user', 'model.request', 'message:assistant', 'permission.decided',
-    'tool.started', 'tool.finished', 'message:tool', 'model.request', 'message:assistant',
+    'message:user', 'model.request', 'stream.started', 'stream.delta', 'stream.delta', 'stream.delta', 'stream.ended', 'message:assistant', 'permission.decided',
+    'tool.started', 'tool.finished', 'message:tool', 'model.request', 'stream.started', 'stream.delta', 'stream.delta', 'stream.ended', 'message:assistant',
   ])
   const rows = rowsOf(view)
-  assert.deepEqual(rows.map((row) => row.seq), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+  assert.deepEqual(rows.map((row) => row.seq), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
   const requestRow = rows.find((row) => row.type === 'model.request')
   assert.equal(requestRow.detail.provider, 'fake')
   assert.equal(requestRow.detail.body.messages[0].content, 'Write hello.txt')
@@ -206,6 +207,12 @@ test('projects the recorded fixture into turns, timing, and inspectable records'
   assert.equal(decision.detail.decision, 'allow')
   assert.equal(decision.detail.arguments.path, 'hello.txt')
   assert.equal(rows.at(-1).detail.content, 'Wrote hello.txt.')
+  const ends = rows.filter((row) => row.type === 'stream.ended')
+  assert.equal(ends[0].detail.tool_calls[0].id, 'write-hello')
+  assert.equal(ends[0].detail.tool_calls[0].function.arguments, '{"path":"hello.txt","content":"hello\\n"}')
+  assert.equal(ends[1].detail.text, 'Wrote hello.txt.')
+  assert.deepEqual(view.overview[3].tokens.map((token) => token.text), ['Wrote he', 'llo.txt.'])
+  assert.equal(view.overview[3].tokens.map((token) => token.text).join(''), rows.at(-1).detail.content)
 })
 
 test('projects an interrupted tool and an unresolved tool call as unknown', () => {
@@ -277,6 +284,83 @@ test('times model and tool spans from the recorded clock', () => {
   assert.equal(view.overview.find((span) => span.kind === 'tool').status, 'error')
   assert.equal(view.turns[0].rows.find((row) => row.type === 'tool.finished').detail.error, 'Error: failed')
   assert.throws(() => project([{ seq: 1, type: 'note' }, { seq: 3, type: 'note' }]), /Trajectory sequence gap: expected 2, received 3/)
+})
+
+test('projects stream fragments from the session and follows them without a gap', async () => {
+  const dir = await directory()
+  let tick = 0
+  const clock = () => new Date(Date.UTC(2026, 0, 1, 0, 0, tick++)).toISOString()
+  const app = await boot({
+    workspace: dir,
+    provider: fakeProvider([{ stream: [
+      { text: 'Hel' },
+      { text: 'lo' },
+      { finish: 'stop' },
+    ] }]),
+    clock,
+    view: { port: 0, refreshMs: 0 },
+  })
+  const live = []
+  try {
+    const joined = await openSse(`${app.ctx.viewer.url}/events?after=0`)
+    live.push(joined)
+    await app.ctx.agent.turn('Hi')
+    await until(() => joined.events.length === app.ctx.session.events.length)
+    const seqs = joined.events.map((item) => item.data.seq)
+    assert.deepEqual(seqs, app.ctx.session.events.map((event) => event.seq))
+    seqs.forEach((seq, index) => assert.equal(seq, index + 1))
+    const saved = app.ctx.session.events
+    const view = project(saved)
+    const page = await request(`${app.ctx.viewer.url}/`)
+    const trajectory = await request(`${app.ctx.viewer.url}/trajectory`)
+    assert.deepEqual(JSON.parse(trajectory.body), view)
+    assert.deepEqual(embedded(page.body), view)
+    assert.deepEqual(view.unknownStreams, [])
+    const ended = saved.find((event) => event.type === 'stream.ended')
+    assert.equal(observeStream(saved, ended.stream).text, 'Hello')
+    assert.equal(saved.find((event) => event.seq === ended.seq + 1).message.content, 'Hello')
+    const model = view.overview.find((span) => span.kind === 'model')
+    assert.equal(model.status, 'ok')
+    assert.equal(model.endSeq, ended.seq)
+    assert.ok(model.durationMs >= 1000)
+    assert.deepEqual(model.tokens.map((token) => token.text), ['Hel', 'lo'])
+    assert.match(page.body, /class="token"/)
+    assert.match(page.body, />Hel</)
+    assert.match(page.body, />lo</)
+    assert.equal(page.body.includes('sk-secret'), false)
+    assert.equal(view.turns[0].rows.some((row) => row.type === 'stream.delta' && row.detail.text === 'Hel'), true)
+    const endRow = view.turns[0].rows.find((row) => row.type === 'stream.ended')
+    assert.equal(endRow.detail.text, 'Hello')
+    assert.equal(endRow.detail.finish, 'stop')
+
+    joined.close()
+    const resumed = await openSse(`${app.ctx.viewer.url}/events?after=${ended.seq}`)
+    live.push(resumed)
+    await until(() => resumed.events.length >= 1)
+    assert.equal(resumed.events[0].data.seq, ended.seq + 1)
+    assert.equal(resumed.events[0].id, String(ended.seq + 1))
+  } finally {
+    for (const stream of live) stream.close()
+    await app.dispose()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('an unfinished stream has no invented end or assistant text', () => {
+  const view = project([
+    { seq: 1, time: '2026-01-01T00:00:00.000Z', type: 'message', message: { role: 'user', content: 'Hi' } },
+    { seq: 2, time: '2026-01-01T00:00:01.000Z', type: 'model.request', provider: 'fake', body: { model: 'fake' } },
+    { seq: 3, time: '2026-01-01T00:00:02.000Z', type: 'stream.started' },
+    { seq: 4, time: '2026-01-01T00:00:03.000Z', type: 'stream.delta', stream: 3, text: 'Hel' },
+  ])
+  assert.deepEqual(view.unknownStreams, [3])
+  assert.equal(view.overview.find((span) => span.kind === 'model').status, 'unknown')
+  assert.equal(view.overview.find((span) => span.kind === 'model').endTime, null)
+  assert.equal(view.overview.find((span) => span.kind === 'model').durationMs, null)
+  assert.deepEqual(view.overview.find((span) => span.kind === 'model').tokens.map((token) => token.text), ['Hel'])
+  assert.equal(view.turns[0].rows.some((row) => row.detail?.role === 'assistant'), false)
+  assert.equal(JSON.stringify(view).includes('Hello'), false)
+  assert.equal(view.turns[0].rows.find((row) => row.type === 'stream.started').status, 'unknown')
 })
 
 test('serves the fixture read-only and renders the same history after restart', async () => {

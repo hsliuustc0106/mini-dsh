@@ -1,4 +1,4 @@
-import { unknownOutcomes } from './log.js'
+import { completeFinish, observeStream, unknownOutcomes, unknownStreams } from './log.js'
 
 // A projection of one session log. It is derived on read and stored nowhere.
 
@@ -35,7 +35,7 @@ function spanDuration(start, end) {
 }
 
 function kindOf(event) {
-  if (event.type === 'model.request') return 'model'
+  if (event.type === 'model.request' || event.type.startsWith('stream.')) return 'model'
   if (event.type === 'tool.started' || event.type === 'tool.finished') return 'tool'
   if (event.type === 'permission.decided') return 'permission'
   if (event.type !== 'message') return 'session'
@@ -49,9 +49,21 @@ function toolLabel(name, args) {
   return clip([name, extra].filter(Boolean).join(' '))
 }
 
+function deltaText(event) {
+  if (typeof event.text === 'string' && event.text) return event.text
+  if (typeof event.reasoning === 'string' && event.reasoning) return event.reasoning
+  const call = event.tool_call
+  if (!call) return ''
+  if (typeof call.name === 'string' && call.name) return call.name
+  return typeof call.arguments === 'string' ? call.arguments : ''
+}
+
 function summaryFor(event) {
   if (event.type === 'session.opened') return clip(event.workspace)
   if (event.type === 'model.request') return clip(event.provider)
+  if (event.type === 'stream.started') return 'stream'
+  if (event.type === 'stream.delta') return clip(deltaText(event))
+  if (event.type === 'stream.ended') return clip(event.finish)
   if (event.type === 'permission.decided') return clip(`${event.decision} ${event.name}`)
   if (event.type === 'tool.started') return toolLabel(event.name, event.arguments)
   if (event.type === 'tool.finished') return clip(event.result)
@@ -63,9 +75,28 @@ function summaryFor(event) {
   return clip(message.content)
 }
 
-function detailFor(event, unknown) {
+function detailFor(event, unknown, streams, events) {
   if (event.type === 'model.request') return { provider: event.provider, body: event.body }
-    if (event.type === 'permission.decided') {
+  if (event.type === 'stream.started') return streams.has(event.seq) ? { outcome: 'unknown' } : {}
+  if (event.type === 'stream.delta') {
+    const detail = { stream: event.stream }
+    if (event.text != null) detail.text = event.text
+    if (event.reasoning != null) detail.reasoning = event.reasoning
+    if (event.tool_call != null) detail.tool_call = event.tool_call
+    return detail
+  }
+  if (event.type === 'stream.ended') {
+    const observed = observeStream(events, event.stream)
+    return {
+      stream: event.stream,
+      finish: event.finish,
+      text: observed.text,
+      ...(observed.reasoning ? { reasoning: observed.reasoning } : {}),
+      ...(observed.tool_calls.length ? { tool_calls: observed.tool_calls } : {}),
+      ...(completeFinish(event.finish) && !streams.has(event.stream) ? {} : { outcome: 'unknown' }),
+    }
+  }
+  if (event.type === 'permission.decided') {
     return {
       callId: event.callId,
       name: event.name,
@@ -103,7 +134,9 @@ function detailFor(event, unknown) {
   return rest
 }
 
-function statusOf(event, unknown) {
+function statusOf(event, unknown, streams) {
+  if (event.type === 'stream.started') return streams.has(event.seq) ? 'unknown' : 'ok'
+  if (event.type === 'stream.ended') return completeFinish(event.finish) && !streams.has(event.stream) ? 'ok' : 'unknown'
   if (event.type === 'tool.started') return unknown.has(event.callId) ? 'unknown' : 'ok'
   if (event.type === 'tool.finished') return isErrorText(event.result) ? 'error' : 'ok'
   if (event.type === 'permission.decided') return event.decision === 'deny' ? 'deny' : 'ok'
@@ -128,12 +161,13 @@ function point(kind, event) {
 
 // Spans follow the session sequence. An unfinished tool stays unknown and
 // does not receive an invented end time.
-function overviewOf(events, unknown) {
+function overviewOf(events, unknown, streams) {
   const spans = []
   let model = null
   const tools = new Map()
   const closeModel = () => {
     if (!model) return
+    if (model.stream && model.status === 'open') model.status = 'unknown'
     spans.push(model)
     model = null
   }
@@ -153,7 +187,19 @@ function overviewOf(events, unknown) {
         durationMs: null,
         status: 'open',
       }
-    } else if (event.type === 'message' && event.message?.role === 'assistant' && model) {
+    } else if (event.type === 'stream.started' && model) {
+      model.stream = event.seq
+      model.tokens = []
+    } else if (event.type === 'stream.delta' && model?.tokens) {
+      model.tokens.push({ seq: event.seq, time: event.time ?? null, text: deltaText(event) })
+    } else if (event.type === 'stream.ended' && model && model.stream === event.stream) {
+      model.endSeq = event.seq
+      model.endTime = event.time ?? null
+      model.durationMs = spanDuration(model.time, model.endTime)
+      model.finish = event.finish
+      model.status = completeFinish(event.finish) && !streams.has(event.stream) ? 'ok' : 'unknown'
+      closeModel()
+    } else if (event.type === 'message' && event.message?.role === 'assistant' && model && !model.stream) {
       model.endSeq = event.seq
       model.endTime = event.time ?? null
       model.durationMs = spanDuration(model.time, model.endTime)
@@ -208,7 +254,9 @@ function group(rows) {
 export function project(events) {
   assertContiguous(events)
   const unknown = unknownOutcomes(events)
+  const unknownStreamList = unknownStreams(events)
   const pending = new Set(unknown)
+  const streams = new Set(unknownStreamList)
   const rows = events.map((event) => ({
     seq: event.seq,
     time: event.time ?? null,
@@ -216,15 +264,16 @@ export function project(events) {
     kind: kindOf(event),
     label: event.type === 'message' ? `message:${event.message.role}` : event.type,
     summary: summaryFor(event),
-    status: statusOf(event, pending),
-    detail: detailFor(event, pending),
+    status: statusOf(event, pending, streams),
+    detail: detailFor(event, pending, streams, events),
   }))
   return {
     wordmark: 'mini-dsh',
     count: events.length,
     cursor: events.length ? events[events.length - 1].seq : 0,
     unknown,
-    overview: overviewOf(events, pending),
+    unknownStreams: unknownStreamList,
+    overview: overviewOf(events, pending, streams),
     ...group(rows),
   }
 }
