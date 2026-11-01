@@ -375,3 +375,61 @@ test('a terminal profile and web turns share the agent without sharing approval 
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+// Mirrors GET /trajectory: the log is projected on read, and an unfinished
+// span is marked open only while the agent is still busy.
+function served(events, app) {
+  const { busy } = app.ctx.agent
+  const { writable } = app.ctx.session
+  return project(events).overview.map(({ tokens, ...span }) => ({
+    ...span,
+    status: span.status === 'unknown' && !span.endTime && busy && writable ? 'open' : span.status,
+  }))
+}
+
+function through(events, predicate) {
+  const end = events.findIndex(predicate)
+  if (end < 0) throw new Error('Expected session event was not recorded')
+  return events.slice(0, end + 1)
+}
+
+test('web trajectory follows the session log for an open ask and a shortened log', async () => {
+  const run = await start([assistant(null, [call('write-hello', 'hello.txt', 'hello\n')]), assistant('Wrote hello.txt.')])
+  const client = await stream(run.url)
+  try {
+    const { connection } = await client.wait('hello')
+    assert.equal((await request(run.url, '/turn', { method: 'POST', data: { connection, input: 'Write hello.txt' } })).status, 202)
+    await client.wait('approval', (data) => data.pending?.arguments.path === 'hello.txt')
+    const duringAsk = run.app.ctx.session.events.slice()
+    assert.equal(duringAsk.some((event) => event.type === 'permission.decided' || event.type === 'tool.started'), false)
+    const open = JSON.parse((await request(run.url, '/trajectory')).body)
+    assert.equal(open.cursor, duringAsk.at(-1).seq)
+    assert.deepEqual(open.overview, served(duringAsk, run.app))
+    assert.equal(open.overview.some((span) => span.kind === 'tool'), false)
+
+    const approval = client.events.find((event) => event.type === 'approval' && event.data.pending).data.pending
+    assert.equal((await request(run.url, '/approval', { method: 'POST', data: { connection, id: approval.id, decision: 'allow' } })).status, 200)
+    await client.wait('session', (event) => event.type === 'message' && event.message.content === 'Wrote hello.txt.')
+    const saved = run.app.ctx.session.events.slice()
+    const followed = client.events.filter((event) => event.type === 'session').map((event) => event.data)
+    const disk = (await readFile(run.app.sessionPath, 'utf8')).trim().split('\n').map(JSON.parse)
+    assert.deepEqual(followed, saved)
+    assert.deepEqual(disk, saved)
+    const timing = JSON.parse((await request(run.url, '/trajectory')).body)
+    assert.equal(timing.cursor, saved.at(-1).seq)
+    assert.deepEqual(timing.overview, served(saved, run.app))
+
+    const running = through(saved, (event) => event.type === 'tool.started')
+    const partialReply = through(saved, (event) => event.type === 'stream.delta' && typeof event.text === 'string')
+    for (const events of [duringAsk, running, partialReply]) {
+      run.app.ctx.session.events = events
+      const body = JSON.parse((await request(run.url, '/trajectory')).body)
+      assert.notEqual(body.cursor, saved.at(-1).seq)
+      assert.equal(body.cursor, events.at(-1).seq)
+      assert.deepEqual(body.overview, served(events, run.app))
+    }
+    assert.equal(running.some((event) => event.type === 'tool.finished'), false)
+    assert.equal(partialReply.at(-1).text, 'Wrote he')
+    assert.equal(partialReply.some((event) => event.type === 'message' && event.message.content === 'Wrote hello.txt.'), false)
+  } finally { client.close(); await run.close() }
+})

@@ -48,19 +48,31 @@ async function browser() {
     emit(type, data) { this.listeners.get(type)?.({ data: JSON.stringify(data) }) }
     close() { this.closed = true }
   }
+  const posts = []
   const script = await readFile(new URL('../src/web/app.js', import.meta.url), 'utf8')
   runInNewContext(script, {
     document,
     EventSource,
     requestAnimationFrame: (callback) => callback(),
     setTimeout: (callback) => { timers.push(callback); return timers.length },
-    fetch: async (url) => { assert.equal(url, '/trajectory'); return { ok: true, json: async () => snapshot } },
+    fetch: async (url, init) => {
+      if (url === '/trajectory') return { ok: true, json: async () => snapshot }
+      if (url === '/approval') {
+        posts.push(JSON.parse(init.body))
+        return { ok: true, json: async () => ({}) }
+      }
+      throw new Error(`unexpected fetch ${url}`)
+    },
   })
   return {
-    elements, source,
+    elements, source, posts,
     snapshot(value) { snapshot = value },
     async flush() { while (timers.length) await timers.shift()() },
   }
+}
+
+function descendants(element) {
+  return element.children.flatMap((child) => child instanceof Element ? [child, ...descendants(child)] : [])
 }
 
 test('groups streamed fragments while preserving their text, details, and order', async () => {
@@ -137,4 +149,42 @@ test('shows recorded timing for each span and updates its event details', async 
   assert.deepEqual(elements.timeline.children.map((bar) => bar.textContent), ['input—', 'modelunknown', 'tool46 ms'])
   assert.match(modelRow.firstElementChild.children[1].textContent, /Duration: unavailable.*Status: unknown/)
   assert.match(elements.events.children[2].firstElementChild.children[1].textContent, /Finished:.*Duration: 46 ms/)
+})
+
+test('an approval click waits for the session event before showing a decision or tool result', async () => {
+  const { elements, source, posts } = await browser()
+  source.emit('hello', { connection: 'browser', busy: true, writable: true })
+  const emit = (event) => source.emit('session', event)
+  emit({ seq: 1, type: 'message', message: { role: 'user', content: 'Write hello.txt' } })
+  emit({ seq: 2, type: 'model.request', provider: 'fake' })
+  emit({ seq: 3, type: 'stream.started' })
+  emit({ seq: 4, type: 'stream.delta', stream: 3, text: 'Writing' })
+  emit({ seq: 5, type: 'stream.ended', stream: 3, finish: 'tool_calls' })
+  emit({ seq: 6, type: 'message', message: { role: 'assistant', content: 'Writing', tool_calls: [
+    { id: 'write-hello', type: 'function', function: { name: 'write', arguments: '{"path":"hello.txt","content":"hello\\n"}' } },
+  ] } })
+  source.emit('approval', { pending: { id: 'ask-1', name: 'write', arguments: { path: 'hello.txt', content: 'hello\n' }, workspace: '/tmp/workspace' } })
+  assert.match(elements.chat.textContent, /Allow this tool call\?/)
+  assert.equal(elements.chat.textContent.includes('Allowed once'), false)
+  assert.equal(elements.chat.textContent.includes('Running'), false)
+  assert.equal(elements.chat.textContent.includes('File written'), false)
+
+  const rows = elements.events.children.length
+  descendants(elements.chat).find((element) => element.className === 'allow').fire('click')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(posts, [{ connection: 'browser', id: 'ask-1', decision: 'allow' }])
+  assert.equal(elements.events.children.length, rows)
+  assert.equal(elements.chat.textContent.includes('Allowed once'), false)
+  assert.equal(elements.chat.textContent.includes('Running'), false)
+  assert.equal(elements.chat.textContent.includes('File written'), false)
+
+  emit({ seq: 7, type: 'permission.decided', callId: 'write-hello', name: 'write', decision: 'allow', arguments: { path: 'hello.txt', content: 'hello\n' }, workspace: '/tmp/workspace' })
+  assert.match(elements.chat.textContent, /Allowed once · write/)
+  assert.equal(elements.chat.textContent.includes('Running'), false)
+  assert.equal(elements.chat.textContent.includes('File written'), false)
+  emit({ seq: 8, type: 'tool.started', callId: 'write-hello', name: 'write', arguments: { path: 'hello.txt', content: 'hello\n' } })
+  assert.match(elements.chat.textContent, /Running write/)
+  assert.equal(elements.chat.textContent.includes('File written'), false)
+  emit({ seq: 9, type: 'tool.finished', callId: 'write-hello', result: 'File written.' })
+  assert.match(elements.chat.textContent, /File written\./)
 })

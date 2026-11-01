@@ -6,6 +6,9 @@ const prompt = get('prompt')
 const send = get('send')
 const notice = get('notice')
 const hint = get('hint')
+// Followed session events, in order. transcript() rebuilds the chat from `log`.
+// `pending` is the open ask on this connection. Allow once and Deny post that
+// ask; the chat shows the decision only after `permission.decided` arrives.
 const log = []
 const timingDetails = new Map()
 let cursor = 0

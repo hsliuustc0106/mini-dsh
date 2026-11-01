@@ -1,6 +1,9 @@
 import { completeFinish, observeStream, unknownOutcomes, unknownStreams } from './log.js'
 
-// A projection of one session log. It is derived on read and stored nowhere.
+// Projection of one append-only session log, derived on each call and stored
+// nowhere. Tool results, permission decisions, and stream text come only from
+// the events passed in. The viewer page and both GET /trajectory routes call
+// `project` on `session.events`. test/event-driven.test.js locks that.
 
 function sequenceGap(expected, received) {
   const error = new Error(`Trajectory sequence gap: expected ${expected}, received ${received}`)
