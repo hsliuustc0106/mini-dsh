@@ -149,6 +149,8 @@ export class WebControl extends Service {
       return send(res, 200, type, body)
     }
     if (req.method === 'GET' && url.pathname === '/trajectory') {
+      // Recomputed from the session log on every read. An unfinished span is
+      // marked open only while the agent is still busy.
       const projection = project(this.ctx.session.events)
       const overview = projection.overview.map(({ tokens, ...span }) => ({
         ...span,
