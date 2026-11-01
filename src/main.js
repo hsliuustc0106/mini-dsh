@@ -121,7 +121,10 @@ try {
   } else {
     console.log('Mini harness. /quit exits; workspace:', app.workspace)
     console.log('Session:', `${app.sessionPath} (${session.events.length} events)`)
-    if (app.ctx.viewer?.url) console.log('Trajectory:', app.ctx.viewer.url)
+    if (app.ctx.viewer?.url) {
+      console.log('Trajectory:', app.ctx.viewer.url)
+      console.log('Simulated prototype:', `${app.ctx.viewer.url}/prototype`)
+    }
     for (;;) {
       const input = await terminal.ask('\nYou> ')
       if (input == null || input.trim() === '/quit') break
