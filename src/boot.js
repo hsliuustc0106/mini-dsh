@@ -84,6 +84,8 @@ export async function boot(options = {}) {
     sessionPath,
     model: options.model,
     writable: options.writable !== false,
+    provider: options.provider,
+    approve: options.approve,
   })
   if (!Array.isArray(entries)) throw new Error('Composition must return an array of plugins')
   const ctx = new Context()
@@ -97,12 +99,18 @@ export async function boot(options = {}) {
     const report = started.map(describe)
     const problems = report.filter((item, index) => started[index].required !== false && item.state !== 'active')
     if (problems.length) throw new BootError(problems.map(formatProblem).join('; '), report)
+    let disposing
     return {
       ctx,
       workspace,
       sessionPath,
       report,
-      dispose: () => disposeAll(started),
+      // One disposal. A second call waits for the same sequence, so a turn can
+      // finish recording before the session fiber releases the writer.
+      dispose() {
+        disposing ??= disposeAll(started)
+        return disposing
+      },
     }
   } catch (error) {
     const report = error instanceof BootError && error.report?.length ? error.report : started.map(describe)

@@ -9,11 +9,6 @@ try {
     workspace: process.env.MINI_WORKSPACE || process.cwd(),
     session: process.env.MINI_SESSION,
     composition,
-    model: {
-      key: process.env.DEEPSEEK_API_KEY,
-      baseURL: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
-      model: process.env.DEEPSEEK_MODEL || 'deepseek-chat',
-    },
   })
   const { session } = app.ctx
   if (!session.writable) {
