@@ -45,7 +45,7 @@ export const runtimeContext = {
       order: 0,
       context: () => ({
         workspace: ctx.workspace.root,
-        permissions: 'read is allowed; each write, edit, and shell call requires approval; unknown tools are denied',
+        permissions: 'read, glob, and grep are allowed; each write, edit, and shell call requires approval; unknown tools are denied',
         sandbox: false,
       }),
     }))

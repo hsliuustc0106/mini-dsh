@@ -1,10 +1,11 @@
 import { Service } from '@deepseek-ai/cordis'
 
-// Allow read. Ask for each exact write, edit, or shell call. Deny anything else.
+// Allow read-only tools. Ask for each exact write, edit, or shell call. Deny anything else.
 // Only `true` is a grant. Approval is not a sandbox: an allowed command still
 // runs with the user's OS permissions, and the workspace is only its cwd.
 
 const ASKED = new Set(['write', 'edit', 'shell'])
+const ALLOWED = new Set(['read', 'glob', 'grep'])
 
 function untilAbort(signal) {
   if (!signal) return new Promise(() => {})
@@ -38,7 +39,7 @@ export class Permissions extends Service {
       arguments: structuredClone(call.arguments ?? null),
       workspace: this.ctx.workspace.root,
     }
-    if (call.name === 'read') return { ...detail, decision: 'allow' }
+    if (ALLOWED.has(call.name)) return { ...detail, decision: 'allow' }
     if (!ASKED.has(call.name)) return { ...detail, decision: 'deny', reason: 'unknown tool' }
     const answer = await answerFor(this.ask, structuredClone(detail), signal)
     if (signal?.aborted || answer !== true) {

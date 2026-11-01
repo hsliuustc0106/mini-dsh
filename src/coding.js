@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { exec } from 'node:child_process'
 import { isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
+import { searchTools } from './search.js'
 
 const run = promisify(exec)
 const parameters = (properties, required) => ({ type: 'object', properties, required, additionalProperties: false })
@@ -50,6 +51,7 @@ export const coding = {
             return (result.stdout + result.stderr).slice(0, 30000) || '(no output)'
           } catch (error) { return `Command failed: ${error.message}\n${error.stdout || ''}${error.stderr || ''}`.slice(0, 30000) }
         } },
+      ...searchTools(() => workspaceRoot(ctx)),
     ]
     for (const tool of tools) ctx.effect(() => ctx.tools.register(tool))
   },

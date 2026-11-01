@@ -4,6 +4,6 @@
   "private": true,
   "type": "module",
   "scripts": { "start": "node src/main.js", "view": "node src/view.js", "test": "node --test", "replay": "node --test test/terminal.test.js", "smoke": "node src/smoke.js" },
-  "dependencies": { "@deepseek-ai/cordis": "4.0.5" },
+  "dependencies": { "@deepseek-ai/cordis": "4.0.5", "@vscode/ripgrep": "^1.18.0" },
   "engines": { "node": ">=22.13.0" }
 }

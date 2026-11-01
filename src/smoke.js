@@ -149,7 +149,7 @@ function checkTurn(events, workspace, model) {
     throw new Error('user message was not in the recorded request')
   }
   const names = (body.tools ?? []).map((tool) => tool.function?.name)
-  for (const name of ['read', 'write', 'edit', 'shell']) {
+  for (const name of ['read', 'write', 'edit', 'shell', 'glob', 'grep']) {
     if (!names.includes(name)) throw new Error(`recorded tools omitted ${name}`)
   }
   if (body.tool_choice?.function?.name !== 'read') throw new Error('first request did not name the read tool')

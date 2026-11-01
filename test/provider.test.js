@@ -173,7 +173,7 @@ test('records the chat-completions body before posting it and keeps the key in t
     assert.match(body.messages[0].content, /"sandbox":false/)
     assert.equal(body.messages[1].role, 'user')
     assert.equal(body.messages[1].content, 'Read note.txt')
-    assert.equal(body.tools.map((tool) => tool.function.name).join(), 'read,write,edit,shell')
+    assert.equal(body.tools.map((tool) => tool.function.name).join(), 'read,write,edit,shell,glob,grep')
     assert.equal(JSON.stringify(body).includes('sk-secret'), false)
     const { events, text } = await saved(app)
     assert.equal(text.includes('sk-secret'), false)
