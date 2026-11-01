@@ -10,10 +10,10 @@ export class Prompt extends Service {
   }
 
   contribute(part) {
-    if (!part || (typeof part.instructions !== 'string' && typeof part.context !== 'function')) {
+    if (!part || (!['string', 'function'].includes(typeof part.instructions) && typeof part.context !== 'function')) {
       throw new Error('Prompt contribution needs instructions or context')
     }
-    const entry = { order: part.order ?? 0, seq: this.seq++, instructions: part.instructions, context: part.context }
+    const entry = { order: part.order ?? 0, seq: this.seq++, instructions: part.instructions, context: part.context, onUserInput: part.onUserInput }
     this.parts.push(entry)
     return () => {
       const index = this.parts.indexOf(entry)
@@ -21,11 +21,20 @@ export class Prompt extends Service {
     }
   }
 
-  snapshot() {
+  async resolveUserInput(input) {
     const ordered = [...this.parts].sort((a, b) => a.order - b.order || a.seq - b.seq)
+    const contributions = await Promise.all(ordered.filter((part) => typeof part.onUserInput === 'function').map((part) => part.onUserInput(input)))
+    return contributions.flat()
+  }
+
+  async snapshot() {
+    const ordered = [...this.parts].sort((a, b) => a.order - b.order || a.seq - b.seq)
+    const instructions = await Promise.all(ordered.filter((part) => part.instructions != null).map((part) =>
+      typeof part.instructions === 'function' ? part.instructions() : part.instructions))
+    const context = await Promise.all(ordered.filter((part) => typeof part.context === 'function').map((part) => part.context()))
     return {
-      instructions: ordered.filter((part) => typeof part.instructions === 'string').map((part) => part.instructions),
-      context: ordered.filter((part) => typeof part.context === 'function').map((part) => part.context()),
+      instructions: instructions.filter((part) => typeof part === 'string' && part),
+      context,
     }
   }
 }
@@ -45,7 +54,7 @@ export const runtimeContext = {
       order: 0,
       context: () => ({
         workspace: ctx.workspace.root,
-        permissions: 'read, glob, and grep are allowed; each write, edit, and shell call requires approval; unknown tools are denied',
+        permissions: 'read, glob, grep, and skill are allowed; each write, edit, and shell call requires approval; unknown tools are denied',
         sandbox: false,
       }),
     }))
