@@ -7,7 +7,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { boot } from '../src/boot.js'
 import { composition } from '../src/composition.js'
 import { acquireWriter, lockPathFor } from '../src/lock.js'
-import { unknownOutcomes } from '../src/log.js'
+import { observeStream, unknownOutcomes } from '../src/log.js'
 import { Prompt } from '../src/prompt.js'
 import { fakeProvider } from '../src/provider.js'
 
@@ -498,4 +498,102 @@ test('disposal cancels a pending approval without running the tool or granting i
       assert.equal(again.ctx.session.events.some((event) => event.type === 'tool.started'), false)
     } finally { await again.dispose() }
   } finally { await app.dispose(); await rm(dir, { recursive: true, force: true }) }
+})
+
+test('the assistant message is only the text committed in stream deltas', async () => {
+  const dir = await directory()
+  let tick = 0
+  const clock = () => new Date(Date.UTC(2026, 0, 1, 0, 0, tick++)).toISOString()
+  const provider = fakeProvider([{ stream: [
+    { text: 'saw ' },
+    { reasoning: 'note' },
+    { text: 'a' },
+    { finish: 'stop' },
+  ] }])
+  const app = await boot({ workspace: dir, provider, clock })
+  try {
+    await app.ctx.agent.turn('Hi')
+    const { events } = await saved(app)
+    const request = events.find((event) => event.type === 'model.request')
+    const started = events.find((event) => event.type === 'stream.started')
+    const deltas = events.filter((event) => event.type === 'stream.delta')
+    const ended = events.find((event) => event.type === 'stream.ended')
+    const message = events.find((event) => event.seq === ended.seq + 1)
+    assert.ok(request.seq < started.seq && started.seq < deltas[0].seq && deltas.at(-1).seq < ended.seq)
+    assert.ok(request.time < deltas[0].time && deltas[0].time < deltas.at(-1).time && deltas.at(-1).time <= ended.time)
+    const observed = observeStream(events, ended.stream)
+    assert.equal(observed.text, 'saw a')
+    assert.equal(observed.reasoning, 'note')
+    assert.equal(message.message.content, 'saw a')
+    assert.equal(message.message.reasoning_content, 'note')
+    assert.equal(events.filter((event) => event.message?.role === 'assistant').length, 1)
+    assert.equal(app.ctx.session.messages.at(-1).content, 'saw a')
+  } finally { await app.dispose(); await rm(dir, { recursive: true, force: true }) }
+})
+
+test('a failed stream checkpoint does not invent the uncommitted tail', async () => {
+  const dir = await directory()
+  const provider = fakeProvider([{ stream: [
+    { text: 'Hel' },
+    { text: 'lo!' },
+    { finish: 'stop' },
+  ] }])
+  const app = await boot({ workspace: dir, provider })
+  try {
+    const session = app.ctx.session
+    let deltas = 0
+    session.config.write = async (line) => {
+      const event = JSON.parse(line)
+      if (event.type === 'stream.delta' && ++deltas === 2) throw new Error('disk full')
+      const buffer = Buffer.from(line)
+      let offset = 0
+      while (offset < buffer.length) {
+        const { bytesWritten } = await session.handle.write(buffer.subarray(offset))
+        if (!bytesWritten) throw new Error('incomplete log write')
+        offset += bytesWritten
+      }
+    }
+    await assert.rejects(app.ctx.agent.turn('Hi'), /disk full/)
+    const { text } = await saved(app)
+    assert.equal(text.includes('Hel'), true)
+    assert.equal(text.includes('lo!'), false)
+    assert.equal(text.includes('stream.ended'), false)
+    assert.equal(text.includes('"role":"assistant"'), false)
+    await assert.rejects(app.ctx.checkpoint.commit({ type: 'note' }), /blocked/)
+  } finally { await app.dispose(); await rm(dir, { recursive: true, force: true }) }
+})
+
+test('a dropped stream leaves the observed prefix and stays read-only', async () => {
+  const dir = await directory()
+  const provider = {
+    inject: ['model'],
+    apply(ctx) {
+      ctx.effect(() => ctx.model.register({
+        name: 'fake',
+        prepare: () => ({ model: 'fake' }),
+        async *dispatch() {
+          yield { start: true }
+          yield { text: 'Hel' }
+          throw new Error('socket closed')
+        },
+      }))
+    },
+  }
+  const app = await boot({ workspace: dir, provider })
+  const sessionPath = app.sessionPath
+  try {
+    await assert.rejects(app.ctx.agent.turn('Hi'), /socket closed/)
+    const { events, text } = await saved(app)
+    assert.equal(events.some((event) => event.text === 'Hel'), true)
+    assert.equal(text.includes('Hello'), false)
+    assert.equal(events.some((event) => event.type === 'stream.ended'), false)
+    assert.equal(events.some((event) => event.message?.role === 'assistant'), false)
+    assert.match(app.ctx.session.readonlyReason, /unknown stream outcome/)
+  } finally { await app.dispose() }
+  const again = await boot({ workspace: dir, session: sessionPath, provider: fakeProvider([]) })
+  try {
+    assert.equal(again.ctx.session.writable, false)
+    assert.equal(again.ctx.session.messages.some((message) => message.role === 'assistant'), false)
+    assert.match(again.ctx.session.readonlyReason, /unknown stream outcome/)
+  } finally { await again.dispose(); await rm(dir, { recursive: true, force: true }) }
 })

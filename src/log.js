@@ -36,7 +36,31 @@ export function assertEvent(event, seq) {
   if ((event.type === 'tool.started' || event.type === 'tool.finished') && (typeof event.callId !== 'string' || !event.callId)) {
     throw corrupt('tool event requires callId')
   }
+  if ((event.type === 'stream.delta' || event.type === 'stream.ended') && (!Number.isInteger(event.stream) || event.stream < 1)) {
+    throw corrupt('stream event requires stream')
+  }
+  if (event.type === 'stream.delta' && !deltaPayload(event)) throw corrupt('stream delta is empty')
+  if (event.type === 'stream.delta' && event.tool_call != null && !toolPiece(event.tool_call)) throw corrupt('invalid tool call')
+  if (event.type === 'stream.ended' && (typeof event.finish !== 'string' || !event.finish)) throw corrupt('stream end requires finish')
   if (event.time != null && typeof event.time !== 'string') throw corrupt('time must be a string')
+}
+
+function deltaPayload(event) {
+  if (typeof event.text === 'string' && event.text) return true
+  if (typeof event.reasoning === 'string' && event.reasoning) return true
+  return event.tool_call != null
+}
+
+function toolPiece(piece) {
+  return piece && typeof piece === 'object' && !Array.isArray(piece)
+}
+
+// A finish the provider completed. aborted and insufficient_system_resource
+// were observed, but the generation did not finish.
+const COMPLETE_FINISH = new Set(['stop', 'length', 'tool_calls', 'content_filter'])
+
+export function completeFinish(finish) {
+  return COMPLETE_FINISH.has(finish)
 }
 
 // A model tool call is open from the assistant message until its tool result.
@@ -67,8 +91,92 @@ export function unknownOutcomes(events) {
   return [...new Set([...conversation, ...execution])]
 }
 
-export function unknownReason(callIds) {
-  return `Session is read-only: unknown tool outcome for ${callIds.join(', ')}. Inspect the workspace and start a new session.`
+function applyTool(tools, piece) {
+  if (!toolPiece(piece) || !Number.isInteger(piece.index) || piece.index < 0) throw corrupt('invalid tool call index')
+  const current = tools.get(piece.index) ?? { id: undefined, type: 'function', name: '', arguments: '' }
+  if (piece.id != null) {
+    if (typeof piece.id !== 'string' || !piece.id) throw corrupt('invalid tool call id')
+    if (current.id && current.id !== piece.id) throw corrupt('tool call id changed')
+    current.id = piece.id
+  }
+  if (piece.name != null) {
+    if (typeof piece.name !== 'string' || !piece.name) throw corrupt('invalid tool call name')
+    if (current.name && current.name !== piece.name) throw corrupt('tool call name changed')
+    current.name = piece.name
+  }
+  if (piece.type != null) {
+    if (typeof piece.type !== 'string' || !piece.type) throw corrupt('invalid tool call type')
+    current.type = piece.type
+  }
+  if (piece.arguments != null) {
+    if (typeof piece.arguments !== 'string') throw corrupt('invalid tool call arguments')
+    current.arguments += piece.arguments
+  }
+  tools.set(piece.index, current)
+}
+
+// Text and tool calls reconstructed from committed deltas. This does not fill
+// in a fragment that was never written.
+export function observeStream(events, stream) {
+  let text = ''
+  let reasoning = ''
+  const tools = new Map()
+  let finish = null
+  for (const event of events) {
+    if (event.type === 'stream.delta' && event.stream === stream) {
+      if (typeof event.text === 'string') text += event.text
+      if (typeof event.reasoning === 'string') reasoning += event.reasoning
+      if (event.tool_call) applyTool(tools, event.tool_call)
+    } else if (event.type === 'stream.ended' && event.stream === stream) finish = event.finish
+  }
+  const tool_calls = [...tools.keys()].sort((a, b) => a - b).map((index) => {
+    const call = tools.get(index)
+    return { id: call.id, type: call.type || 'function', function: { name: call.name, arguments: call.arguments } }
+  })
+  return { text, reasoning, finish, tool_calls, complete: completeFinish(finish) }
+}
+
+// stream.started is open until a complete stream.ended and the assistant
+// message that follows it. An incomplete finish stays open. Nothing here
+// synthesizes the missing message.
+export function unknownStreams(events) {
+  let open = null
+  let sawEnd = false
+  let awaiting = null
+  const tools = new Map()
+  for (const event of events) {
+    if (event.type === 'stream.started') {
+      if (open != null || awaiting != null) throw corrupt('stream already open')
+      open = event.seq
+      sawEnd = false
+      tools.clear()
+    } else if (event.type === 'stream.delta') {
+      if (open == null || sawEnd || event.stream !== open) throw corrupt(`stream delta without a start (${event.stream})`)
+      if (event.tool_call) applyTool(tools, event.tool_call)
+    } else if (event.type === 'stream.ended') {
+      if (open == null || sawEnd || event.stream !== open) throw corrupt(`stream end without a start (${event.stream})`)
+      sawEnd = true
+      if (completeFinish(event.finish)) {
+        awaiting = open
+        open = null
+      }
+    } else if (awaiting != null) {
+      if (event.type === 'message' && event.message?.role === 'assistant') awaiting = null
+      else throw corrupt('stream ended without an assistant message')
+    }
+  }
+  const unknown = []
+  if (open != null) unknown.push(open)
+  if (awaiting != null) unknown.push(awaiting)
+  return unknown
+}
+
+export function unknownReason(callIds, streams = []) {
+  const parts = []
+  if (callIds?.length) parts.push(`unknown tool outcome for ${callIds.join(', ')}`)
+  if (streams?.length) parts.push(`unknown stream outcome for ${streams.join(', ')}`)
+  if (!parts.length) parts.push('unknown outcome')
+  return `Session is read-only: ${parts.join('; ')}. Inspect the workspace and start a new session.`
 }
 
 export function createEvent(input, seq, clock) {
@@ -97,6 +205,7 @@ export function parseSession(buffer) {
     }
   }
   unknownOutcomes(events)
+  unknownStreams(events)
   return { events, incompleteTail: Buffer.from(incompleteTail), size: buffer.length }
 }
 

@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { observeStream } from './log.js'
 import { DEEPSEEK_MODEL, readApiKey } from './provider.js'
 
 // One live terminal turn. Not part of npm test. Exits 0 without a key.
@@ -123,7 +124,23 @@ function checkTurn(events, workspace, model) {
   if (first.provider !== 'deepseek') throw new Error(`provider was ${first.provider}`)
   const body = first.body
   if (body.model !== model) throw new Error(`model was ${body.model}`)
-  if (body.stream !== false) throw new Error('request stream was not false')
+  if (body.stream !== true) throw new Error('request stream was not true')
+  const ends = events.filter((event) => event.type === 'stream.ended')
+  if (!ends.length || !events.some((event) => event.type === 'stream.delta')) {
+    throw new Error('live turn recorded no stream')
+  }
+  for (const ended of ends) {
+    const next = events.find((event) => event.seq === ended.seq + 1)
+    const observed = observeStream(events, ended.stream)
+    if (!observed.complete || next?.type !== 'message' || next.message.role !== 'assistant') {
+      throw new Error('stream end was not followed by the observed assistant message')
+    }
+    if ((next.message.content ?? '') !== observed.text) throw new Error('assistant message does not match streamed text')
+    if (next.message.tool_calls?.length) {
+      const recorded = JSON.stringify(next.message.tool_calls)
+      if (recorded !== JSON.stringify(observed.tool_calls)) throw new Error('assistant tool calls do not match streamed fragments')
+    }
+  }
   if (body.thinking?.type !== 'disabled') throw new Error('thinking was not disabled')
   if (body.messages?.[0]?.role !== 'system' || !body.messages[0].content.includes('"sandbox":false')) {
     throw new Error('request context did not record sandbox false')

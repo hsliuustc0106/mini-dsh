@@ -7,7 +7,8 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import { boot } from '../src/boot.js'
-import { deepseekProvider, providerForConfig, readApiKey } from '../src/provider.js'
+import { observeStream } from '../src/log.js'
+import { deepseekProvider, fakeProvider, providerForConfig, readApiKey } from '../src/provider.js'
 import { Model } from '../src/services.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
@@ -60,6 +61,22 @@ function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), { status, headers: { 'Content-Type': 'application/json' } })
 }
 
+function piece(delta, finish = null) {
+  return { choices: [{ index: 0, delta, finish_reason: finish }] }
+}
+
+function sse(chunks, { done = true, status = 200 } = {}) {
+  const parts = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`)
+  if (done) parts.push('data: [DONE]\n\n')
+  return new Response(parts.join(''), { status, headers: { 'Content-Type': 'text/event-stream' } })
+}
+
+async function collect(iterable) {
+  const chunks = []
+  for await (const chunk of iterable) chunks.push(chunk)
+  return chunks
+}
+
 async function saved(app) {
   const text = await readFile(app.sessionPath, 'utf8')
   return { text, events: text.trim() ? text.trim().split('\n').map((line) => JSON.parse(line)) : [] }
@@ -76,7 +93,10 @@ test('prepared replies stay on the fake provider when a key is present', async (
       instructions: ['Stay'], context: [], messages: [{ role: 'user', content: 'Hi' }], tools: [],
     })
     assert.equal(prepared.provider, 'fake')
-    assert.equal((await prepared.dispatch()).content, 'ok')
+    const chunks = await collect(prepared.dispatch())
+    assert.equal(chunks[0].start, true)
+    assert.equal(chunks.filter((chunk) => chunk.text).map((chunk) => chunk.text).join(''), 'ok')
+    assert.equal(chunks.at(-1).finish, 'stop')
     assert.equal(JSON.stringify(plugin.sent).includes('sk-secret'), false)
     await assert.rejects(async () => prepared.dispatch(), /already used/)
   } finally {
@@ -104,7 +124,12 @@ test('records the chat-completions body before posting it and keeps the key in t
       assert.equal(JSON.stringify(recorded.body), calls[0].init.body)
       assert.equal(text.includes('sk-secret'), false)
       assert.equal(text.includes('Authorization'), false)
-      return jsonResponse(completion(assistant(null, [call('read-1', 'read', { path: 'note.txt' })])))
+      return sse([
+        piece({ role: 'assistant', content: '' }),
+        piece({ tool_calls: [{ index: 0, id: 'read-1', type: 'function', function: { name: 'read', arguments: '' } }] }),
+        piece({ tool_calls: [{ index: 0, function: { arguments: '{"path":' } }] }),
+        piece({ tool_calls: [{ index: 0, function: { arguments: '"note.txt"}' } }] }, 'tool_calls'),
+      ])
     },
     async () => {
       const { events } = await saved(app)
@@ -112,7 +137,10 @@ test('records the chat-completions body before posting it and keeps the key in t
       assert.equal(JSON.stringify(recorded.body), calls[1].init.body)
       assert.equal(recorded.body.tool_choice, undefined)
       assert.equal(recorded.body.messages.at(-1).content, 'note')
-      return jsonResponse(completion(assistant('saw note')))
+      return sse([
+        piece({ content: 'saw ' }),
+        piece({ content: 'note' }, 'stop'),
+      ])
     },
   ])
   const asks = []
@@ -137,7 +165,7 @@ test('records the chat-completions body before posting it and keeps the key in t
     assert.equal(calls[0].init.headers['Content-Type'], 'application/json')
     const body = JSON.parse(calls[0].init.body)
     assert.equal(body.model, 'deepseek-flash')
-    assert.equal(body.stream, false)
+    assert.equal(body.stream, true)
     assert.deepEqual(body.thinking, { type: 'disabled' })
     assert.equal(body.tool_choice.function.name, 'read')
     assert.equal(body.messages[0].role, 'system')
@@ -159,6 +187,10 @@ test('records the chat-completions body before posting it and keeps the key in t
     assert.equal(started.seq < finished.seq, true)
     assert.equal(finished.result, 'note')
     assert.equal(events.at(-1).message.content, 'saw note')
+    const firstEnd = events.find((event) => event.type === 'stream.ended')
+    const firstDeltas = events.filter((event) => event.type === 'stream.delta' && event.stream === firstEnd.stream)
+    assert.equal(firstDeltas.map((event) => event.tool_call?.arguments ?? '').join(''), '{"path":"note.txt"}')
+    assert.equal(events.find((event) => event.seq === firstEnd.seq + 1).message.tool_calls[0].id, 'read-1')
   } finally {
     await app.dispose()
     await rm(dir, { recursive: true, force: true })
@@ -169,8 +201,10 @@ test('a deepseek write still asks and a denial does not start the tool', async (
   const dir = await directory()
   const asks = []
   const { calls, fetchImpl } = mockFetch([
-    async () => jsonResponse(completion(assistant(null, [call('w1', 'write', { path: 'marker.txt', content: 'nope' })]))),
-    async () => jsonResponse(completion(assistant('stopped'))),
+    async () => sse([
+      piece({ tool_calls: [{ index: 0, id: 'w1', type: 'function', function: { name: 'write', arguments: '{"path":"marker.txt","content":"nope"}' } }] }, 'tool_calls'),
+    ]),
+    async () => sse([piece({ content: 'stopped' }, 'stop')]),
   ])
   const app = await boot({
     workspace: dir,
@@ -218,6 +252,96 @@ test('an error response redacts the key and leaves the recorded request', async 
     assert.equal(events.some((event) => event.type === 'model.request'), true)
     assert.equal(events.some((event) => event.message?.role === 'assistant'), false)
     assert.equal(text.includes('sk-secret'), false)
+  } finally {
+    await app.dispose()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a split sse body is assembled, redacted, and stored as the observed text', async () => {
+  const dir = await directory()
+  const payload = [
+    `data: ${JSON.stringify(piece({ content: 'sk-secret ' }))}\n\n`,
+    `data: ${JSON.stringify(piece({ content: 'seen' }, 'stop'))}\n\n`,
+    'data: [DONE]\n\n',
+  ].join('')
+  const bytes = new TextEncoder().encode(payload)
+  const fetchImpl = async () => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes.subarray(0, 8))
+      controller.enqueue(bytes.subarray(8, 20))
+      controller.enqueue(bytes.subarray(20))
+      controller.close()
+    },
+  }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  const app = await boot({
+    workspace: dir,
+    provider: deepseekProvider({ apiKey: 'sk-secret', baseUrl: 'https://example.test', fetch: fetchImpl }),
+  })
+  try {
+    await app.ctx.agent.turn('Hello')
+    const { events, text } = await saved(app)
+    assert.equal(text.includes('sk-secret'), false)
+    assert.equal(text.includes('Authorization'), false)
+    const ended = events.find((event) => event.type === 'stream.ended')
+    assert.equal(ended.finish, 'stop')
+    assert.equal(observeStream(events, ended.stream).text, '[redacted] seen')
+    assert.equal(events.find((event) => event.seq === ended.seq + 1).message.content, '[redacted] seen')
+    assert.equal(events.filter((event) => event.type === 'model.request').length, 1)
+  } finally {
+    await app.dispose()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('an unfinished deepseek stream keeps the observed delta and does not invent the reply', async () => {
+  const dir = await directory()
+  const fetchImpl = async () => sse([piece({ content: 'partial' })], { done: false })
+  const app = await boot({
+    workspace: dir,
+    provider: deepseekProvider({ apiKey: 'sk-secret', baseUrl: 'https://example.test', fetch: fetchImpl }),
+  })
+  const sessionPath = app.sessionPath
+  try {
+    await assert.rejects(app.ctx.agent.turn('Hello'), /before a finish/)
+    const { events, text } = await saved(app)
+    assert.equal(text.includes('sk-secret'), false)
+    assert.equal(events.some((event) => event.type === 'stream.delta' && event.text === 'partial'), true)
+    assert.equal(events.some((event) => event.type === 'stream.ended'), false)
+    assert.equal(events.some((event) => event.message?.role === 'assistant'), false)
+    assert.match(app.ctx.session.readonlyReason, /unknown stream outcome/)
+    await assert.rejects(app.ctx.agent.turn('Again'), /unknown stream outcome/)
+  } finally { await app.dispose() }
+  const again = await boot({ workspace: dir, session: sessionPath, provider: fakeProvider([assistant('guess')]) })
+  try {
+    assert.equal(again.ctx.session.writable, false)
+    assert.equal(again.ctx.session.events.some((event) => event.message?.role === 'assistant'), false)
+    assert.match(again.ctx.session.readonlyReason, /unknown stream outcome/)
+  } finally {
+    await again.dispose()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('an aborted finish is recorded and is not turned into an assistant message', async () => {
+  const dir = await directory()
+  const fetchImpl = async () => sse([
+    piece({ content: 'half' }),
+    piece({}, 'aborted'),
+  ])
+  const app = await boot({
+    workspace: dir,
+    provider: deepseekProvider({ apiKey: 'sk-secret', baseUrl: 'https://example.test', fetch: fetchImpl }),
+  })
+  try {
+    await assert.rejects(app.ctx.agent.turn('Hello'), /incomplete: aborted/)
+    const { events, text } = await saved(app)
+    assert.equal(text.includes('sk-secret'), false)
+    const ended = events.find((event) => event.type === 'stream.ended')
+    assert.equal(ended.finish, 'aborted')
+    assert.equal(observeStream(events, ended.stream).text, 'half')
+    assert.equal(events.some((event) => event.message?.role === 'assistant'), false)
+    assert.match(app.ctx.session.readonlyReason, /unknown stream outcome/)
   } finally {
     await app.dispose()
     await rm(dir, { recursive: true, force: true })

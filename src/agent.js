@@ -1,4 +1,5 @@
 import { Service } from '@deepseek-ai/cordis'
+import { completeFinish, observeStream, unknownReason } from './log.js'
 import { validateArguments } from './services.js'
 
 function fail(message, code) {
@@ -14,6 +15,16 @@ function toolCalls(response) {
     throw new Error('Model returned invalid tool calls')
   }
   return calls
+}
+
+function deltaFrom(stream, chunk) {
+  if (!chunk || typeof chunk !== 'object') return null
+  const event = { type: 'stream.delta', stream }
+  if (typeof chunk.text === 'string' && chunk.text) event.text = chunk.text
+  if (typeof chunk.reasoning === 'string' && chunk.reasoning) event.reasoning = chunk.reasoning
+  if (chunk.tool_call) event.tool_call = chunk.tool_call
+  if (!event.text && !event.reasoning && !event.tool_call) return null
+  return event
 }
 
 function assistantMessage(response, calls) {
@@ -62,10 +73,8 @@ export class Agent extends Service {
     const { checkpoint } = this.ctx
     await checkpoint.commit({ role: 'user', content: input })
     while (!this.stopping) {
-      const response = await this.complete()
-      const calls = toolCalls(response)
-      const message = assistantMessage(response, calls)
-      await checkpoint.commit(message)
+      const message = await this.complete(signal)
+      const calls = message.tool_calls ?? []
       if (message.content) report({ type: 'assistant', content: message.content })
       if (!calls.length) return
       for (let index = 0; index < calls.length; index++) {
@@ -78,7 +87,7 @@ export class Agent extends Service {
     }
   }
 
-  async complete() {
+  async complete(signal) {
     const { model, tools, session, checkpoint, prompt } = this.ctx
     const snap = prompt.snapshot()
     const prepared = model.prepare({
@@ -88,7 +97,52 @@ export class Agent extends Service {
       tools: tools.schemas(),
     })
     await checkpoint.commit({ type: 'model.request', provider: prepared.provider, body: prepared.body })
-    return prepared.dispatch()
+    let started = null
+    let recorded = false
+    try {
+      let finish = null
+      for await (const chunk of prepared.dispatch(signal)) {
+        if (chunk?.start) {
+          if (started) throw new Error('Model stream already started')
+          started = await checkpoint.commit({ type: 'stream.started' })
+        } else if (!started) {
+          throw new Error('Model stream chunk before start')
+        } else if (chunk?.finish) {
+          if (finish) throw new Error('Model stream already finished')
+          finish = chunk.finish
+        } else {
+          const delta = deltaFrom(started.seq, chunk)
+          if (delta) await checkpoint.commit(delta)
+        }
+        if (signal?.aborted || this.stopping) throw fail('Agent is shutting down', 'BUSY')
+      }
+      if (!started || typeof finish !== 'string' || !finish) throw new Error('Model stream ended incomplete')
+      await checkpoint.commit({ type: 'stream.ended', stream: started.seq, finish })
+      if (!completeFinish(finish)) throw new Error(`Model stream ended incomplete: ${finish}`)
+      const observed = observeStream(session.events, started.seq)
+      const calls = toolCalls({ role: 'assistant', tool_calls: observed.tool_calls })
+      const message = assistantMessage({
+        content: observed.text ? observed.text : null,
+        reasoning_content: observed.reasoning || undefined,
+      }, calls)
+      if ((message.content ?? '') !== observed.text) throw new Error('Assistant text was not observed')
+      await checkpoint.commit(message)
+      recorded = true
+      return message
+    } catch (error) {
+      if (started && !recorded) this.freezeStream(started.seq)
+      throw error
+    }
+  }
+
+  // The assistant message was not committed. Later commits in this process
+  // stop, and a new process does not complete the stream.
+  freezeStream(seq) {
+    const session = this.ctx.session
+    if (!session.writable) return
+    session.unknownStreams = [seq]
+    session.writable = false
+    session.readonlyReason = unknownReason([], [seq])
   }
 
   async oneCall(call, report, signal) {
