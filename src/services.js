@@ -129,7 +129,10 @@ export class Session extends Service {
   }
 
   get messages() {
-    return this.events.filter((event) => event.type === 'message').map((event) => event.message)
+    return this.events.filter((event) => event.type === 'message').flatMap((event) => {
+      const { skillInvocations, ...message } = event.message
+      return [message, ...(skillInvocations ?? []).map(({ content }) => ({ role: 'user', content }))]
+    })
   }
 
   history(after = 0) {

@@ -4,6 +4,7 @@ import { instructions, Prompt, runtimeContext } from './prompt.js'
 import { Permissions } from './permissions.js'
 import { fakeProvider } from './provider.js'
 import { Checkpoint, Model, Session, Tools, Workspace } from './services.js'
+import { skills } from './skills.js'
 import { TrajectoryViewer } from './viewer.js'
 import { WebControl } from './web-control.js'
 
@@ -15,13 +16,14 @@ function viewerEntry(view) {
   return { name: 'viewer', plugin: TrajectoryViewer, config: view === true ? {} : view }
 }
 
-export function composition({ workspace, sessionPath, writable = true, provider, approve, model, clock, view, web } = {}) {
+export function composition({ workspace, sessionPath, writable = true, provider, approve, model, clock, view, web, skillOptions } = {}) {
   const viewer = viewerEntry(view)
   return [
     ...(viewer ? [viewer] : []),
     ...(web ? [{ name: 'web-control', plugin: WebControl, config: web === true ? {} : web }] : []),
     { name: 'agent', plugin: Agent },
     { name: 'coding', plugin: coding },
+    { name: 'skills', plugin: skills, config: skillOptions },
     { name: 'instructions', plugin: instructions },
     { name: 'runtime-context', plugin: runtimeContext },
     { name: 'permissions', plugin: Permissions, config: { ask: approve } },

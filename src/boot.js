@@ -89,6 +89,7 @@ export async function boot(options = {}) {
     clock: options.clock,
     view: options.view,
     web: options.web,
+    skillOptions: options.skillOptions,
   })
   if (!Array.isArray(entries)) throw new Error('Composition must return an array of plugins')
   const ctx = new Context()

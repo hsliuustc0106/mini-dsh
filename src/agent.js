@@ -70,8 +70,9 @@ export class Agent extends Service {
   }
 
   async runTurn(input, report, signal, approve) {
-    const { checkpoint } = this.ctx
-    await checkpoint.commit({ role: 'user', content: input })
+    const { checkpoint, prompt } = this.ctx
+    const skillInvocations = await prompt.resolveUserInput(input)
+    await checkpoint.commit({ role: 'user', content: input, ...(skillInvocations.length ? { skillInvocations } : {}) })
     while (!this.stopping) {
       const message = await this.complete(signal)
       const calls = message.tool_calls ?? []
@@ -89,7 +90,7 @@ export class Agent extends Service {
 
   async complete(signal) {
     const { model, tools, session, checkpoint, prompt } = this.ctx
-    const snap = prompt.snapshot()
+    const snap = await prompt.snapshot()
     const prepared = model.prepare({
       instructions: snap.instructions,
       context: snap.context,

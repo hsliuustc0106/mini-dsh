@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { request as httpRequest } from 'node:http'
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { boot } from '../src/boot.js'
@@ -119,6 +119,29 @@ test('web prompt allows one exact call, denies the next, and rejects stale appro
     assert.equal(timing.cursor, saved.at(-1).seq)
     assert.deepEqual(timing.overview, project(saved).overview.map(({ tokens, ...span }) => span))
     assert.deepEqual(timing.overview.map((span) => span.kind), ['input', 'model', 'tool', 'model'])
+  } finally { client.close(); await run.close() }
+})
+
+test('browser turns resolve explicit skills and keep their per-call approval', async () => {
+  const run = await start([assistant(null, [call('skill-write', 'skill.txt', 'ok')]), assistant('Done.')])
+  const client = await stream(run.url)
+  try {
+    const skillDir = join(run.dir, '.agents', 'skills', 'web-skill-check')
+    await mkdir(skillDir, { recursive: true })
+    await writeFile(join(skillDir, 'SKILL.md'), '---\nname: web-skill-check\ndescription: A browser test skill\n---\nFollow the browser skill instructions.\n')
+    const { connection } = await client.wait('hello')
+    assert.equal((await request(run.url, '/turn', { method: 'POST', data: { connection, input: '/web-skill-check create a file' } })).status, 202)
+    const approval = (await client.wait('approval', (data) => data.pending)).pending
+    assert.equal(approval.name, 'write')
+    assert.equal((await request(run.url, '/approval', { method: 'POST', data: { connection, id: approval.id, decision: 'allow' } })).status, 200)
+    await client.wait('session', (event) => event.type === 'message' && event.message.content === 'Done.')
+    const events = run.app.ctx.session.events
+    const user = events.find((event) => event.message?.role === 'user').message
+    assert.deepEqual(user.skillInvocations.map((item) => item.name), ['web-skill-check'])
+    assert.match(user.skillInvocations[0].content, /Follow the browser skill instructions/)
+    assert.ok(events.find((event) => event.type === 'model.request').body.messages.some((message) => message.content?.includes('Follow the browser skill instructions')))
+    assert.equal(events.find((event) => event.type === 'permission.decided').decision, 'allow')
+    assert.equal(await readFile(join(run.dir, 'skill.txt'), 'utf8'), 'ok')
   } finally { client.close(); await run.close() }
 })
 
@@ -250,6 +273,9 @@ test('local control rejects untrusted requests and the separate viewer is read-o
     assert.equal((await request(run.url, '/turn', { method: 'POST', data: { connection: 'unknown', input: 'bad' } })).status, 409)
     assert.equal((await request(run.url, '/turn', { method: 'POST', data: { connection, input: '   ' } })).status, 400)
     const viewer = run.app.ctx.viewer.url
+    const prototype = await request(viewer, '/prototype')
+    assert.equal(prototype.status, 200)
+    assert.match(prototype.body, /simulated/i)
     assert.equal((await request(viewer, '/turn', { method: 'POST', data: { input: 'bad' } })).status, 405)
     assert.equal((await request(viewer, '/approval', { method: 'POST', data: {} })).status, 405)
     assert.equal(run.app.ctx.session.events.length, 1)

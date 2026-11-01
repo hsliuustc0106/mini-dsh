@@ -5,7 +5,7 @@ import { Service } from '@deepseek-ai/cordis'
 // runs with the user's OS permissions, and the workspace is only its cwd.
 
 const ASKED = new Set(['write', 'edit', 'shell'])
-const ALLOWED = new Set(['read', 'glob', 'grep'])
+const ALLOWED = new Set(['read', 'glob', 'grep', 'skill'])
 
 function untilAbort(signal) {
   if (!signal) return new Promise(() => {})

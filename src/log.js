@@ -18,6 +18,10 @@ export function invalidSequence(detail) {
 function assertMessage(message) {
   if (!message || typeof message !== 'object' || Array.isArray(message)) throw corrupt('message must be an object')
   if (!['user', 'assistant', 'tool'].includes(message.role)) throw corrupt('invalid message role')
+  if (message.skillInvocations != null && (message.role !== 'user' || !Array.isArray(message.skillInvocations)
+    || message.skillInvocations.some((item) => !item || typeof item.name !== 'string' || !item.name || typeof item.content !== 'string'))) {
+    throw corrupt('invalid skill invocations')
+  }
   if (message.role === 'assistant' && message.tool_calls != null) {
     if (!Array.isArray(message.tool_calls) || message.tool_calls.some((call) => !call || typeof call.id !== 'string' || !call.id)) {
       throw corrupt('invalid tool calls')

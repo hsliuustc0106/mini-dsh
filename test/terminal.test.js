@@ -13,7 +13,8 @@ const managed = ['MINI_WORKSPACE', 'MINI_SESSION', 'MINI_REPLIES', 'MINI_CLOCK',
 function cleanEnv(overrides) {
   const env = { ...process.env }
   for (const name of managed) delete env[name]
-  return { ...env, DEEPSEEK_API_KEY: 'sk-secret', ...overrides }
+  const emptyHome = join(overrides.MINI_WORKSPACE ?? tmpdir(), 'empty-skill-home')
+  return { ...env, DEEPSEEK_API_KEY: 'sk-secret', DSH_HOME: emptyHome, DSH_AGENTS_HOME: emptyHome, DSH_BUNDLED_SKILL_DIR: emptyHome, ...overrides }
 }
 
 function startMain(overrides) {

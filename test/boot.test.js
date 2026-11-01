@@ -100,7 +100,7 @@ test('boots the composition, records the workspace, and releases the writer on f
       assert.equal(app.workspace, dir)
       assert.equal(app.sessionPath, join(dir, 'nested/session.jsonl'))
       assert.equal(app.ctx.workspace.root, dir)
-      assert.equal(app.ctx.tools.schemas().length, 6)
+      assert.equal(app.ctx.tools.schemas().length, 7)
       assert.equal(app.ctx.session.writable, true)
       assert.equal(app.ctx.session.events[0].type, 'session.opened')
       assert.equal(app.ctx.session.events[0].workspace, dir)
