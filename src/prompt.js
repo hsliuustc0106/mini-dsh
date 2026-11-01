@@ -1,6 +1,6 @@
 import { Service } from '@deepseek-ai/cordis'
 
-const systemPrompt = 'You are a coding assistant. Inspect relevant files, make focused changes, and run suitable checks. Use tools when needed. Explain results and failures honestly.'
+const systemPrompt = 'You are a coding assistant. Inspect relevant files, make focused changes, and run suitable checks. Group independent tool calls when useful. Report results and failures concisely and honestly.'
 
 export class Prompt extends Service {
   constructor(ctx) {
