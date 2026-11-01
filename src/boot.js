@@ -1,0 +1,115 @@
+import { lstat } from 'node:fs/promises'
+import { isAbsolute, join } from 'node:path'
+import { Context } from '@deepseek-ai/cordis'
+import { composition as defaultComposition } from './composition.js'
+
+// Cordis FiberState is a const enum, so the published build does not export it.
+// These values match @deepseek-ai/cordis 4.0.5.
+const LOADING = 1
+const UNLOADING = 5
+const STATE_NAME = ['pending', 'loading', 'active', 'failed', 'disposed', 'unloading']
+
+export class BootError extends Error {
+  constructor(message, report = []) {
+    super(message)
+    this.name = 'BootError'
+    this.report = report
+  }
+}
+
+export async function prepareWorkspace(workspace) {
+  if (typeof workspace !== 'string' || !workspace.trim()) throw new Error('An absolute workspace directory is required')
+  if (!isAbsolute(workspace)) throw new Error(`Workspace must be an absolute path: ${workspace}`)
+  let stat
+  try { stat = await lstat(workspace) }
+  catch (error) {
+    if (error.code === 'ENOENT') throw new Error(`Workspace does not exist: ${workspace}`)
+    throw error
+  }
+  if (!stat.isDirectory()) throw new Error(`Workspace must be a directory: ${workspace}`)
+  return workspace
+}
+
+export function resolveSessionPath(workspace, session) {
+  const selected = session || '.mini-session.jsonl'
+  if (typeof selected !== 'string' || !selected.trim()) throw new Error('Session path must be a non-empty string')
+  return isAbsolute(selected) ? selected : join(workspace, selected)
+}
+
+function statusOf(fiber) {
+  if (fiber._error) return 'failed'
+  return STATE_NAME[fiber.state] ?? 'unknown'
+}
+
+function describe(entry) {
+  const missing = Object.keys(entry.fiber.inject ?? {}).filter((name) => entry.fiber.ctx.reflect.get(name, false) == null)
+  const error = entry.fiber._error
+  return {
+    name: entry.name,
+    state: statusOf(entry.fiber),
+    missing,
+    error: error ? String(error.message ?? error) : undefined,
+  }
+}
+
+function formatProblem(item) {
+  const detail = item.error ? `: ${item.error}` : ''
+  const waiting = item.missing?.length ? `: waiting for ${item.missing.join(', ')}` : ''
+  return `${item.name} ${item.state === 'failed' ? 'failed' : `is ${item.state}`}${item.state === 'failed' ? detail : waiting}`
+}
+
+async function settle(fibers) {
+  for (let attempt = 0; attempt < fibers.length + 3; attempt++) {
+    await Promise.all(fibers.map((entry) => entry.fiber.await().catch(() => {})))
+    const busy = fibers.some((entry) => entry.fiber.inertia || entry.fiber.state === LOADING || entry.fiber.state === UNLOADING)
+    if (!busy) return
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  throw new BootError('Plugins did not settle')
+}
+
+async function disposeAll(fibers) {
+  for (const entry of fibers) {
+    try { await entry.fiber.dispose() }
+    catch { /* the plugin's own disposer already reported the failure */ }
+  }
+}
+
+export async function boot(options = {}) {
+  const workspace = await prepareWorkspace(options.workspace)
+  const sessionPath = resolveSessionPath(workspace, options.session)
+  const compose = Array.isArray(options.composition) ? () => options.composition : options.composition ?? defaultComposition
+  const entries = compose({
+    workspace,
+    sessionPath,
+    model: options.model,
+    writable: options.writable !== false,
+  })
+  if (!Array.isArray(entries)) throw new Error('Composition must return an array of plugins')
+  const ctx = new Context()
+  const started = []
+  try {
+    for (const entry of entries) {
+      if (!entry?.plugin || typeof entry.name !== 'string' || !entry.name) throw new Error('Composition entries need a name and a plugin')
+      started.push({ ...entry, fiber: ctx.plugin(entry.plugin, entry.config) })
+    }
+    await settle(started)
+    const report = started.map(describe)
+    const problems = report.filter((item, index) => started[index].required !== false && item.state !== 'active')
+    if (problems.length) throw new BootError(problems.map(formatProblem).join('; '), report)
+    return {
+      ctx,
+      workspace,
+      sessionPath,
+      report,
+      dispose: () => disposeAll(started),
+    }
+  } catch (error) {
+    const report = error instanceof BootError && error.report?.length ? error.report : started.map(describe)
+    await disposeAll(started)
+    if (error instanceof BootError) throw error
+    const wrapped = new BootError(error.message, report)
+    wrapped.cause = error
+    throw wrapped
+  }
+}

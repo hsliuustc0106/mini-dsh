@@ -5,5 +5,5 @@
   "type": "module",
   "scripts": { "start": "node src/main.js", "test": "node --test" },
   "dependencies": { "@deepseek-ai/cordis": "4.0.5" },
-  "engines": { "node": ">=20" }
+  "engines": { "node": ">=22.13.0" }
 }
