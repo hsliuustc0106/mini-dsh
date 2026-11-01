@@ -44,6 +44,8 @@ The model receives skill names and descriptions and can call the read-only `skil
 
 `src/composition.js` is the coding-agent composition. `boot()` in `src/boot.js` is the shared entry used by the terminal and by tests. It checks the workspace, starts each plugin on its own Cordis fiber, waits until required plugins are active, and disposes every fiber it started when startup fails. A failed or missing plugin is reported by name. Disposing one plugin removes only that plugin's registrations.
 
+Prompt plugins contribute ordered instructions through `ctx.prompt.contribute()`. The coding plugin adds guidance for its search and file tools while the prompt service is available. A custom composition passed to `boot()` can replace the `instructions` plugin or add its own contributions. The default prompt encourages grouping independent tool calls to reduce model round trips; the agent still executes those calls sequentially and checks permissions for each call.
+
 ## Session log
 
 The log is append-only JSONL. Each complete line is one object with a `seq` starting at 1 and increasing by 1, a `type`, and a `time`. Bytes after the final newline are an incomplete tail, not a record.

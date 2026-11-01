@@ -29,6 +29,12 @@ function workspacePath(root, value, label) {
 export const coding = {
   inject: ['tools', 'workspace'],
   apply(ctx) {
+    ctx.inject(['prompt'], (inner) => {
+      inner.effect(() => inner.prompt.contribute({
+        order: 10,
+        instructions: 'Use glob to find files and grep to search contents. Keep searches focused, and read relevant files before editing.',
+      }))
+    })
     const tools = [
       { name: 'read', description: 'Read a UTF-8 file. Relative paths start at the workspace.', parameters: parameters({ path: string }, ['path']),
         execute: async (args) => (await readFile(workspacePath(workspaceRoot(ctx), field(args, 'path'), 'path'), 'utf8')).slice(0, 30000) },

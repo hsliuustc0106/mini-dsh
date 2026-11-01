@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { boot } from '../src/boot.js'
 import { coding } from '../src/coding.js'
+import { Prompt } from '../src/prompt.js'
 import { fakeProvider } from '../src/provider.js'
 import { Session, Tools, Workspace } from '../src/services.js'
 
@@ -49,6 +50,32 @@ test('Cordis removes tool effects and reactivates consumers when dependencies re
   await codingFiber.dispose()
   assert.equal(ctx.tools.schemas().length, 0)
   await second.dispose()
+  await workspace.dispose()
+})
+
+test('coding guidance follows the coding and prompt service lifecycles', async () => {
+  const ctx = new Context()
+  const workspace = ctx.plugin(Workspace, { root: tmpdir() })
+  const tools = ctx.plugin(Tools)
+  const codingFiber = ctx.plugin(coding)
+  await ready([workspace, tools, codingFiber])
+  assert.ok(ctx.tools.items.has('grep'))
+
+  const first = ctx.plugin(Prompt)
+  await ready([first])
+  await tick()
+  assert.match((await ctx.prompt.snapshot()).instructions.join('\n'), /glob.*grep/)
+  await first.dispose()
+  assert.ok(ctx.tools.items.has('grep'))
+
+  const second = ctx.plugin(Prompt)
+  await ready([second])
+  await tick()
+  assert.equal((await ctx.prompt.snapshot()).instructions.length, 1)
+  await codingFiber.dispose()
+  assert.deepEqual((await ctx.prompt.snapshot()).instructions, [])
+  await second.dispose()
+  await tools.dispose()
   await workspace.dispose()
 })
 
