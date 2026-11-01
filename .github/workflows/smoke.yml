@@ -1,0 +1,23 @@
+name: smoke
+
+# Manual only. Default CI is .github/workflows/test.yml (npm test and npm run replay).
+# Add the DEEPSEEK_API_KEY repository secret to run a live turn. The smoke skips
+# when that secret is absent, and the key is not written to the session or the log.
+on:
+  workflow_dispatch:
+
+jobs:
+  deepseek:
+    name: Live DeepSeek smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Live turn
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: npm run smoke

@@ -19,7 +19,7 @@ async function directory() {
 function runMain(env) {
   const child = spawn(process.execPath, ['src/main.js'], {
     cwd: root,
-    env: { ...process.env, DEEPSEEK_API_KEY: '', MINI_VIEW: '', MINI_VIEW_PORT: '', ...env },
+    env: { ...process.env, DEEPSEEK_API_KEY: '', DEEPSEEK_API_KEY_FILE: '', DEEPSEEK_TOOL_CHOICE: '', MINI_VIEW: '', MINI_VIEW_PORT: '', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let stdout = '', stderr = ''

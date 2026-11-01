@@ -25,7 +25,7 @@ async function directory() { return mkdtemp(join(tmpdir(), 'mini-view-')) }
 
 function cleanEnv(overrides) {
   const env = { ...process.env }
-  for (const name of ['MINI_WORKSPACE', 'MINI_SESSION', 'MINI_REPLIES', 'MINI_CLOCK', 'MINI_INSPECT', 'MINI_VIEW', 'MINI_VIEW_PORT', 'DEEPSEEK_API_KEY']) {
+  for (const name of ['MINI_WORKSPACE', 'MINI_SESSION', 'MINI_REPLIES', 'MINI_CLOCK', 'MINI_INSPECT', 'MINI_VIEW', 'MINI_VIEW_PORT', 'DEEPSEEK_API_KEY', 'DEEPSEEK_API_KEY_FILE', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL', 'DEEPSEEK_TOOL_CHOICE']) {
     delete env[name]
   }
   return { ...env, DEEPSEEK_API_KEY: 'sk-secret', MINI_VIEW_PORT: '0', ...overrides }

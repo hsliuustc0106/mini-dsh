@@ -4,7 +4,7 @@ import { stdin, stdout } from 'node:process'
 import { createInterface } from 'node:readline'
 import { boot } from './boot.js'
 import { composition } from './composition.js'
-import { fakeProvider } from './provider.js'
+import { providerForConfig, readApiKey } from './provider.js'
 import { viewerSettings } from './viewer.js'
 
 const inspect = process.env.MINI_INSPECT === '1'
@@ -15,17 +15,26 @@ function fixedClock() {
   return () => time
 }
 
+// MINI_REPLIES keeps the fake provider, even if a key is set. Otherwise a
+// credential selects DeepSeek. With neither, the fake provider has no replies.
 async function loadProvider() {
   const file = process.env.MINI_REPLIES
-  if (!file) return undefined
-  const path = resolve(file)
-  let parsed
-  try { parsed = JSON.parse(await readFile(path, 'utf8')) }
-  catch (error) {
-    throw new Error(error instanceof SyntaxError ? `MINI_REPLIES is not JSON: ${path}` : `MINI_REPLIES could not be read: ${path}`)
+  if (file) {
+    const path = resolve(file)
+    let parsed
+    try { parsed = JSON.parse(await readFile(path, 'utf8')) }
+    catch (error) {
+      throw new Error(error instanceof SyntaxError ? `MINI_REPLIES is not JSON: ${path}` : `MINI_REPLIES could not be read: ${path}`)
+    }
+    if (!Array.isArray(parsed)) throw new Error('MINI_REPLIES must be a JSON array')
+    return providerForConfig({ replies: parsed })
   }
-  if (!Array.isArray(parsed)) throw new Error('MINI_REPLIES must be a JSON array')
-  return fakeProvider(parsed)
+  return providerForConfig({
+    apiKey: await readApiKey(),
+    baseUrl: process.env.DEEPSEEK_BASE_URL,
+    model: process.env.DEEPSEEK_MODEL,
+    toolChoice: process.env.DEEPSEEK_TOOL_CHOICE,
+  })
 }
 
 // Lines are queued as they arrive, including during boot and between prompts.

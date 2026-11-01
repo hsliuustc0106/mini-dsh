@@ -27,6 +27,7 @@ export function composition({ workspace, sessionPath, writable = true, provider,
     { name: 'tools', plugin: Tools },
     { name: 'prompt', plugin: Prompt },
     { name: 'model', plugin: Model },
+    // Tests and replay pass the fake provider. The terminal passes DeepSeek when a key is set.
     { name: 'provider', plugin: provider ?? fakeProvider(), config: model ?? {} },
     { name: 'session', plugin: Session, config: { path: sessionPath, writable, workspace, clock } },
     { name: 'workspace', plugin: Workspace, config: { root: workspace } },
