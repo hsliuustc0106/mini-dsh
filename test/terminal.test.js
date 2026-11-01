@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const fixtureDir = join(root, 'fixtures/write-hello')
-const managed = ['MINI_WORKSPACE', 'MINI_SESSION', 'MINI_REPLIES', 'MINI_CLOCK', 'MINI_INSPECT', 'MINI_VIEW', 'MINI_VIEW_PORT', 'DEEPSEEK_API_KEY']
+const managed = ['MINI_WORKSPACE', 'MINI_SESSION', 'MINI_REPLIES', 'MINI_CLOCK', 'MINI_INSPECT', 'MINI_VIEW', 'MINI_VIEW_PORT', 'DEEPSEEK_API_KEY', 'DEEPSEEK_API_KEY_FILE', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL', 'DEEPSEEK_TOOL_CHOICE']
 
 function cleanEnv(overrides) {
   const env = { ...process.env }
