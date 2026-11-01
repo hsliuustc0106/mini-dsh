@@ -2,6 +2,7 @@ import { lstat } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { composition as defaultComposition } from './composition.js'
+import { configurePlugins } from './plugin-config.js'
 
 // Cordis FiberState is a const enum, so the published build does not export it.
 // These values match @deepseek-ai/cordis 4.0.5.
@@ -79,7 +80,7 @@ export async function boot(options = {}) {
   const workspace = await prepareWorkspace(options.workspace)
   const sessionPath = resolveSessionPath(workspace, options.session)
   const compose = Array.isArray(options.composition) ? () => options.composition : options.composition ?? defaultComposition
-  const entries = compose({
+  let entries = await compose({
     workspace,
     sessionPath,
     model: options.model,
@@ -90,8 +91,10 @@ export async function boot(options = {}) {
     view: options.view,
     web: options.web,
     skillOptions: options.skillOptions,
+    terminal: options.terminal,
   })
   if (!Array.isArray(entries)) throw new Error('Composition must return an array of plugins')
+  entries = await configurePlugins(entries, options.pluginConfig, workspace)
   const ctx = new Context()
   const started = []
   try {

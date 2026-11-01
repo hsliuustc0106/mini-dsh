@@ -13,7 +13,7 @@ import { observeStream, readSession } from '../src/log.js'
 import { fakeProvider } from '../src/provider.js'
 import { Session, Workspace } from '../src/services.js'
 import { project } from '../src/trajectory.js'
-import { renderPage, TrajectoryViewer } from '../src/viewer.js'
+import { renderPage, TrajectoryViewer, viewerSettings } from '../src/viewer.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const fixtureDir = join(root, 'fixtures/write-hello')
@@ -25,7 +25,7 @@ async function directory() { return mkdtemp(join(tmpdir(), 'mini-view-')) }
 
 function cleanEnv(overrides) {
   const env = { ...process.env }
-  for (const name of ['MINI_WORKSPACE', 'MINI_SESSION', 'MINI_REPLIES', 'MINI_CLOCK', 'MINI_INSPECT', 'MINI_VIEW', 'MINI_VIEW_PORT', 'DEEPSEEK_API_KEY', 'DEEPSEEK_API_KEY_FILE', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL', 'DEEPSEEK_TOOL_CHOICE']) {
+  for (const name of ['MINI_WORKSPACE', 'MINI_SESSION', 'MINI_REPLIES', 'MINI_CLOCK', 'MINI_INSPECT', 'MINI_VIEW', 'MINI_VIEW_PORT', 'MINI_WEB', 'MINI_WEB_PORT', 'MINI_CONFIG', 'MINI_VIEW_CONFIG', 'DEEPSEEK_API_KEY', 'DEEPSEEK_API_KEY_FILE', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL', 'DEEPSEEK_TOOL_CHOICE']) {
     delete env[name]
   }
   return { ...env, DEEPSEEK_API_KEY: 'sk-secret', MINI_VIEW_PORT: '0', ...overrides }
@@ -432,6 +432,59 @@ test('an unfinished stream has no invented end or assistant text', () => {
   ])
   assert.equal(ended.turns[0].cards[1].partial, true)
   assert.equal(ended.turns[0].cards[1].content, 'Hel')
+})
+
+test('the standalone viewer loads and disposes its own plugin profile', async (t) => {
+  const dir = await directory()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const marker = join(dir, 'marker')
+  await writeFile(join(dir, 'viewer-plugin.mjs'), `
+import { appendFileSync } from 'node:fs'
+export default {
+  inject: ['session'],
+  apply(ctx, config) {
+    ctx.effect(() => {
+      appendFileSync(config.marker, 'start:' + ctx.session.writable + '\\n')
+      return () => appendFileSync(config.marker, 'stop:' + ctx.session.writable + '\\n')
+    })
+  },
+}
+`)
+  await writeFile(join(dir, 'viewer.json'), JSON.stringify({ plugins: [
+    { name: 'extension', module: './viewer-plugin.mjs', config: { marker } },
+  ] }))
+  const view = startView({ MINI_WORKSPACE: dir, MINI_VIEW_CONFIG: 'viewer.json', MINI_CONFIG: 'ignored.json' })
+  let status
+  try {
+    const url = await view.url()
+    assert.equal((await request(url)).status, 200)
+    assert.equal(await readFile(marker, 'utf8'), 'start:false\n')
+  } finally { status = await view.stop() }
+  assert.equal(status.code, 0, status.stderr)
+  assert.equal(await readFile(marker, 'utf8'), 'start:false\nstop:false\n')
+})
+
+test('a replacement viewer does not need the default viewer port', async (t) => {
+  const dir = await directory()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  await assert.rejects(boot({
+    workspace: dir, writable: false, composition: viewerComposition, view: viewerSettings({ MINI_VIEW_PORT: '99999' }),
+  }), /MINI_VIEW_PORT is invalid/)
+  await writeFile(join(dir, 'viewer.mjs'), `
+export default {
+  inject: ['session'],
+  apply(ctx) {
+    ctx.provide('viewer', { url: 'http://127.0.0.1:12345' })
+    ctx.effect(() => { const timer = setInterval(() => {}, 1000); return () => clearInterval(timer) })
+  },
+}
+`)
+  await writeFile(join(dir, 'viewer.json'), JSON.stringify({ plugins: [{ name: 'viewer', module: './viewer.mjs' }] }))
+  const view = startView({ MINI_WORKSPACE: dir, MINI_VIEW_CONFIG: 'viewer.json', MINI_VIEW_PORT: '99999' })
+  let status
+  try { assert.equal(await view.url(), 'http://127.0.0.1:12345') }
+  finally { status = await view.stop() }
+  assert.equal(status.code, 0, status.stderr)
 })
 
 test('serves the fixture read-only and renders the same history after restart', async () => {

@@ -1,13 +1,16 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { request as httpRequest } from 'node:http'
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { boot } from '../src/boot.js'
 import { fakeProvider } from '../src/provider.js'
 import { project } from '../src/trajectory.js'
 
+const root = fileURLToPath(new URL('..', import.meta.url))
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function until(find) {
@@ -312,4 +315,63 @@ test('unknown tool outcomes stay read-only and cannot accept a web turn', async 
     assert.equal((await request(run.url, '/turn', { method: 'POST', data: { connection: hello.connection, input: 'Again' } })).status, 409)
     assert.equal(await readFile(run.app.sessionPath, 'utf8'), sessionText)
   } finally { client.close(); await run.close() }
+})
+
+test('a terminal profile and web turns share the agent without sharing approval prompts', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-web-terminal-'))
+  await writeFile(join(dir, 'plugins.json'), JSON.stringify({ plugins: [{ name: 'coding', config: { tools: ['write'] } }] }))
+  await writeFile(join(dir, 'replies.json'), JSON.stringify([
+    assistant(null, [call('browser-write', 'browser.txt', 'browser')]),
+    assistant('Web done.'),
+    assistant('Terminal done.'),
+  ]))
+  const child = spawn(process.execPath, ['src/main.js'], {
+    cwd: root,
+    env: {
+      ...process.env,
+      MINI_WORKSPACE: dir, MINI_SESSION: '', MINI_CONFIG: 'plugins.json', MINI_REPLIES: join(dir, 'replies.json'),
+      MINI_INSPECT: '', MINI_VIEW: '', MINI_WEB: '1', MINI_WEB_PORT: '0',
+      DSH_HOME: dir, DSH_AGENTS_HOME: dir, DSH_BUNDLED_SKILL_DIR: dir,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  let stdout = '', stderr = '', client
+  child.stdout.on('data', (chunk) => { stdout += chunk })
+  child.stderr.on('data', (chunk) => { stderr += chunk })
+  const exited = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })))
+  try {
+    const url = await until(() => {
+      if (child.exitCode != null || child.signalCode != null) throw new Error(`terminal exited: ${stderr}`)
+      return stdout.match(/Web: (http:\/\/127\.0\.0\.1:\d+)/)?.[1]
+    })
+    client = await stream(url)
+    const { connection } = await client.wait('hello')
+    assert.equal((await request(url, '/turn', { method: 'POST', data: { connection, input: 'Write from browser' } })).status, 202)
+    const approval = (await client.wait('approval', (data) => data.pending)).pending
+    child.stdin.write('terminal while browser is busy\n')
+    await until(() => stderr.includes('Error: Agent is busy'))
+    assert.equal(child.exitCode, null)
+    const afterApproval = client.events.length
+    assert.equal((await request(url, '/approval', { method: 'POST', data: { connection, id: approval.id, decision: 'allow' } })).status, 200)
+    await client.wait('session', (event) => event.type === 'message' && event.message.content === 'Web done.')
+    await until(() => client.events.slice(afterApproval).some((event) => event.type === 'state' && !event.data.busy))
+    child.stdin.write('terminal after browser\n')
+    await until(() => stdout.includes('assistant> Terminal done.'))
+    child.stdin.end('/quit\n')
+    const timer = setTimeout(() => child.kill('SIGKILL'), 5000)
+    const status = await exited
+    clearTimeout(timer)
+    assert.equal(status.code, 0, stderr)
+    assert.doesNotMatch(stdout, /Approve write/)
+    assert.equal(await readFile(join(dir, 'browser.txt'), 'utf8'), 'browser')
+    const events = (await readFile(join(dir, '.mini-session.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse)
+    assert.deepEqual(events.filter((event) => event.message?.role === 'user').map((event) => event.message.content), ['Write from browser', 'terminal after browser'])
+    assert.deepEqual(events.find((event) => event.type === 'model.request').body.tools.map((tool) => tool.function.name).sort(), ['skill', 'write'])
+    assert.equal(events.find((event) => event.type === 'permission.decided').decision, 'allow')
+  } finally {
+    client?.close()
+    if (child.exitCode == null && child.signalCode == null) child.kill('SIGKILL')
+    await exited
+    await rm(dir, { recursive: true, force: true })
+  }
 })

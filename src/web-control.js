@@ -9,9 +9,14 @@ const MAX_BODY = 1024 * 1024
 
 export function webControlSettings(env = process.env) {
   const raw = env.MINI_WEB_PORT
-  if (raw == null || raw === '') return { port: 7484 }
-  if (!/^\d+$/.test(raw) || Number(raw) > 65535) throw new Error(`MINI_WEB_PORT is invalid: ${raw}`)
-  return { port: Number(raw) }
+  // Profiles can disable or replace this plugin without reading its port.
+  return {
+    get port() {
+      if (raw == null || raw === '') return 7484
+      if (!/^\d+$/.test(raw) || Number(raw) > 65535) throw new Error(`MINI_WEB_PORT is invalid: ${raw}`)
+      return Number(raw)
+    },
+  }
 }
 
 function send(res, status, type, body) {

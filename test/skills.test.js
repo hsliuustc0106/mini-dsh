@@ -266,7 +266,7 @@ test('the terminal discovers user skills through DSH_HOME', async () => {
     await writeFile(replies, JSON.stringify([assistant(null, [call('cli-call', 'cli')]), assistant('done'), assistant('explicit done')]))
     const child = spawn(process.execPath, ['src/main.js'], {
       cwd: root,
-      env: { ...process.env, MINI_WORKSPACE: workspace, MINI_SESSION: join(workspace, '.mini-session.jsonl'), MINI_REPLIES: replies, MINI_CLOCK: '', MINI_INSPECT: '', MINI_VIEW: '', DSH_HOME: home, DSH_AGENTS_HOME: join(dir, 'empty-agents'), DSH_BUNDLED_SKILL_DIR: join(dir, 'empty-bundled') },
+      env: { ...process.env, MINI_WORKSPACE: workspace, MINI_SESSION: join(workspace, '.mini-session.jsonl'), MINI_REPLIES: replies, MINI_CLOCK: '', MINI_INSPECT: '', MINI_VIEW: '', MINI_WEB: '', MINI_CONFIG: '', DSH_HOME: home, DSH_AGENTS_HOME: join(dir, 'empty-agents'), DSH_BUNDLED_SKILL_DIR: join(dir, 'empty-bundled') },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
     let output = '', errors = ''

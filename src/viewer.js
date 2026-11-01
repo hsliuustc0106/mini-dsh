@@ -7,12 +7,14 @@ const HOST = '127.0.0.1'
 
 export function viewerSettings(env = process.env) {
   const raw = env.MINI_VIEW_PORT
-  let port = 7483
-  if (raw != null && raw !== '') {
-    if (!/^\d+$/.test(raw) || Number(raw) > 65535) throw new Error(`MINI_VIEW_PORT is invalid: ${raw}`)
-    port = Number(raw)
+  // A replacement viewer need not read or validate the default viewer's port.
+  return {
+    get port() {
+      if (raw == null || raw === '') return 7483
+      if (!/^\d+$/.test(raw) || Number(raw) > 65535) throw new Error(`MINI_VIEW_PORT is invalid: ${raw}`)
+      return Number(raw)
+    },
   }
-  return { port }
 }
 
 function esc(value) {
