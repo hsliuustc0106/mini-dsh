@@ -50,7 +50,9 @@ button:disabled { opacity: .4; cursor: default; }
 .timing h2 { margin: 0 0 8px; color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
 .timeline { display: flex; gap: 6px; overflow-x: auto; align-items: stretch; }
 .timeline p { color: var(--muted); margin: 0; }
-.bar { min-width: 4.5rem; min-height: 54px; padding: 8px; border: 0; border-radius: 8px; color: #fff; text-align: left; font: inherit; cursor: pointer; }
+.bar { min-width: 5.75rem; min-height: 54px; padding: 8px; border: 0; border-radius: 8px; color: #fff; text-align: left; font: inherit; cursor: pointer; }
+.bar-kind, .bar-time { display: block; }
+.bar-time { font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .bar.input, .legend .input::before { background: #2f5d8c; }
 .bar.model, .legend .model::before { background: #a56b12; }
 .bar.tool, .legend .tool::before { background: #2c6e45; }
@@ -62,6 +64,7 @@ button:disabled { opacity: .4; cursor: default; }
 .events li { border-bottom: 1px solid var(--border); font-size: 12px; }
 .events summary { display: grid; grid-template-columns: minmax(64px, max-content) minmax(120px, 170px) minmax(0, 1fr); gap: 8px; padding: 8px 0; cursor: pointer; }
 .events summary span:first-child { color: var(--muted); }
+.event-timing { margin: 0 0 8px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .events pre { padding: 8px; margin-bottom: 8px; border-radius: 6px; background: var(--panel); }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 [hidden] { display: none !important; }

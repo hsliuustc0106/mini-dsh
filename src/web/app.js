@@ -7,6 +7,7 @@ const send = get('send')
 const notice = get('notice')
 const hint = get('hint')
 const log = []
+const timingDetails = new Map()
 let cursor = 0
 let connection = null
 let pending = null
@@ -119,7 +120,14 @@ function appendEvent(event) {
   title.append(node('span', '', `#${event.seq}`))
   title.append(node('strong', '', event.type === 'message' ? `message:${event.message.role}` : event.type))
   title.append(node('span', '', summary(event)))
-  details.append(title, node('pre', '', JSON.stringify(event, null, 2)))
+  details.append(title)
+  if (event.type === 'model.request' || event.type === 'tool.started' || (event.type === 'message' && event.message.role === 'user')) {
+    const timing = node('p', 'event-timing')
+    timing.hidden = true
+    timingDetails.set(event.seq, timing)
+    details.append(timing)
+  }
+  details.append(node('pre', '', JSON.stringify(event, null, 2)))
   item.append(details)
   eventsList.append(item)
 }
@@ -156,16 +164,51 @@ function appendDelta(event) {
   if (group.details.open) group.body.append(document.createTextNode(`${group.fragments.length > 1 ? '\n\n' : ''}${JSON.stringify(event, null, 2)}`))
 }
 
+function recordedTime(value) {
+  if (typeof value !== 'string') return null
+  const time = new Date(value)
+  if (Number.isNaN(time.getTime())) return null
+  return time.toLocaleString(undefined, {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3,
+  })
+}
+
+function timingOf(span) {
+  const start = recordedTime(span.time)
+  const end = recordedTime(span.endTime)
+  const measured = Number.isFinite(span.durationMs) && span.durationMs >= 0
+  const duration = measured ? `${Math.round(span.durationMs).toLocaleString()} ms` : null
+  const point = span.kind === 'input'
+  const label = point ? (start ? 'instant' : '—')
+    : span.status === 'open' ? 'running'
+      : duration ?? (span.status === 'unknown' ? 'unknown' : '—')
+  const description = [
+    start ? `${point ? 'At' : 'Started'}: ${start}` : 'Start time unavailable',
+    !point && end ? `Finished: ${end}` : null,
+    point ? null : `Duration: ${duration ?? (span.status === 'open' ? 'in progress' : 'unavailable')}`,
+    span.status !== 'ok' ? `Status: ${span.status === 'open' ? 'running' : span.status}` : null,
+  ].filter(Boolean).join(' · ')
+  return { label, description }
+}
+
 function showTimeline(spans) {
   timeline.replaceChildren()
   if (!spans.length) return timeline.append(node('p', '', 'No timing spans yet.'))
   for (const span of spans) {
-    const suffix = span.status === 'open' ? ' …' : span.status !== 'ok' ? ` ${span.status}` : ''
-    const bar = node('button', `bar ${span.kind}${span.status !== 'ok' ? ` ${span.status}` : ''}`, `${span.kind}${suffix}`)
+    const timing = timingOf(span)
+    const bar = node('button', `bar ${span.kind}${span.status !== 'ok' ? ` ${span.status}` : ''}`)
+    bar.append(node('span', 'bar-kind', span.kind), node('span', 'bar-time', timing.label))
     bar.type = 'button'
     const weight = Math.max(span.durationMs ?? 0, 1)
     bar.style.flex = `${weight} ${weight} 4.5rem`
-    bar.title = [span.kind, span.name, span.provider, span.status, span.durationMs == null ? null : `${span.durationMs} ms`].filter(Boolean).join(' · ')
+    bar.title = [[span.kind, span.name, span.provider].filter(Boolean).join(' · '), timing.description].join('\n')
+    bar.setAttribute('aria-label', bar.title)
+    const detail = timingDetails.get(span.seq)
+    if (detail) {
+      detail.textContent = `Timing · ${timing.description}`
+      detail.hidden = false
+    }
     bar.addEventListener('click', () => {
       const item = get(`event-${span.seq}`)
       if (!item) return

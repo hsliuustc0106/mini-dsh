@@ -101,7 +101,7 @@ test('groups streamed fragments while preserving their text, details, and order'
   assert.equal(elements.events.children.length, 10)
 })
 
-test('shows input, model and tool timing and opens the selected event', async () => {
+test('shows recorded timing for each span and updates its event details', async () => {
   const { elements, source, snapshot, flush } = await browser()
   source.emit('hello', { connection: 'browser', busy: false, writable: true })
   const emit = (event) => source.emit('session', event)
@@ -109,15 +109,32 @@ test('shows input, model and tool timing and opens the selected event', async ()
   emit({ seq: 2, type: 'model.request', provider: 'fake' })
   emit({ seq: 3, type: 'tool.started', callId: 'one', name: 'write' })
   snapshot({ cursor: 3, overview: [
-    { kind: 'input', seq: 1, status: 'ok', durationMs: 0 },
-    { kind: 'model', seq: 2, status: 'ok', durationMs: 20 },
-    { kind: 'tool', seq: 3, status: 'open', durationMs: null, name: 'write' },
+    { kind: 'input', seq: 1, status: 'ok', durationMs: 0, time: '2026-01-01T00:00:00.000Z', endTime: '2026-01-01T00:00:00.000Z' },
+    { kind: 'model', seq: 2, status: 'ok', durationMs: 20, time: '2026-01-01T00:00:01.000Z', endTime: '2026-01-01T00:00:01.020Z' },
+    { kind: 'tool', seq: 3, status: 'open', durationMs: null, name: 'write', time: '2026-01-01T00:00:02.000Z', endTime: null },
   ] })
   await flush()
-  assert.deepEqual(elements.timeline.children.map((bar) => bar.textContent), ['input', 'model', 'tool …'])
+  assert.deepEqual(elements.timeline.children.map((bar) => bar.textContent), ['inputinstant', 'model20 ms', 'toolrunning'])
   assert.deepEqual(elements.timeline.children.map((bar) => bar.className), ['bar input', 'bar model', 'bar tool open'])
+  assert.match(elements.timeline.children[0].title, /At:/)
+  assert.match(elements.timeline.children[1].title, /Started:.*Finished:.*Duration: 20 ms/)
+  assert.equal(elements.timeline.children[1].attributes['aria-label'], elements.timeline.children[1].title)
+  assert.match(elements.timeline.children[2].title, /Duration: in progress.*Status: running/)
   elements.timeline.children[1].fire('click')
   const modelRow = elements.events.children[1]
   assert.equal(modelRow.firstElementChild.open, true)
   assert.equal(modelRow.scrolled, true)
+  assert.match(modelRow.firstElementChild.children[1].textContent, /Started:.*Finished:.*Duration: 20 ms/)
+  assert.equal(modelRow.firstElementChild.children[1].hidden, false)
+
+  snapshot({ cursor: 3, overview: [
+    { kind: 'input', seq: 1, status: 'ok', durationMs: null },
+    { kind: 'model', seq: 2, status: 'unknown', durationMs: null, time: '2026-01-01T00:00:01.000Z' },
+    { kind: 'tool', seq: 3, status: 'ok', durationMs: 46, name: 'write', time: '2026-01-01T00:00:02.000Z', endTime: '2026-01-01T00:00:02.046Z' },
+  ] })
+  source.emit('state', { busy: false, writable: true })
+  await flush()
+  assert.deepEqual(elements.timeline.children.map((bar) => bar.textContent), ['input—', 'modelunknown', 'tool46 ms'])
+  assert.match(modelRow.firstElementChild.children[1].textContent, /Duration: unavailable.*Status: unknown/)
+  assert.match(elements.events.children[2].firstElementChild.children[1].textContent, /Finished:.*Duration: 46 ms/)
 })
