@@ -26,7 +26,7 @@ test('Cordis removes tool effects and reactivates consumers when dependencies re
   const codingFiber = ctx.plugin(coding)
   const first = ctx.plugin(Tools)
   await ready([workspace, codingFiber, first])
-  assert.equal(ctx.tools.schemas().length, 4)
+  assert.equal(ctx.tools.schemas().length, 6)
   assert.throws(() => ctx.tools.register({
     name: 'read', description: 'again', parameters: { type: 'object', properties: {} }, execute() {},
   }), /Duplicate tool: read/)
@@ -45,7 +45,7 @@ test('Cordis removes tool effects and reactivates consumers when dependencies re
   assert.equal(ctx.tools, undefined)
   const second = ctx.plugin(Tools)
   await ready([codingFiber, second])
-  assert.equal(ctx.tools.schemas().length, 4)
+  assert.equal(ctx.tools.schemas().length, 6)
   await codingFiber.dispose()
   assert.equal(ctx.tools.schemas().length, 0)
   await second.dispose()

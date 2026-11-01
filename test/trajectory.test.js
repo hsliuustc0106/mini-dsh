@@ -194,7 +194,7 @@ test('projects the recorded fixture into turns, timing, and inspectable records'
   const requestRow = rows.find((row) => row.type === 'model.request')
   assert.equal(requestRow.detail.provider, 'fake')
   assert.equal(requestRow.detail.body.messages[0].content, 'Write hello.txt')
-  assert.equal(requestRow.detail.body.tools.length, 4)
+  assert.equal(requestRow.detail.body.tools.length, 6)
   assert.equal(JSON.stringify(requestRow.detail).includes('sk-'), false)
   const started = rows.find((row) => row.type === 'tool.started')
   assert.deepEqual(started.detail.arguments, { path: 'hello.txt', content: 'hello\n' })
