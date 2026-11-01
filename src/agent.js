@@ -44,14 +44,14 @@ export class Agent extends Service {
     this.ctx.effect(() => () => this.shutdown())
   }
 
-  turn(input, report = () => {}) {
+  turn(input, report = () => {}, { approve } = {}) {
     if (this.stopping) throw fail('Agent is shutting down', 'BUSY')
     if (this.busy) throw fail('Agent is busy', 'BUSY')
     if (typeof input !== 'string' || !input.trim()) throw new Error('Turn input is required')
     this.busy = true
     const controller = new AbortController()
     this.controller = controller
-    const run = this.runTurn(input, report, controller.signal)
+    const run = this.runTurn(input, report, controller.signal, approve)
     this.current = run
     return run.finally(() => {
       if (this.controller === controller) this.controller = null
@@ -69,7 +69,7 @@ export class Agent extends Service {
     try { await this.current } catch { /* the turn caller observes the failure */ }
   }
 
-  async runTurn(input, report, signal) {
+  async runTurn(input, report, signal, approve) {
     const { checkpoint, prompt } = this.ctx
     const skillInvocations = await prompt.resolveUserInput(input)
     await checkpoint.commit({ role: 'user', content: input, ...(skillInvocations.length ? { skillInvocations } : {}) })
@@ -83,7 +83,7 @@ export class Agent extends Service {
           await this.denyUnstarted(calls.slice(index))
           return
         }
-        await this.oneCall(calls[index], report, signal)
+        await this.oneCall(calls[index], report, signal, approve)
       }
     }
   }
@@ -146,7 +146,7 @@ export class Agent extends Service {
     session.readonlyReason = unknownReason([], [seq])
   }
 
-  async oneCall(call, report, signal) {
+  async oneCall(call, report, signal, approve) {
     const { tools, checkpoint, permissions, workspace } = this.ctx
     const id = call.id
     const name = call.function.name
@@ -166,7 +166,7 @@ export class Agent extends Service {
       await this.toolError(id, error.message, report)
       return
     }
-    const decision = await permissions.decide({ callId: id, name, arguments: args }, signal)
+    const decision = await permissions.decide({ callId: id, name, arguments: args }, signal, approve)
     await checkpoint.commit({ type: 'permission.decided', ...decision })
     if (decision.decision !== 'allow') {
       await this.toolError(id, decision.reason, report)
