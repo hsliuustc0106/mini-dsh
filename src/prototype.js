@@ -236,6 +236,8 @@ const prototypeCss = `
   body.prototype main { max-width: 1120px; }
   .note { background: #efe6d4; border: 1px solid #d9c7a4; border-radius: 8px; padding: 10px 12px; }
   .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(17rem, 24rem); gap: 22px; align-items: start; }
+  body.prototype .trajectory-layout { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  body.prototype .detail { position: static; max-height: 55vh; }
   .rail { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow: auto; }
   .composer { display: flex; gap: 8px; align-items: flex-end; }
   .composer textarea { flex: 1; min-width: 0; min-height: 4.4rem; margin: 0; padding: 8px 10px; border: 1px solid #e3dbd0; border-radius: 8px; background: #fffdf8; color: inherit; font: inherit; resize: vertical; }
@@ -245,8 +247,8 @@ const prototypeCss = `
   .actions .allow { background: #2c6e45; color: #fff; }
   .actions .deny { background: #8c3030; color: #fff; }
   button:disabled { opacity: 0.45; cursor: default; }
-  .card { background: #fffdf8; border: 1px solid #e3dbd0; border-radius: 8px; padding: 12px; margin: 8px 0; }
-  .card pre { margin: 8px 0; }
+  .rail .card { background: #fffdf8; border: 1px solid #e3dbd0; border-radius: 8px; padding: 12px; margin: 8px 0; }
+  .rail .card pre { margin: 8px 0; }
   .kicker, .tool-name { margin: 0 0 6px; }
   .kicker { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: #6d655c; }
   .tool-name { font-weight: 700; }

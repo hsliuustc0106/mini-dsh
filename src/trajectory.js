@@ -237,6 +237,81 @@ function overviewOf(events, unknown, streams) {
   return spans
 }
 
+// Cards are another view of the recorded rows, not a separate conversation.
+// Keep the contributing sequence numbers so each card can lead back to the ledger.
+function cardsOf(rows) {
+  const cards = []
+  const calls = new Map()
+  const states = new Map()
+  const partial = new Map()
+  const addTool = (card, messagePending) => {
+    cards.push(card)
+    calls.set(card.callId, card)
+    states.set(card, { messagePending, executionOpen: false, error: false })
+  }
+  for (const row of rows) {
+    if (row.type === 'stream.started' && row.status === 'unknown') partial.set(row.seq, '')
+    if (row.type === 'stream.delta' && partial.has(row.detail.stream) && typeof row.detail.text === 'string') {
+      partial.set(row.detail.stream, partial.get(row.detail.stream) + row.detail.text)
+    }
+  }
+  for (const row of rows) {
+    const detail = row.detail
+    if (row.type === 'stream.started' && partial.get(row.seq)) {
+      cards.push({ kind: 'assistant', seq: row.seq, time: row.time, content: partial.get(row.seq), status: 'unknown', partial: true })
+    } else if (row.type === 'message' && detail.role === 'user') {
+      cards.push({ kind: 'user', seq: row.seq, time: row.time, content: detail.content ?? '' })
+    } else if (row.type === 'message' && detail.role === 'assistant') {
+      if (detail.content) cards.push({ kind: 'assistant', seq: row.seq, time: row.time, content: detail.content })
+      for (const call of detail.tool_calls ?? []) {
+        const card = {
+          kind: 'tool', seq: row.seq, time: row.time, callId: call.id,
+          name: call.function?.name ?? '', arguments: call.function?.arguments ?? '',
+        }
+        addTool(card, true)
+      }
+    } else if (row.type === 'tool.started') {
+      const previous = calls.get(detail.callId)
+      const state = states.get(previous)
+      if (!state || (!state.messagePending && !state.executionOpen)) {
+        addTool({
+          kind: 'tool', seq: row.seq, time: row.time, callId: detail.callId,
+          name: detail.name ?? '', arguments: detail.arguments,
+        }, false)
+      }
+    }
+
+    const callId = row.type === 'message' && detail.role === 'tool' ? detail.tool_call_id : detail.callId
+    const card = calls.get(callId)
+    if (!card) continue
+    const state = states.get(card)
+    if (row.type === 'permission.decided') {
+      card.decision = detail.decision
+      card.decisionSeq = row.seq
+      card.arguments = detail.arguments
+    } else if (row.type === 'tool.started') {
+      card.startSeq = row.seq
+      card.arguments = detail.arguments
+      state.executionOpen = true
+    } else if (row.type === 'tool.finished') {
+      card.result = detail.result
+      card.resultSeq = row.seq
+      state.executionOpen = false
+      state.error ||= Boolean(detail.error)
+    } else if (row.type === 'message' && detail.role === 'tool') {
+      card.result = detail.content
+      card.resultSeq = row.seq
+      state.messagePending = false
+      state.error ||= Boolean(detail.error)
+    }
+  }
+  for (const [card, state] of states) {
+    card.status = state.messagePending || state.executionOpen ? 'unknown'
+      : card.decision === 'deny' ? 'deny' : state.error ? 'error' : 'ok'
+  }
+  return cards
+}
+
 function group(rows) {
   const preamble = []
   const turns = []
@@ -248,6 +323,7 @@ function group(rows) {
     } else if (turn) turn.rows.push(row)
     else preamble.push(row)
   }
+  for (const item of turns) item.cards = cardsOf(item.rows)
   return { preamble, turns }
 }
 
