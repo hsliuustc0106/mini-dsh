@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline'
 import { boot } from './boot.js'
 import { composition } from './composition.js'
 import { fakeProvider } from './provider.js'
+import { viewerSettings } from './viewer.js'
 
 const inspect = process.env.MINI_INSPECT === '1'
 
@@ -93,6 +94,7 @@ try {
     provider,
     approve: terminal ? oneShotApproval(terminal) : undefined,
     clock: fixedClock(),
+    view: process.env.MINI_VIEW === '1' && !inspect ? viewerSettings() : undefined,
   })
   const { session } = app.ctx
   if (inspect) {
@@ -110,6 +112,7 @@ try {
   } else {
     console.log('Mini harness. /quit exits; workspace:', app.workspace)
     console.log('Session:', `${app.sessionPath} (${session.events.length} events)`)
+    if (app.ctx.viewer?.url) console.log('Trajectory:', app.ctx.viewer.url)
     for (;;) {
       const input = await terminal.ask('\nYou> ')
       if (input == null || input.trim() === '/quit') break
