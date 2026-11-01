@@ -28,13 +28,7 @@ function workspacePath(root, value, label) {
 
 export const coding = {
   inject: ['tools', 'workspace'],
-  apply(ctx) {
-    ctx.inject(['prompt'], (inner) => {
-      inner.effect(() => inner.prompt.contribute({
-        order: 10,
-        instructions: 'Use glob to find files and grep to search contents. Keep searches focused, and read relevant files before editing.',
-      }))
-    })
+  apply(ctx, config = {}) {
     const tools = [
       { name: 'read', description: 'Read a UTF-8 file. Relative paths start at the workspace.', parameters: parameters({ path: string }, ['path']),
         execute: async (args) => (await readFile(workspacePath(workspaceRoot(ctx), field(args, 'path'), 'path'), 'utf8')).slice(0, 30000) },
@@ -59,6 +53,30 @@ export const coding = {
         } },
       ...searchTools(() => workspaceRoot(ctx)),
     ]
-    for (const tool of tools) ctx.effect(() => ctx.tools.register(tool))
+    const selected = config?.tools
+    if (selected !== undefined) {
+      if (!Array.isArray(selected) || selected.some((name) => typeof name !== 'string')) {
+        throw new Error('coding: tools must be an array of tool names')
+      }
+      const available = new Set(tools.map((tool) => tool.name))
+      if (new Set(selected).size !== selected.length) throw new Error('coding: duplicate tool name')
+      for (const name of selected) if (!available.has(name)) throw new Error(`coding: unknown tool ${name}`)
+    }
+    const has = (name) => !selected || selected.includes(name)
+    const guidance = []
+    if (has('glob') && has('grep')) guidance.push('Use glob to find files and grep to search contents.')
+    else if (has('glob')) guidance.push('Use glob to find files.')
+    else if (has('grep')) guidance.push('Use grep to search contents.')
+    const search = has('glob') || has('grep')
+    const readBeforeEdit = has('read') && (has('edit') || has('write'))
+    if (search && readBeforeEdit) guidance.push('Keep searches focused, and read relevant files before editing.')
+    else if (search) guidance.push('Keep searches focused.')
+    else if (readBeforeEdit) guidance.push('Read relevant files before editing.')
+    if (guidance.length) ctx.inject(['prompt'], (inner) => {
+      inner.effect(() => inner.prompt.contribute({ order: 10, instructions: guidance.join(' ') }))
+    })
+    for (const tool of tools) {
+      if (has(tool.name)) ctx.effect(() => ctx.tools.register(tool))
+    }
   },
 }

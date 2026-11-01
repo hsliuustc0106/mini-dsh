@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
 
 // Prepared providers. prepare() returns the JSON body; dispatch() sends it once
 // and yields text and tool-call chunks. The fake provider replays prepared
@@ -71,6 +72,37 @@ export function providerForConfig({ replies, apiKey, baseUrl, model, toolChoice,
     return deepseekProvider({ apiKey: apiKey.trim(), baseUrl, model, toolChoice, fetch })
   }
   return fakeProvider()
+}
+
+// The terminal's default provider is itself a plugin. Selection happens only
+// when that plugin starts, so a profile can replace it without reading its
+// credentials or replay file.
+export function environmentProvider(env = process.env) {
+  return {
+    inject: ['model'],
+    async apply(ctx) {
+      const file = env.MINI_REPLIES
+      let selected
+      if (file) {
+        const path = resolve(file)
+        let replies
+        try { replies = JSON.parse(await readFile(path, 'utf8')) }
+        catch (error) {
+          throw new Error(error instanceof SyntaxError ? `MINI_REPLIES is not JSON: ${path}` : `MINI_REPLIES could not be read: ${path}`)
+        }
+        if (!Array.isArray(replies)) throw new Error('MINI_REPLIES must be a JSON array')
+        selected = providerForConfig({ replies })
+      } else {
+        selected = providerForConfig({
+          apiKey: await readApiKey(env),
+          baseUrl: env.DEEPSEEK_BASE_URL,
+          model: env.DEEPSEEK_MODEL,
+          toolChoice: env.DEEPSEEK_TOOL_CHOICE,
+        })
+      }
+      selected.apply(ctx)
+    },
+  }
 }
 
 export function deepseekProvider(options = {}) {

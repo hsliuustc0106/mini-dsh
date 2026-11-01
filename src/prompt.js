@@ -48,13 +48,13 @@ export const instructions = {
 
 // Context describes the workspace and the permission policy. It does not enforce them.
 export const runtimeContext = {
-  inject: ['prompt', 'workspace'],
+  inject: ['prompt', 'workspace', 'permissions', 'tools'],
   apply(ctx) {
     ctx.effect(() => ctx.prompt.contribute({
       order: 0,
       context: () => ({
         workspace: ctx.workspace.root,
-        permissions: 'read, glob, grep, and skill are allowed; each write, edit, and shell call requires approval; unknown tools are denied',
+        permissions: ctx.permissions.describe(ctx.tools.schemas().map((tool) => tool.function.name)),
         sandbox: false,
       }),
     }))

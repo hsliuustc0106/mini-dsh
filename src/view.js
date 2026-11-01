@@ -25,6 +25,7 @@ try {
     session: process.env.MINI_SESSION,
     writable: false,
     composition: viewerComposition,
+    pluginConfig: process.env.MINI_VIEW_CONFIG,
     view: viewerSettings(),
   })
   const { session } = app.ctx

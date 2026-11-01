@@ -46,7 +46,7 @@ function redact(text, secret) {
 
 function childEnv(dir, sessionPath, apiKey) {
   const env = { ...process.env }
-  for (const name of ['MINI_REPLIES', 'MINI_INSPECT', 'MINI_VIEW', 'MINI_VIEW_PORT', 'MINI_CLOCK', 'DEEPSEEK_API_KEY_FILE']) {
+  for (const name of ['MINI_REPLIES', 'MINI_INSPECT', 'MINI_VIEW', 'MINI_VIEW_PORT', 'MINI_WEB', 'MINI_WEB_PORT', 'MINI_CLOCK', 'MINI_CONFIG', 'DEEPSEEK_API_KEY_FILE']) {
     delete env[name]
   }
   env.MINI_WORKSPACE = dir

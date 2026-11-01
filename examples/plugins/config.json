@@ -1,0 +1,9 @@
+{
+  "plugins": [
+    {
+      "name": "greeting",
+      "module": "./greeting.mjs",
+      "config": { "prefix": "Hello" }
+    }
+  ]
+}

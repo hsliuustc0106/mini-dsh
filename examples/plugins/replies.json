@@ -1,0 +1,10 @@
+[
+  {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      { "id": "greet-1", "type": "function", "function": { "name": "greet", "arguments": "{\"name\":\"Ada\"}" } }
+    ]
+  },
+  { "role": "assistant", "content": "Greeted Ada." }
+]

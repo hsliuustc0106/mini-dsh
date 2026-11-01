@@ -38,7 +38,7 @@ The surfaces are projections of the same append-only session:
 
 Tool cards distinguish denied, error, and unknown outcomes and never fill in a missing result. Card event buttons and the ledger lead to the underlying records, including the permission decision. The timeline groups fragments by model request and keeps each fragment selectable.
 
-`/prototype` on that server is a simulated mockup of the `hello.txt` prompt and approval flow, beside the same ledger. The ledger is a snapshot of the session log and is not a second history. The page does not follow later session events. Enter sends the prompt; Shift+Enter inserts a newline. A second send does nothing until the open turn decides. The scripted call is always `write` `write-hello` with arguments `{"path":"hello.txt","content":"hello\n"}` and the workspace the server was given. The typed text is only the simulated user message. Read, glob, grep, and skill are allowed and do not ask. **Allow once** and **Deny** decide that one call; another click does nothing. Any action other than Allow once leaves the tool unstarted. The page does not call DeepSeek, read an API key, append the session, or create `hello.txt`.
+`/prototype` on that server is a simulated mockup of the `hello.txt` prompt and approval flow, beside the same ledger. The ledger is a snapshot of the session log and is not a second history. The page does not follow later session events. Enter sends the prompt; Shift+Enter inserts a newline. A second send does nothing until the open turn decides. The scripted call is always `write` `write-hello` with arguments `{"path":"hello.txt","content":"hello\n"}` and the workspace the server was given. The typed text is only the simulated user message. The simulation uses the default policy: read, glob, grep, and skill are allowed and do not ask. **Allow once** and **Deny** decide that one call; another click does nothing. Any action other than Allow once leaves the tool unstarted. The page does not call DeepSeek, read an API key, append the session, or create `hello.txt`.
 
 The live composer uses a separate control server; this mockup remains read-only and simulated.
 
@@ -53,6 +53,29 @@ MINI_WEB=1 npm start
 Open the printed **Web** address (default `http://127.0.0.1:7484`; set `MINI_WEB_PORT`, including `0` for an available port). Chat sends one prompt at a time, streams the same session events, and asks for each exact write, edit, or shell call with **Allow once** or **Deny**. Enter sends; Shift+Enter inserts a newline. Trajectory shows the same log with input, model, and tool timing spans; streamed fragments are grouped into expandable rows. A browser disconnect denies any pending approval, and a reconnected browser cannot approve that old request. Terminal prompts and approvals continue to work in the terminal; a second prompt is rejected while the agent is busy.
 
 The control server binds to `127.0.0.1`, accepts control requests only from its own origin, and keeps provider credentials on the server. It is separate from the read-only `npm run view` and `MINI_VIEW=1` viewer. As with terminal approval, an allowed tool runs with your user's permissions; the workspace is not a sandbox.
+
+## Plugins
+
+The terminal, agent, registries, session, provider, tools, permissions, prompt contributions, skills, viewer, and web controls are Cordis plugins. `src/composition.js` supplies the default composition; each entry has a name, a plugin, and optional config. `boot()` starts the entries on Cordis fibers, waits for their dependencies, and disposes their effects on shutdown or startup failure. A plugin can register services, tools, prompt contributions, and permission policies through the injected context.
+
+Set `MINI_CONFIG` to an explicit JSON file to customize the interactive agent. Relative config paths start at `MINI_WORKSPACE`; module paths start at the config file's directory. The file overlays the defaults by plugin name:
+
+```json
+{
+  "plugins": [
+    { "name": "coding", "enabled": false },
+    { "name": "greeting", "module": "./greeting.mjs", "config": { "prefix": "Hello" } }
+  ]
+}
+```
+
+An existing name changes that entry; `enabled: false` removes it. A new name needs a local JavaScript `module`, whose default export is a Cordis plugin. Use `export` to select another named export. `config` replaces that entry's config rather than merging it; if omitted, an existing entry keeps its runtime config. For example, `{ "name": "coding", "config": { "tools": ["read", "glob", "grep"] } }` keeps just those coding tools. The `skill` tool is provided by the separate `skills` plugin. `required: false` allows an optional plugin fiber to be pending or fail without blocking boot; invalid config or a module that cannot be imported still fails. New entries are inserted before shared permission services so the agent drains before their effects are removed. `before` can place a new entry before a named existing entry when a different disposal order is needed. Module imports execute code, so use a config and plugins you trust. Config changes take effect on the next boot; restart the process after editing a loaded plugin module.
+
+Inspect mode ignores `MINI_CONFIG`. The standalone viewer has its own `viewer` and `session` composition and ignores `MINI_CONFIG`; set `MINI_VIEW_CONFIG` to a separate profile to customize it. Its default session is read-only, though configured plugins and replacements can run arbitrary code.
+
+[`examples/plugins/config.json`](examples/plugins/config.json) adds a `greet` tool using [`greeting.mjs`](examples/plugins/greeting.mjs). To try it without a key, run `MINI_CONFIG=examples/plugins/config.json MINI_REPLIES=examples/plugins/replies.json npm start` from the repository and enter a prompt. The tool and its `allow` policy are separate reversible effects. A registered tool without a policy is denied; plugins can register `allow`, `ask`, or `deny` with `ctx.permissions.register(name, policy)`. The default policies are themselves supplied by the `default-tool-permissions` plugin. Replacing that plugin lets a composition define a different policy without changing the agent.
+
+The interactive entry calls the `terminal` service's `run({ workspace, sessionPath, viewerUrl, webUrl })` method, and forwards approval requests to `approve(detail, signal)`. A profile can replace the `terminal` plugin with another implementation of that interface. Only an approval result of `true` grants the call; an absent approval method denies it. Browser turns use their own approval callback.
 
 ## Skills
 
@@ -99,14 +122,14 @@ Limitations:
 
 ## Study the core
 
-1. `src/composition.js` selects plugins. `src/main.js` boots that composition. Shutdown disposes consumers first, so a turn can record a known outcome before the session releases its writer lock.
+1. `src/composition.js` selects default plugins, and `src/plugin-config.js` applies the optional named overlay. `src/main.js` boots that composition; `src/terminal.js` supplies the interactive input and approval plugin. Shutdown disposes consumers first, so a turn can record a known outcome before the session releases its writer lock.
 2. `src/services.js` defines the workspace, the model provider registry, the tool registry, the checkpoint policy, and the session. The agent builds model messages from message events.
 3. `src/coding.js` registers read, write, edit, shell, and the glob and grep tools from `src/search.js` with `ctx.effect`. Relative paths and the shell working directory come from the boot workspace. Disposing that plugin removes its tools.
 4. `src/prompt.js` collects ordered instruction and runtime-context contributions for the life of the plugin that added them. `src/skills.js` contributes a current catalog and the `skill` loader. Context describes the workspace and the permission policy. It does not enforce them.
-5. `src/permissions.js` allows read, glob, grep, and skill, asks for each exact write, edit, or shell call, and denies unknown tools. Only an answer of `true` is a grant. The terminal supplies that answer once per call. Approval is not a sandbox.
+5. `src/permissions.js` defines the permission registry and a default policy plugin: read, glob, grep, and skill are allowed; each write, edit, or shell call asks; unknown tools are denied. Only an answer of `true` is a grant. The terminal supplies that answer once per call. Approval is not a sandbox.
 6. `src/provider.js` registers one provider. `MINI_REPLIES` registers the fake provider. A credential with no replies registers DeepSeek. Each model call is prepared once. The prepared body is the request that will be sent. DeepSeek's body is the chat-completions JSON, without the API key. `dispatch()` yields that call's chunks once.
 7. `src/agent.js` runs one turn at a time. It records that body before dispatch, commits each observed chunk before reading the next, and writes the assistant message from those committed deltas only after a complete finish. It then checkpoints `tool.started` before each tool body and records the observed result after. A second turn is rejected as busy. Shutdown stops new turns, cancels a pending approval, drains a tool body that already started, and does not invent a result or reply text that was never observed.
-8. `test/core.test.js`, `test/session.test.js`, `test/boot.test.js`, `test/agent.test.js`, `test/terminal.test.js`, `test/trajectory.test.js`, `test/prototype.test.js`, `test/search.test.js`, `test/skills.test.js`, `test/provider.test.js`, `test/web-control.test.js`, and `test/web-ui.test.js` exercise disposal, replay, recovery, the agent, both web views, search, skills, and the DeepSeek request body with a mocked HTTP call. Run `npm test`. `npm run replay` runs the terminal replay on its own. No API key is required. `npm run smoke` is the live check.
+8. The tests exercise plugin configuration, disposal, replay, recovery, the agent, both web views, search, skills, and the DeepSeek request body with a mocked HTTP call. Run `npm test`. `npm run replay` runs the terminal replay on its own. No API key is required. `npm run smoke` is the live check.
 9. `src/trajectory.js` projects session events into turns, conversation cards, timing spans, and observed stream fragments. `src/viewer.js` serves that projection on `127.0.0.1`. The server is a `ctx.effect` registration, so unloading the plugin closes it. `npm run view` opens the log read-only. `MINI_VIEW=1` follows a live terminal session from the same session service. Reconnect with the last sequence you observed. `src/prototype.js` is the `/prototype` page: the same projection, plus a simulated turn that is not written back.
 10. `src/web-control.js` is an optional Cordis plugin for the live agent. Browser turns use a per-turn approval callback, so terminal turns keep their own approval prompt. Each browser approval belongs to one live connection and one call; the session remains the only history.
 
