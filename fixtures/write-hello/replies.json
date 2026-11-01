@@ -1,0 +1,20 @@
+[
+  {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      {
+        "id": "write-hello",
+        "type": "function",
+        "function": {
+          "name": "write",
+          "arguments": "{\"path\":\"hello.txt\",\"content\":\"hello\\n\"}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": "Wrote hello.txt."
+  }
+]
