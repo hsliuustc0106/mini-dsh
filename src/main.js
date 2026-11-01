@@ -6,6 +6,7 @@ import { boot } from './boot.js'
 import { composition } from './composition.js'
 import { providerForConfig, readApiKey } from './provider.js'
 import { viewerSettings } from './viewer.js'
+import { webControlSettings } from './web-control.js'
 
 const inspect = process.env.MINI_INSPECT === '1'
 
@@ -104,6 +105,7 @@ try {
     approve: terminal ? oneShotApproval(terminal) : undefined,
     clock: fixedClock(),
     view: process.env.MINI_VIEW === '1' && !inspect ? viewerSettings() : undefined,
+    web: process.env.MINI_WEB === '1' && !inspect ? webControlSettings() : undefined,
   })
   const { session } = app.ctx
   if (inspect) {
@@ -122,12 +124,13 @@ try {
     console.log('Mini harness. /quit exits; workspace:', app.workspace)
     console.log('Session:', `${app.sessionPath} (${session.events.length} events)`)
     if (app.ctx.viewer?.url) console.log('Trajectory:', app.ctx.viewer.url)
+    if (app.ctx.webControl?.url) console.log('Web:', app.ctx.webControl.url)
     for (;;) {
       const input = await terminal.ask('\nYou> ')
       if (input == null || input.trim() === '/quit') break
       if (!input.trim()) continue
       try { await app.ctx.agent.turn(input, ({ type, content }) => console.log(`\n${type}> ${content}`)) }
-      catch (error) { console.error(`Error: ${error.message}`); break }
+      catch (error) { console.error(`Error: ${error.message}`); if (error.code !== 'BUSY') break }
     }
   }
 } catch (error) {

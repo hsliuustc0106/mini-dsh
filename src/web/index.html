@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mini-dsh</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="app">
+    <header class="header"><strong>mini-dsh</strong><span id="workspace"></span></header>
+    <nav class="tabs" role="tablist" aria-label="Session view">
+      <button id="chat-tab" role="tab" aria-controls="chat" aria-selected="true">Chat</button>
+      <button id="trajectory-tab" role="tab" aria-controls="trajectory" aria-selected="false">Trajectory</button>
+    </nav>
+    <section id="chat" class="content" role="tabpanel" aria-labelledby="chat-tab" aria-live="polite"></section>
+    <section id="trajectory" class="content" role="tabpanel" aria-labelledby="trajectory-tab" hidden>
+      <section class="timing" aria-label="Timing overview">
+        <h2>Timing</h2>
+        <div id="timeline" class="timeline"><p>No timing spans yet.</p></div>
+        <ul class="legend"><li class="input">input</li><li class="model">model</li><li class="tool">tool</li></ul>
+      </section>
+      <ol id="events" class="events"></ol>
+    </section>
+    <p id="notice" class="notice" role="status"></p>
+    <div class="composer">
+      <label class="sr-only" for="prompt">Message mini-dsh</label>
+      <textarea id="prompt" rows="2" placeholder="Message mini-dsh…" disabled></textarea>
+      <div class="composer-footer">
+        <span id="hint">Connecting…</span>
+        <button id="send" class="send" type="button" aria-label="Send prompt" disabled>↑</button>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

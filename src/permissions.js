@@ -32,7 +32,7 @@ export class Permissions extends Service {
     this.ask = config?.ask
   }
 
-  async decide(call, signal) {
+  async decide(call, signal, ask = this.ask) {
     const detail = {
       callId: call.callId,
       name: call.name,
@@ -41,7 +41,7 @@ export class Permissions extends Service {
     }
     if (ALLOWED.has(call.name)) return { ...detail, decision: 'allow' }
     if (!ASKED.has(call.name)) return { ...detail, decision: 'deny', reason: 'unknown tool' }
-    const answer = await answerFor(this.ask, structuredClone(detail), signal)
+    const answer = await answerFor(ask, structuredClone(detail), signal)
     if (signal?.aborted || answer !== true) {
       const reason = answer === false && !signal?.aborted ? 'denied' : 'approval unavailable'
       return { ...detail, decision: 'deny', reason }

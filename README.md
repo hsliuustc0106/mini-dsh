@@ -28,6 +28,16 @@ Set `DEEPSEEK_API_KEY` to use the live provider for `npm start`. The key can als
 
 `MINI_VIEW=1` serves the same page beside the interactive terminal and follows the open session. Inspect mode ignores it. The viewer reads the session log. It does not keep a second history. A reconnect continues from the last sequence it observed. Terminal input and approvals stay in the terminal.
 
+To use the optional browser controls alongside the terminal, start the agent with:
+
+```sh
+MINI_WEB=1 npm start
+```
+
+Open the printed **Web** address (default `http://127.0.0.1:7484`; set `MINI_WEB_PORT`, including `0` for an available port). Chat sends one prompt at a time, streams the same session events, and asks for each exact write, edit, or shell call with **Allow once** or **Deny**. Enter sends; Shift+Enter inserts a newline. Trajectory shows the same log with input, model, and tool timing spans; streamed fragments are grouped into expandable rows. A browser disconnect denies any pending approval, and a reconnected browser cannot approve that old request. Terminal prompts and approvals continue to work in the terminal; a second prompt is rejected while the agent is busy.
+
+The control server binds to `127.0.0.1`, accepts control requests only from its own origin, and keeps provider credentials on the server. It is separate from the read-only `npm run view` and `MINI_VIEW=1` viewer. As with terminal approval, an allowed tool runs with your user's permissions; the workspace is not a sandbox.
+
 ## Composition and boot
 
 `src/composition.js` is the coding-agent composition. `boot()` in `src/boot.js` is the shared entry used by the terminal and by tests. It checks the workspace, starts each plugin on its own Cordis fiber, waits until required plugins are active, and disposes every fiber it started when startup fails. A failed or missing plugin is reported by name. Disposing one plugin removes only that plugin's registrations.
@@ -72,5 +82,6 @@ Limitations:
 7. `src/agent.js` runs one turn at a time. It records that body before dispatch, commits each observed chunk before reading the next, and writes the assistant message from those committed deltas only after a complete finish. It then checkpoints `tool.started` before each tool body and records the observed result after. A second turn is rejected as busy. Shutdown stops new turns, cancels a pending approval, drains a tool body that already started, and does not invent a result or reply text that was never observed.
 8. `test/core.test.js`, `test/session.test.js`, `test/boot.test.js`, `test/agent.test.js`, `test/terminal.test.js`, `test/trajectory.test.js`, and `test/provider.test.js` exercise disposal, replay, the writer lock, recovery, boot, the keyless loop, the terminal entry point, the trajectory projection, and the DeepSeek request body with a mocked HTTP call. Run `npm test`. `npm run replay` runs the terminal replay on its own. No API key is required. `npm run smoke` is the live check.
 9. `src/trajectory.js` projects session events into turns, timing spans, and the observed stream fragments. `src/viewer.js` serves that projection on `127.0.0.1`. The server is a `ctx.effect` registration, so unloading the plugin closes it. `npm run view` opens the log read-only. `MINI_VIEW=1` follows a live terminal session from the same session service. Reconnect with the last sequence you observed.
+10. `src/web-control.js` is an optional Cordis plugin for the live agent. Browser turns use a per-turn approval callback, so terminal turns keep their own approval prompt. Each browser approval belongs to one live connection and one call; the session remains the only history.
 
 `fixtures/write-hello/` is the recorded fake-model task: prepared replies, the session log, and `hello.txt`. The replay drives `src/main.js` in an explicit workspace and checks the session events and that file. Those replies are streamed into the session as deltas. The trajectory viewer projects that same log, including an interrupted tool with no recorded result. Live DeepSeek is the interactive provider and `npm run smoke`. This version has no sandbox, compaction, or full DeepSeek Harness session compatibility. CI runs the same keyless suite and does not call DeepSeek.

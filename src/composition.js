@@ -5,6 +5,7 @@ import { Permissions } from './permissions.js'
 import { fakeProvider } from './provider.js'
 import { Checkpoint, Model, Session, Tools, Workspace } from './services.js'
 import { TrajectoryViewer } from './viewer.js'
+import { WebControl } from './web-control.js'
 
 // Consumers are listed before the services they use. Shutdown disposes in
 // this order, so a turn can record a known outcome before the session
@@ -14,10 +15,11 @@ function viewerEntry(view) {
   return { name: 'viewer', plugin: TrajectoryViewer, config: view === true ? {} : view }
 }
 
-export function composition({ workspace, sessionPath, writable = true, provider, approve, model, clock, view } = {}) {
+export function composition({ workspace, sessionPath, writable = true, provider, approve, model, clock, view, web } = {}) {
   const viewer = viewerEntry(view)
   return [
     ...(viewer ? [viewer] : []),
+    ...(web ? [{ name: 'web-control', plugin: WebControl, config: web === true ? {} : web }] : []),
     { name: 'agent', plugin: Agent },
     { name: 'coding', plugin: coding },
     { name: 'instructions', plugin: instructions },
