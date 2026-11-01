@@ -6,9 +6,18 @@ import { join } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { Agent } from '../src/agent.js'
 import { coding } from '../src/coding.js'
-import { Session, Tools } from '../src/services.js'
+import { Checkpoint, Session, Tools } from '../src/services.js'
 
 const tick = () => new Promise(setImmediate)
+
+async function ready(fibers) {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    await Promise.all(fibers.map((fiber) => fiber.await().catch(() => {})))
+    if (fibers.every((fiber) => fiber.state === 2)) return
+    await tick()
+  }
+  throw new Error(`plugins were not ready: ${fibers.map((fiber) => fiber.state).join(',')}`)
+}
 
 test('Cordis removes tool effects and reactivates consumers when dependencies return', async () => {
   const ctx = new Context()
@@ -41,29 +50,38 @@ test('agent records a tool call and replays the resulting history', async () => 
     }
   }
   const ctx = new Context()
-  const fibers = [ctx.plugin(Agent), ctx.plugin(coding), ctx.plugin(Tools), ctx.plugin(Session, { path }), ctx.plugin(FakeModel)]
+  const fibers = [ctx.plugin(Agent), ctx.plugin(coding), ctx.plugin(Tools), ctx.plugin(Session, { path }), ctx.plugin(Checkpoint), ctx.plugin(FakeModel)]
+  const reader = new Context()
+  let readerFiber
   try {
-    await tick()
-    await ctx.session.load()
+    await ready(fibers)
     await ctx.agent.turn('Read the file')
     assert.equal(seen[1].at(-1).content, 'hello')
-    const lines = (await readFile(path, 'utf8')).trim().split('\n').map(JSON.parse)
-    assert.deepEqual(lines.map((m) => m.role), ['user', 'assistant', 'tool', 'assistant'])
-    ctx.session.messages = []
-    await ctx.session.load()
-    assert.deepEqual(ctx.session.messages, lines)
+    const events = (await readFile(path, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+    assert.deepEqual(events.map((event) => event.seq), [1, 2, 3, 4])
+    assert.deepEqual(events.map((event) => event.message.role), ['user', 'assistant', 'tool', 'assistant'])
+    assert.deepEqual(ctx.session.messages.map((message) => message.role), ['user', 'assistant', 'tool', 'assistant'])
+    readerFiber = reader.plugin(Session, { path, writable: false })
+    await ready([readerFiber])
+    assert.deepEqual(reader.session.messages, ctx.session.messages)
   } finally {
+    if (readerFiber) await readerFiber.dispose()
     await Promise.all(fibers.map((fiber) => fiber.dispose()))
     await rm(dir, { recursive: true, force: true })
   }
 })
 
-test('refuses to resume an interrupted tool call', async () => {
+test('keeps an interrupted tool call readable and refuses to continue it', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'mini-agent-')), path = join(dir, 'session.jsonl')
-  await writeFile(path, JSON.stringify({ role: 'assistant', tool_calls: [{ id: 'pending' }] }) + '\n')
-  const ctx = new Context(), fiber = ctx.plugin(Session, { path })
-  try { await tick(); await assert.rejects(ctx.session.load(), /unresolved tool calls/) }
-  finally { await fiber.dispose(); await rm(dir, { recursive: true, force: true }) }
+  await writeFile(path, JSON.stringify({ seq: 1, type: 'message', time: 't', message: { role: 'assistant', tool_calls: [{ id: 'pending' }] } }) + '\n')
+  const ctx = new Context(), fiber = ctx.plugin(Session, { path, writable: true })
+  try {
+    await ready([fiber])
+    assert.equal(ctx.session.writable, false)
+    assert.match(ctx.session.readonlyReason, /unknown tool outcome for pending/)
+    assert.equal(ctx.session.history()[0].message.tool_calls[0].id, 'pending')
+    await assert.rejects(ctx.session.append({ type: 'note' }), /unknown tool outcome/)
+  } finally { await fiber.dispose(); await rm(dir, { recursive: true, force: true }) }
 })
 
 test('model adapter sends the conversation and tool schemas over HTTP', async () => {
