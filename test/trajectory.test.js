@@ -13,7 +13,7 @@ import { observeStream, readSession } from '../src/log.js'
 import { fakeProvider } from '../src/provider.js'
 import { Session, Workspace } from '../src/services.js'
 import { project } from '../src/trajectory.js'
-import { TrajectoryViewer } from '../src/viewer.js'
+import { renderPage, TrajectoryViewer } from '../src/viewer.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const fixtureDir = join(root, 'fixtures/write-hello')
@@ -185,6 +185,14 @@ test('projects the recorded fixture into turns, timing, and inspectable records'
   assert.equal(view.turns.length, 1)
   assert.equal(view.turns[0].id, 1)
   assert.equal(view.turns[0].input, 'Write hello.txt')
+  const cards = view.turns[0].cards
+  assert.deepEqual(cards.map((card) => card.kind), ['user', 'tool', 'assistant'])
+  assert.equal(cards[0].content, 'Write hello.txt')
+  assert.deepEqual([cards[1].name, cards[1].status, cards[1].seq, cards[1].decisionSeq, cards[1].startSeq, cards[1].resultSeq],
+    ['write', 'ok', 9, 10, 11, 13])
+  assert.deepEqual(cards[1].arguments, { path: 'hello.txt', content: 'hello\n' })
+  assert.equal(cards[1].result, 'File written.')
+  assert.equal(cards[2].content, 'Wrote hello.txt.')
   assert.deepEqual(view.turns[0].rows.map((row) => row.label), [
     'message:user', 'model.request', 'stream.started', 'stream.delta', 'stream.delta', 'stream.delta', 'stream.ended', 'message:assistant', 'permission.decided',
     'tool.started', 'tool.finished', 'message:tool', 'model.request', 'stream.started', 'stream.delta', 'stream.delta', 'stream.ended', 'message:assistant',
@@ -246,6 +254,10 @@ test('projects an interrupted tool and an unresolved tool call as unknown', () =
   assert.equal(pending.turns[0].rows.find((row) => row.type === 'message' && row.detail.role === 'assistant').detail.outcome, 'unknown')
   assert.equal(rowsOf(pending).some((row) => row.type === 'tool.started' || row.type === 'tool.finished'), false)
   assert.equal(pending.overview.some((span) => span.kind === 'tool'), false)
+  const pendingCard = pending.turns[0].cards.find((card) => card.kind === 'tool')
+  assert.equal(pendingCard.status, 'unknown')
+  assert.equal('result' in pendingCard, false)
+  assert.equal(pendingCard.seq, 4)
 })
 
 test('projects a denied tool error without a tool span', () => {
@@ -265,6 +277,50 @@ test('projects a denied tool error without a tool span', () => {
   const error = view.turns[0].rows.find((row) => row.detail.error)
   assert.equal(error.detail.error, 'Error: denied')
   assert.equal(view.overview.some((span) => span.kind === 'tool'), false)
+  const card = view.turns[0].cards.find((item) => item.kind === 'tool')
+  assert.equal(card.status, 'deny')
+  assert.equal(card.result, 'Error: denied')
+  assert.equal(card.decisionSeq, 4)
+  assert.equal(card.resultSeq, 5)
+  assert.equal('startSeq' in card, false)
+})
+
+test('keeps parallel tool calls and their observed results associated with the right cards', () => {
+  const view = project([
+    { seq: 1, time: clock, type: 'message', message: { role: 'user', content: 'Check both' } },
+    { seq: 2, time: clock, type: 'message', message: assistant('Checking.', [call('first', 'read', { path: 'a' }), call('second', 'shell', { command: 'bad' })]) },
+    { seq: 3, time: clock, type: 'tool.started', callId: 'second', name: 'shell', arguments: { command: 'bad' } },
+    { seq: 4, time: clock, type: 'tool.finished', callId: 'second', result: 'Error: failed' },
+    { seq: 5, time: clock, type: 'message', message: { role: 'tool', tool_call_id: 'second', content: 'Error: failed' } },
+    { seq: 6, time: clock, type: 'tool.started', callId: 'first', name: 'read', arguments: { path: 'a' } },
+    { seq: 7, time: clock, type: 'tool.finished', callId: 'first', result: 'file contents' },
+    { seq: 8, time: clock, type: 'message', message: { role: 'tool', tool_call_id: 'first', content: 'file contents' } },
+  ])
+  assert.deepEqual(view.turns[0].cards.map((card) => card.kind), ['user', 'assistant', 'tool', 'tool'])
+  const [first, second] = view.turns[0].cards.filter((card) => card.kind === 'tool')
+  assert.deepEqual([first.callId, first.result, first.resultSeq, first.status], ['first', 'file contents', 8, 'ok'])
+  assert.deepEqual([second.callId, second.result, second.resultSeq, second.status], ['second', 'Error: failed', 5, 'error'])
+
+  const unfinished = project([
+    { seq: 1, time: clock, type: 'message', message: { role: 'user', content: 'Write' } },
+    { seq: 2, time: clock, type: 'message', message: assistant(null, [call('write', 'write', { path: 'a' })]) },
+    { seq: 3, time: clock, type: 'tool.started', callId: 'write', name: 'write', arguments: { path: 'a' } },
+    { seq: 4, time: clock, type: 'tool.finished', callId: 'write', result: 'File written.' },
+  ])
+  const card = unfinished.turns[0].cards.find((item) => item.kind === 'tool')
+  assert.equal(card.status, 'unknown')
+  assert.equal(card.result, 'File written.')
+  assert.equal(card.resultSeq, 4)
+
+  const reused = project([
+    { seq: 1, type: 'message', message: { role: 'user', content: 'Read twice' } },
+    { seq: 2, type: 'message', message: assistant(null, [call('same-id', 'read', { path: 'first' })]) },
+    { seq: 3, type: 'tool.started', callId: 'same-id', name: 'read', arguments: { path: 'first' } },
+    { seq: 4, type: 'tool.finished', callId: 'same-id', result: 'first contents' },
+    { seq: 5, type: 'message', message: { role: 'tool', tool_call_id: 'same-id', content: 'first contents' } },
+    { seq: 6, type: 'message', message: assistant(null, [call('same-id', 'read', { path: 'second' })]) },
+  ])
+  assert.deepEqual(reused.turns[0].cards.filter((item) => item.kind === 'tool').map((item) => item.status), ['ok', 'unknown'])
 })
 
 test('times model and tool spans from the recorded clock', () => {
@@ -361,6 +417,21 @@ test('an unfinished stream has no invented end or assistant text', () => {
   assert.equal(view.turns[0].rows.some((row) => row.detail?.role === 'assistant'), false)
   assert.equal(JSON.stringify(view).includes('Hello'), false)
   assert.equal(view.turns[0].rows.find((row) => row.type === 'stream.started').status, 'unknown')
+  assert.deepEqual(view.turns[0].cards.map((card) => [card.kind, card.content, card.status, card.partial]), [
+    ['user', 'Hi', undefined, undefined], ['assistant', 'Hel', 'unknown', true],
+  ])
+  const page = renderPage(view)
+  assert.match(page, /Partial · outcome unknown/)
+  assert.match(page, /These records may still be in progress/)
+  assert.equal(page.includes('Session is read-only:'), false)
+  const ended = project([
+    { seq: 1, type: 'message', message: { role: 'user', content: 'Hi' } },
+    { seq: 2, type: 'stream.started' },
+    { seq: 3, type: 'stream.delta', stream: 2, text: 'Hel' },
+    { seq: 4, type: 'stream.ended', stream: 2, finish: 'stop' },
+  ])
+  assert.equal(ended.turns[0].cards[1].partial, true)
+  assert.equal(ended.turns[0].cards[1].content, 'Hel')
 })
 
 test('serves the fixture read-only and renders the same history after restart', async () => {
@@ -381,6 +452,12 @@ test('serves the fixture read-only and renders the same history after restart', 
     assert.match(page.body, /class="bar input"/)
     assert.equal(page.body.split('class="bar model"').length - 1, 2)
     assert.match(page.body, /class="bar tool"/)
+    assert.match(page.body, /aria-label="conversation"/)
+    assert.match(page.body, /class="card user"/)
+    assert.match(page.body, /class="card tool ok"/)
+    assert.match(page.body, /class="card assistant"/)
+    assert.match(page.body, /data-seq="13">Result #13/)
+    assert.match(page.body, /<summary>Event ledger/)
     assert.match(page.body, />input</)
     assert.match(page.body, />model</)
     assert.match(page.body, />tool</)
