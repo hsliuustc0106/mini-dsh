@@ -1,6 +1,7 @@
 import { createServer } from 'node:http'
 import { Service } from '@deepseek-ai/cordis'
 import { unknownReason } from './log.js'
+import { prototypePage } from './prototype.js'
 import { project } from './trajectory.js'
 
 const HOST = '127.0.0.1'
@@ -102,7 +103,7 @@ export function renderPage(projection) {
 <main>
   <header>
     <p class="wordmark">mini-dsh</p>
-    <p class="meta">${projection.count} events</p>
+    <p class="meta">${projection.count} events · <a href="/prototype">Simulated prototype</a></p>
   </header>
   ${banner}
   <section aria-label="timing overview">
@@ -184,6 +185,12 @@ function section(title, input, rows) {
   const heading = input == null ? esc(title) : `${esc(title)} · ${esc(input)}`
   const items = rows.map((row) => `<li><button type="button" class="row${row.status !== 'ok' ? ` ${esc(row.status)}` : ''}" data-seq="${row.seq}" data-kind="${esc(row.kind)}" data-status="${esc(row.status)}"><span class="seq">#${row.seq}</span><span class="label">${esc(row.label)}</span><span class="summary">${esc(row.summary)}</span><time datetime="${esc(row.time)}">${esc(row.time)}</time></button></li>`).join('')
   return `<section class="turn"><h2>${heading}</h2><ol>${items}</ol></section>`
+}
+
+function prototypeWorkspace(session) {
+  if (typeof session?.workspace === 'string' && session.workspace) return session.workspace
+  const opened = session?.events?.find((event) => event.type === 'session.opened')
+  return typeof opened?.workspace === 'string' ? opened.workspace : ''
 }
 
 function send(res, status, type, body) {
@@ -295,6 +302,12 @@ export class TrajectoryViewer extends Service {
     }
     if (url.pathname === '/events') {
       await this.stream(req, res, url)
+      return
+    }
+    // GET only. A later live approval route would need a secret the page
+    // cannot forge; this server does not accept a prompt or a decision.
+    if (url.pathname === '/prototype') {
+      send(res, 200, 'text/html; charset=utf-8', prototypePage(renderPage(await this.snapshot()), prototypeWorkspace(this.ctx.session)))
       return
     }
     send(res, 404, 'text/plain; charset=utf-8', 'Not found\n')
