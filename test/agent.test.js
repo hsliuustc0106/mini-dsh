@@ -70,10 +70,10 @@ test('prompt contributions stay ordered and leave with the plugin', async () => 
   const fiber = ctx.plugin(plugin)
   try {
     await ready([prompt, fiber])
-    assert.deepEqual(ctx.prompt.snapshot().instructions, ['earlier', 'later'])
-    assert.deepEqual(ctx.prompt.snapshot().context, [{ n: 1 }])
+    assert.deepEqual((await ctx.prompt.snapshot()).instructions, ['earlier', 'later'])
+    assert.deepEqual((await ctx.prompt.snapshot()).context, [{ n: 1 }])
     await fiber.dispose()
-    assert.deepEqual(ctx.prompt.snapshot(), { instructions: [], context: [] })
+    assert.deepEqual(await ctx.prompt.snapshot(), { instructions: [], context: [] })
   } finally {
     await fiber.dispose()
     await prompt.dispose()
@@ -414,7 +414,7 @@ test('disposal drains a blocked tool without inventing its result', async () => 
     await tick()
     assert.equal(app.ctx.session.writable, true)
     assert.equal(typeof app.ctx.checkpoint.guard, 'function')
-    assert.equal(app.ctx.tools.schemas().length, 1)
+    assert.equal(app.ctx.tools.schemas().length, 2)
     const mid = await saved(app)
     assert.equal(mid.events.some((event) => event.type === 'tool.started' && event.callId === 'read-1'), true)
     assert.equal(mid.events.some((event) => event.type === 'tool.finished'), false)
