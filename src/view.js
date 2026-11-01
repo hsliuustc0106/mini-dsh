@@ -29,6 +29,7 @@ try {
   })
   const { session } = app.ctx
   console.log(`mini-dsh trajectory ${app.ctx.viewer.url}`)
+  console.log(`simulated prototype ${app.ctx.viewer.url}/prototype`)
   console.log(`Session: ${app.sessionPath} (${session.events.length} events)`)
   if (session.unknown.length) console.error(session.readonlyReason)
 } catch (error) {
