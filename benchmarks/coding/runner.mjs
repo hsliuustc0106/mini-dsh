@@ -114,11 +114,12 @@ async function publicConfigCheck(task, workspace, start, signal) {
     if (signal.aborted) throw new Error('Benchmark timeout')
     return await Promise.race([checkPublicConfig(sandbox), aborted])
   } finally {
-    signal.removeEventListener('abort', onAbort)
-    if (sandbox) {
-      if (signal.aborted) void close().catch(() => {})
-      else await close()
-    }
+    try {
+      if (sandbox) {
+        if (signal.aborted) void close().catch(() => {})
+        else await Promise.race([close(), aborted])
+      }
+    } finally { signal.removeEventListener('abort', onAbort) }
   }
 }
 

@@ -437,7 +437,41 @@ test('configuration deadline covers sandbox startup and closes late sandboxes', 
     assert.equal(result.modelCalls, 2)
     assert.equal(typeof release, 'function')
     release({ close: async () => { closeLate() } })
-    await lateClosed
+    const cleanupLimit = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('late sandbox was not closed')), 10000) })
+    await Promise.race([lateClosed, cleanupLimit]).finally(() => clearTimeout(timer))
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('configuration deadline does not wait for stalled sandbox cleanup', async () => {
+  const task = tasks.find((item) => item.id === 'config')
+  const dir = await mkdtemp(join(tmpdir(), 'mini-benchmark-cleanup-timeout-'))
+  let starts = 0, calls = 0, closes = 0, release
+  const startWithSlowCleanup = async () => {
+    if (starts++ === 0) return {
+      error: null,
+      request: async () => { throw new Error('candidate failed') },
+      close: () => { closes++; return new Promise((resolve) => { release = resolve }) },
+    }
+    return { error: null, request: async () => ({ ok: false, error: { name: 'Error', message: 'fixture' } }), close: async () => {} }
+  }
+  try {
+    const fetchImpl = async () => {
+      const writing = calls++ === 0
+      const delta = writing
+        ? { tool_calls: [{ index: 0, id: 'write', type: 'function', function: { name: 'write', arguments: JSON.stringify({ path: task.file, content: assignmentConfig }) } }] }
+        : { content: 'Done.' }
+      const payload = { choices: [{ index: 0, delta, finish_reason: writing ? 'tool_calls' : 'stop' }] }
+      return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, { headers: { 'Content-Type': 'text/event-stream' } })
+    }
+    const run = runOne({ task, variant: 'updated', repetition: 1, directory: dir, apiKey: 'fixture-api-key', fetchImpl, start: startWithSlowCleanup, timeoutMs: 1000 })
+    let timer
+    const limit = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('run waited for sandbox cleanup')), 10000) })
+    const result = await Promise.race([run, limit]).finally(() => clearTimeout(timer))
+    assert.equal(result.error, 'benchmark timeout')
+    assert.equal(result.repairAttempted, false)
+    assert.equal(closes, 1)
+    assert.equal(typeof release, 'function')
+    release()
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
