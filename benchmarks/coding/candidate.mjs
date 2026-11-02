@@ -37,11 +37,13 @@ try {
 
 for await (const line of createInterface({ input: process.stdin })) {
   const { id, method, args, mutations = [] } = deserialize(Buffer.from(line, 'base64'))
-  let response, asynchronous = false
+  let response, asynchronous = false, thrownByCandidate = false
   try {
     if (loadError) throw loadError
     if (typeof candidate[method] !== 'function') throw new Error(`Missing export: ${method}`)
-    const returned = candidate[method](...args)
+    let returned
+    try { returned = candidate[method](...args) }
+    catch (error) { thrownByCandidate = true; throw error }
     asynchronous = !!returned && typeof returned.then === 'function'
     const value = asynchronous ? await returned : returned
     const prototype = value && typeof value === 'object'
@@ -59,7 +61,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     response = { id, ok: true, value, prototype, plain, plainChildren, asynchronous, argsAfterCall, argsAfterMutation: args }
   } catch (error) {
-    response = { id, ok: false, asynchronous, error: { name: String(error?.name), message: String(error?.message ?? error).slice(0, 500), isTypeError: error instanceof TypeError } }
+    response = { id, ok: false, asynchronous, error: { name: String(error?.name), message: String(error?.message ?? error).slice(0, 500), isTypeError: thrownByCandidate && error instanceof TypeError } }
   }
   try { process.stdout.write(`mini-dsh-response:${serialize(response).toString('base64')}\n`) }
   catch { process.stdout.write(`mini-dsh-response:${serialize({ id, ok: false, error: { name: 'Error', message: 'Result is not serializable' } }).toString('base64')}\n`) }

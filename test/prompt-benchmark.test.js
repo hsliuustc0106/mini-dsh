@@ -68,6 +68,10 @@ test('quality checks reject every starting fixture and accept independently impl
         await writeFile(join(workspace, task.file), renamed)
         const report = await grade(task, workspace, start)
         assert.equal(report.checks.find((check) => check.name.includes('raise TypeError')).passed, false, `${task.id} must reject a renamed Error`)
+        const getter = solutions[task.id].replace('throw new TypeError()', 'return { get value() { throw new TypeError() } }')
+        await writeFile(join(workspace, task.file), getter)
+        const postprocessing = await grade(task, workspace, start)
+        assert.equal(postprocessing.checks.find((check) => check.name.includes('raise TypeError')).passed, false, `${task.id} must reject an error thrown after return`)
       }
       if (task.id === 'ranges' || task.id === 'config') {
         const aliased = task.id === 'ranges'
