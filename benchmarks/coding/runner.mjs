@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { cp, mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { performance } from 'node:perf_hooks'
@@ -10,6 +10,8 @@ import { composition } from '../../src/composition.js'
 import { Permissions } from '../../src/permissions.js'
 import { Prompt } from '../../src/prompt.js'
 import { deepseekProvider, DEEPSEEK_MODEL } from '../../src/provider.js'
+import { checkQuality } from './quality.mjs'
+import { ensureSandbox, startSandbox } from './sandbox.mjs'
 import { tasks } from './tasks.mjs'
 
 const run = promisify(execFile)
@@ -76,23 +78,17 @@ export function benchmarkComposition(variant, target) {
   })
 }
 
-export async function grade(task, workspace) {
+export async function grade(task, workspace, start = startSandbox) {
+  let sandbox
   try {
-    const { stdout } = await run(process.execPath, [
-      '--no-warnings', '--permission', `--allow-fs-read=${join(here, 'quality.mjs')}`, `--allow-fs-read=${workspace}`,
-      join(here, 'quality.mjs'), task.id, join(workspace, task.file),
-    ], { cwd: workspace, env: {}, timeout: 5000, maxBuffer: 1_000_000 })
-    const line = stdout.split('\n').findLast((entry) => entry.startsWith('mini-dsh-quality:'))
-    if (!line) throw new Error('Quality checks did not return a result')
-    const result = JSON.parse(line.slice('mini-dsh-quality:'.length))
-    if (!Array.isArray(result.checks) || !result.checks.length || result.checks.some((check) => typeof check.passed !== 'boolean')) throw new Error('Invalid quality results')
-    return { checks: result.checks, passed: result.checks.every((check) => check.passed) }
+    sandbox = await start(join(workspace, task.file))
+    return await checkQuality(task.id, sandbox)
   } catch (error) {
     return { checks: [], passed: false, error: String(error.message ?? error).slice(0, 500) }
-  }
+  } finally { if (sandbox) await sandbox.close() }
 }
 
-export async function runOne({ task, variant, repetition, directory, apiKey, model = DEEPSEEK_MODEL, baseUrl, fetchImpl = fetch, maxCalls = 20, timeoutMs = 120000 }) {
+export async function runOne({ task, variant, repetition, directory, apiKey, model = DEEPSEEK_MODEL, baseUrl, fetchImpl = fetch, maxCalls = 20, timeoutMs = 120000, start = startSandbox }) {
   const workspace = join(directory, 'workspace')
   const emptyHome = join(directory, 'empty-skill-home')
   await mkdir(directory, { recursive: true })
@@ -116,10 +112,10 @@ export async function runOne({ task, variant, repetition, directory, apiKey, mod
   })
   let error = null, timedOut = false
   const timer = setTimeout(() => { timedOut = true; void app.ctx.agent.shutdown() }, timeoutMs)
-  const start = performance.now()
+  const startedAt = performance.now()
   try { await app.ctx.agent.turn(task.prompt) }
   catch (caught) { error = String(caught.message ?? caught).replaceAll(apiKey, '[redacted]') }
-  const durationMs = Math.round(performance.now() - start)
+  const durationMs = Math.round(performance.now() - startedAt)
   clearTimeout(timer)
   const events = app.ctx.session.events
   const messages = events.filter((event) => event.type === 'message' && event.message?.role === 'assistant')
@@ -129,7 +125,7 @@ export async function runOne({ task, variant, repetition, directory, apiKey, mod
   const toolCalls = events.filter((event) => event.type === 'tool.started').length
   await app.dispose()
   const changed = (await readFile(join(workspace, task.file), 'utf8')) !== initial
-  const quality = await grade(task, workspace)
+  const quality = await grade(task, workspace, start)
   return {
     task: task.id, variant, repetition, completed, modelCalls: calls, durationMs, toolCalls, deniedCalls, changed,
     quality, passed: completed && changed && quality.passed, error: timedOut ? 'benchmark timeout' : error,
@@ -159,14 +155,25 @@ export function summarize(results) {
   return { groups, pairs, comparable }
 }
 
+export async function snapshotSource(source, root) {
+  // Snapshot outside the source first: the requested output may be inside it.
+  const temporary = await mkdtemp(join(tmpdir(), 'mini-dsh-benchmark-source-'))
+  try {
+    const snapshot = join(temporary, 'source')
+    await cp(source, snapshot, { recursive: true, filter: (path) => !isInside(root, path) })
+    await cp(snapshot, join(root, 'benchmark-source'), { recursive: true })
+  } finally { await rm(temporary, { recursive: true, force: true }) }
+}
+
 export async function benchmark({ apiKey, model = DEEPSEEK_MODEL, baseUrl, repeats = 1, maxCalls = 20, timeoutMs = 120000, output, fetchImpl, onResult = () => {} }) {
   if (!apiKey) throw new Error('DEEPSEEK_API_KEY or DEEPSEEK_API_KEY_FILE is required')
   if (!Number.isInteger(repeats) || repeats < 1 || repeats > 10) throw new Error('repeats must be an integer from 1 to 10')
   if (!Number.isInteger(maxCalls) || maxCalls < 1 || maxCalls > 50) throw new Error('max-calls must be an integer from 1 to 50')
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1000) throw new Error('timeout-ms must be at least 1000')
+  await ensureSandbox()
   const root = output ? resolve(output) : await mkdtemp(join(tmpdir(), 'mini-dsh-prompt-benchmark-'))
   if (output) await mkdir(root)
-  await cp(here, join(root, 'benchmark-source'), { recursive: true })
+  await snapshotSource(here, root)
   const results = []
   for (let repetition = 1; repetition <= repeats; repetition++) {
     for (let i = 0; i < tasks.length; i++) {
