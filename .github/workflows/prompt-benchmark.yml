@@ -24,6 +24,12 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Validate sandboxed public checks
+        env:
+          BENCHMARK_TEST_DOCKER: '1'
+        run: |
+          docker pull node:22-alpine
+          node --test --test-name-pattern='configuration public check|candidate compartment exposes no process|Docker isolates candidate code' test/prompt-benchmark.test.js
       - name: Run benchmark when a key is available
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
@@ -50,6 +56,10 @@ jobs:
           console.log('## Coding prompt benchmark')
           console.log(`| | Previous | Updated |\n|---|---:|---:|\n| Completed | ${previous.completed}/${previous.runs} | ${updated.completed}/${updated.runs} |\n| Passed quality | ${previous.passed}/${previous.runs} | ${updated.passed}/${updated.runs} |\n| Mean calls (both passed) | ${fmt(paired.previousCalls)} | ${fmt(paired.updatedCalls)} |\n| Mean latency ms (both passed) | ${fmt(paired.previousMs)} | ${fmt(paired.updatedMs)} |`)
           console.log(`\n${paired.pairs} paired runs passed quality for both prompts.`)
+          for (const variant of ['previous', 'updated']) {
+            const config = summary.results.filter((result) => result.task === 'config' && result.variant === variant)
+            console.log(`\n- ${variant} configuration: ${config.filter((result) => result.publicCheck?.passed).length}/${config.length} passed the initial public check; ${config.filter((result) => result.repairAttempted).length} repair turns.`)
+          }
           for (const result of summary.results.filter((item) => !item.passed)) {
             const failures = result.quality.checks.filter((check) => !check.passed).map((check) => check.name).join(', ')
             console.log(`- ${result.task} / ${result.variant} / ${result.repetition}: ${failures || result.error || result.quality.error || 'did not complete or change the file'}`)
