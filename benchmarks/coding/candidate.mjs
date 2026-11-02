@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline'
+import { writeSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { deserialize, serialize } from 'node:v8'
 import 'ses'
@@ -12,6 +13,15 @@ lockdown({ overrideTaming: 'severe' })
 const getPrototypeOf = Object.getPrototypeOf, objectPrototype = Object.prototype
 const arrayPrototype = Array.prototype
 const symbols = Object.getOwnPropertySymbols, enumerable = Object.prototype.propertyIsEnumerable
+const descriptor = Object.getOwnPropertyDescriptor
+function dataStructure(value, seen = new Set()) {
+  if (!value || typeof value !== 'object' || seen.has(value)) return true
+  seen.add(value)
+  return Object.keys(value).every((key) => {
+    const property = descriptor(value, key)
+    return property && Object.hasOwn(property, 'value') && dataStructure(property.value, seen)
+  })
+}
 function plainStructure(value, seen = new Set()) {
   if (!value || typeof value !== 'object' || seen.has(value)) return true
   seen.add(value)
@@ -19,6 +29,9 @@ function plainStructure(value, seen = new Set()) {
   if (symbols(value).some((key) => enumerable.call(value, key))) return false
   return Object.values(value).every((item) => plainStructure(item, seen))
 }
+// Sent before evaluating candidate code, so the host can distinguish a
+// candidate that stops responding from a worker that could not start.
+writeSync(1, 'mini-dsh-worker-ready\n')
 let candidate, loadError
 try {
   const source = new ModuleSource(await readFile(process.argv[2], 'utf8'))
@@ -51,7 +64,9 @@ for await (const line of createInterface({ input: process.stdin })) {
     const prototype = value && typeof value === 'object'
       ? getPrototypeOf(value) === null ? 'null' : getPrototypeOf(value) === objectPrototype ? 'object' : 'other'
       : null
-    // V8 serialization normalizes custom prototypes; preserve this information.
+    // V8 serialization normalizes custom prototypes and accessors; preserve
+    // this information before serializing the candidate's result.
+    const dataProperties = dataStructure(value)
     const plain = plainStructure(value)
     const plainChildren = value && typeof value === 'object' && !symbols(value).some((key) => enumerable.call(value, key)) && Object.values(value).every((item) => plainStructure(item))
     const argsAfterCall = structuredClone(args)
@@ -61,7 +76,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       if (action === 'push') parent[key].push(replacement)
       else parent[key] = replacement
     }
-    response = { id, ok: true, value, prototype, plain, plainChildren, asynchronous, argsAfterCall, argsAfterMutation: args }
+    response = { id, ok: true, value, prototype, plain, plainChildren, dataProperties, asynchronous, argsAfterCall, argsAfterMutation: args }
   } catch (error) {
     response = { id, ok: false, asynchronous, error: { name: String(error?.name), message: String(error?.message ?? error).slice(0, 500), isTypeError: thrownByCandidate && error instanceof TypeError } }
   }

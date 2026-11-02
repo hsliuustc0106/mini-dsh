@@ -1,14 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, execFile } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { createServer } from 'node:net'
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { PassThrough } from 'node:stream'
+import { checkPublicConfig } from '../benchmarks/coding/public-quality.mjs'
 import { benchmark, grade, runOne, snapshotSource, summarize } from '../benchmarks/coding/runner.mjs'
-import { candidateProtocol, startSandbox } from '../benchmarks/coding/sandbox.mjs'
+import { CandidateFailure, candidateProtocol, startSandbox } from '../benchmarks/coding/sandbox.mjs'
 import { tasks } from '../benchmarks/coding/tasks.mjs'
 
 const fixtures = fileURLToPath(new URL('../benchmarks/coding/fixtures/', import.meta.url))
@@ -103,6 +106,35 @@ test('quality checks accept constructor assignments but reject unsafe prototype 
     }`)
     const queryResult = await grade(query, queryDir, start)
     assert.equal(queryResult.passed, true, JSON.stringify(queryResult))
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('configuration checks reject accessor properties before serialization', async () => {
+  const task = tasks.find((item) => item.id === 'config')
+  const special = assignmentConfig.replace(
+    'Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true })',
+    'Object.defineProperty(target, key, { get: () => value, enumerable: true, configurable: true })',
+  )
+  const nested = assignmentConfig.replace(
+    'else target[key] = value',
+    "else if (key === 'mode') Object.defineProperty(target, key, { get: () => value, enumerable: true, configurable: true }); else target[key] = value",
+  )
+  assert.notEqual(special, assignmentConfig)
+  assert.notEqual(nested, assignmentConfig)
+  const dir = await mkdtemp(join(tmpdir(), 'mini-benchmark-accessors-'))
+  try {
+    await cp(join(fixtures, task.id), dir, { recursive: true })
+    const file = join(dir, task.file)
+    for (const source of [special, nested]) {
+      await writeFile(file, source)
+      const final = await grade(task, dir, start)
+      assert.equal(final.checks.find((check) => check.name === 'JSON keys that resemble prototype properties are retained').passed, false)
+      const sandbox = await start(file)
+      try {
+        const publicCheck = await checkPublicConfig(sandbox)
+        assert.equal(publicCheck.checks[1].passed, false)
+      } finally { await sandbox.close() }
+    }
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
@@ -203,6 +235,31 @@ test('paired runs use real agent instrumentation and confine model file operatio
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
+test('sandbox protocol distinguishes candidate failures from worker startup errors', async () => {
+  const child = () => Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill() {},
+  })
+  for (const scenario of [
+    { name: 'candidate timeout', ready: true, timeout: true, candidate: true },
+    { name: 'worker startup timeout', ready: false, timeout: true, candidate: false },
+    { name: 'candidate exit', ready: true, exit: 137, candidate: true },
+    { name: 'Docker startup error', ready: false, exit: 125, candidate: false },
+    { name: 'Docker failure after startup', ready: true, exit: 125, candidate: false },
+  ]) {
+    const process = child()
+    const sandbox = candidateProtocol(process, async () => {}, { timeoutMs: 40 })
+    try {
+      if (scenario.ready) process.stdout.write('mini-dsh-worker-ready\n')
+      const request = sandbox.request('probe', [])
+      if (!scenario.timeout) {
+        process.stdin.emit('error', Object.assign(new Error('broken pipe'), { code: 'EPIPE' }))
+        process.emit('exit', scenario.exit, null)
+      }
+      await assert.rejects(request, (error) => (error instanceof CandidateFailure) === scenario.candidate, scenario.name)
+    } finally { await sandbox.close() }
+  }
+})
+
 test('configuration public check allows at most one repair and keeps the same call budget', async () => {
   const task = tasks.find((item) => item.id === 'config')
   const unsafe = assignmentConfig.replace(
@@ -254,6 +311,72 @@ test('configuration public check allows at most one repair and keeps the same ca
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
+test('configuration public check offers repair after a candidate timeout', async () => {
+  const task = tasks.find((item) => item.id === 'config')
+  const dir = await mkdtemp(join(tmpdir(), 'mini-benchmark-candidate-timeout-'))
+  const startWithTimeout = dockerTests
+    ? (file) => startSandbox(file, undefined, { timeoutMs: 5000 })
+    : (file) => candidateProtocol(spawn(process.execPath, [worker, file], { env: {}, stdio: ['pipe', 'pipe', 'pipe'] }), async () => {}, { timeoutMs: 1500 })
+  try {
+    for (const [name, broken] of [
+      ['call', 'export function mergeOptions() { while (true) {} }'],
+      ['load', 'while (true) {} export function mergeOptions() {}'],
+    ]) {
+      const requests = []
+      const fetchImpl = async (_url, options) => {
+        requests.push(JSON.parse(options.body))
+        const index = requests.length - 1
+        assert.ok(index < 4, 'only one repair turn is allowed')
+        const writing = index % 2 === 0
+        const content = index === 0 ? broken : assignmentConfig
+        const delta = writing
+          ? { tool_calls: [{ index: 0, id: `write-${index}`, type: 'function', function: { name: 'write', arguments: JSON.stringify({ path: task.file, content }) } }] }
+          : { content: 'Done.' }
+        const payload = { choices: [{ index: 0, delta, finish_reason: writing ? 'tool_calls' : 'stop' }] }
+        return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, { headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      const result = await runOne({ task, variant: 'updated', repetition: 1, directory: join(dir, name), apiKey: 'fixture-api-key', fetchImpl, start: startWithTimeout, timeoutMs: 30000 })
+      assert.equal(result.error, null)
+      assert.equal(result.repairAttempted, true)
+      assert.equal(result.publicCheck.passed, false)
+      assert.equal(result.passed, true, JSON.stringify(result.quality))
+      assert.equal(result.modelCalls, 4)
+      assert.match(requests[2].messages.at(-1).content, /Candidate stopped or timed out during the public check/)
+    }
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('configuration public check propagates sandbox infrastructure failures', async () => {
+  const task = tasks.find((item) => item.id === 'config')
+  const dir = await mkdtemp(join(tmpdir(), 'mini-benchmark-check-infra-'))
+  let starts = 0, calls = 0
+  const startWithFailure = async (file) => {
+    if (starts++ > 0) return start(file)
+    let failure
+    return {
+      get error() { return failure },
+      async request() { failure = new Error('sandbox unavailable'); throw failure },
+      async close() {},
+    }
+  }
+  try {
+    const fetchImpl = async () => {
+      const writing = calls++ === 0
+      assert.ok(calls <= 2, 'sandbox infrastructure failure must not start a repair turn')
+      const delta = writing
+        ? { tool_calls: [{ index: 0, id: 'write', type: 'function', function: { name: 'write', arguments: JSON.stringify({ path: task.file, content: assignmentConfig }) } }] }
+        : { content: 'Done.' }
+      const payload = { choices: [{ index: 0, delta, finish_reason: writing ? 'tool_calls' : 'stop' }] }
+      return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, { headers: { 'Content-Type': 'text/event-stream' } })
+    }
+    const result = await runOne({ task, variant: 'previous', repetition: 1, directory: dir, apiKey: 'fixture-api-key', fetchImpl, start: startWithFailure })
+    assert.equal(result.error, 'sandbox unavailable')
+    assert.equal(result.repairAttempted, false)
+    assert.equal(result.publicCheck, null)
+    assert.equal(result.modelCalls, 2)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
 test('configuration public check is stopped at the session deadline', async () => {
   const task = tasks.find((item) => item.id === 'config')
   const dir = await mkdtemp(join(tmpdir(), 'mini-benchmark-check-timeout-'))
@@ -284,6 +407,71 @@ test('configuration public check is stopped at the session deadline', async () =
     assert.equal(result.repairAttempted, false)
     assert.equal(result.passed, false)
     assert.equal(result.modelCalls, 2)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('configuration deadline covers sandbox startup and closes late sandboxes', async () => {
+  const task = tasks.find((item) => item.id === 'config')
+  const dir = await mkdtemp(join(tmpdir(), 'mini-benchmark-start-timeout-'))
+  let starts = 0, calls = 0, release, closeLate
+  const lateClosed = new Promise((resolve) => { closeLate = resolve })
+  const startWithDelayedSandbox = async () => {
+    if (starts++ === 0) return new Promise((resolve) => { release = resolve })
+    return { error: null, request: async () => ({ ok: false, error: { name: 'Error', message: 'fixture' } }), close: async () => {} }
+  }
+  try {
+    const fetchImpl = async () => {
+      const writing = calls++ === 0
+      const delta = writing
+        ? { tool_calls: [{ index: 0, id: 'write', type: 'function', function: { name: 'write', arguments: JSON.stringify({ path: task.file, content: assignmentConfig }) } }] }
+        : { content: 'Done.' }
+      const payload = { choices: [{ index: 0, delta, finish_reason: writing ? 'tool_calls' : 'stop' }] }
+      return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, { headers: { 'Content-Type': 'text/event-stream' } })
+    }
+    const run = runOne({ task, variant: 'updated', repetition: 1, directory: dir, apiKey: 'fixture-api-key', fetchImpl, start: startWithDelayedSandbox, timeoutMs: 1000 })
+    let timer
+    const limit = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('run waited for sandbox startup')), 10000) })
+    const result = await Promise.race([run, limit]).finally(() => clearTimeout(timer))
+    assert.equal(result.error, 'benchmark timeout')
+    assert.equal(result.repairAttempted, false)
+    assert.equal(result.modelCalls, 2)
+    assert.equal(typeof release, 'function')
+    release({ close: async () => { closeLate() } })
+    const cleanupLimit = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('late sandbox was not closed')), 10000) })
+    await Promise.race([lateClosed, cleanupLimit]).finally(() => clearTimeout(timer))
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('configuration deadline does not wait for stalled sandbox cleanup', async () => {
+  const task = tasks.find((item) => item.id === 'config')
+  const dir = await mkdtemp(join(tmpdir(), 'mini-benchmark-cleanup-timeout-'))
+  let starts = 0, calls = 0, closes = 0, release
+  const startWithSlowCleanup = async () => {
+    if (starts++ === 0) return {
+      error: null,
+      request: async () => { throw new Error('candidate failed') },
+      close: () => { closes++; return new Promise((resolve) => { release = resolve }) },
+    }
+    return { error: null, request: async () => ({ ok: false, error: { name: 'Error', message: 'fixture' } }), close: async () => {} }
+  }
+  try {
+    const fetchImpl = async () => {
+      const writing = calls++ === 0
+      const delta = writing
+        ? { tool_calls: [{ index: 0, id: 'write', type: 'function', function: { name: 'write', arguments: JSON.stringify({ path: task.file, content: assignmentConfig }) } }] }
+        : { content: 'Done.' }
+      const payload = { choices: [{ index: 0, delta, finish_reason: writing ? 'tool_calls' : 'stop' }] }
+      return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, { headers: { 'Content-Type': 'text/event-stream' } })
+    }
+    const run = runOne({ task, variant: 'updated', repetition: 1, directory: dir, apiKey: 'fixture-api-key', fetchImpl, start: startWithSlowCleanup, timeoutMs: 1000 })
+    let timer
+    const limit = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('run waited for sandbox cleanup')), 10000) })
+    const result = await Promise.race([run, limit]).finally(() => clearTimeout(timer))
+    assert.equal(result.error, 'benchmark timeout')
+    assert.equal(result.repairAttempted, false)
+    assert.equal(closes, 1)
+    assert.equal(typeof release, 'function')
+    release()
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
