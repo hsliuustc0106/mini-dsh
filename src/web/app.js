@@ -9,8 +9,13 @@ const hint = get('hint')
 // Followed session events, in order. transcript() rebuilds the chat from `log`.
 // `pending` is the open ask on this connection. Allow once and Deny post that
 // ask; the chat shows the decision only after `permission.decided` arrives.
+// Activity rows are a projection of those events. `activityView` remembers only
+// whether a row is open and where its detail scroller sits.
 const log = []
 const timingDetails = new Map()
+const activityView = new Map()
+// Same complete finishes as log.js. The browser script cannot import that module.
+const COMPLETE_FINISH = new Set(['stop', 'length', 'tool_calls', 'content_filter'])
 let cursor = 0
 let connection = null
 let pending = null
@@ -19,6 +24,7 @@ let deciding = false
 let status = { busy: false, writable: false }
 let message = ''
 let renderPending = false
+let renderedSignature = ''
 let deltaGroup = null
 let timelineTimer = null
 let timelineCursor = -1
@@ -31,42 +37,331 @@ function node(tag, className, text) {
   return element
 }
 
-function transcript() {
-  const scrollTop = chat.scrollTop
-  const atBottom = chat.scrollHeight - scrollTop - chat.clientHeight < 80
-  const items = []
+function completeFinish(finish) {
+  return COMPLETE_FINISH.has(finish)
+}
+
+function isErrorText(value) {
+  // Agent failures are prefixed with Error:. The shell tool records its own
+  // failure as Command failed: and still returns that text as the result.
+  return typeof value === 'string' && (value.startsWith('Error:') || value.startsWith('Command failed:'))
+}
+
+function clip(value, max = 72) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  if (text.length <= max) return text
+  return `${text.slice(0, max - 1)}…`
+}
+
+function isTag(element, tag) {
+  return String(element?.tagName || element?.tag || '').toLowerCase() === tag
+}
+
+function classTokens(element) {
+  return String(element?.className || '').split(/\s+/).filter(Boolean)
+}
+
+function hasClass(element, name) {
+  return classTokens(element).includes(name)
+}
+
+function childWith(element, predicate) {
+  for (const child of element.children) if (predicate(child)) return child
+  return null
+}
+
+// One pass over the followed log. Tool narration, decisions, and results fold
+// into the turn's activity row. The assistant text after the last tool step
+// stays a visible answer. Reasoning deltas are not part of Chat.
+function projectChat(events, live, writable) {
+  const blocks = []
+  let activity = null
   let stream = null
-  for (const event of log) {
-    if (event.type === 'stream.started') {
-      stream = { type: 'assistant', id: event.seq, text: '' }
-      items.push(stream)
-    } else if (event.type === 'stream.delta' && stream?.id === event.stream && event.text) {
-      stream.text += event.text
-    } else if (event.type === 'message' && event.message.role === 'user') {
-      items.push({ type: 'user', text: event.message.content })
-    } else if (event.type === 'message' && event.message.role === 'assistant') {
-      if (stream) stream.text = event.message.content ?? ''
-      else items.push({ type: 'assistant', text: event.message.content ?? '' })
-      stream = null
-    } else if (event.type === 'permission.decided') {
-      items.push({ type: 'progress', text: `${event.decision === 'allow' ? 'Allowed once' : 'Denied'} · ${event.name}` })
-    } else if (event.type === 'tool.started') {
-      items.push({ type: 'progress', text: `Running ${event.name}…` })
-    } else if (event.type === 'tool.finished') {
-      items.push({ type: 'progress', text: String(event.result) })
+  let answer = null
+
+  const startActivity = (id) => {
+    if (activity) return activity
+    activity = { type: 'activity', id: String(id), lines: [], tools: [], streamInterrupted: false }
+    const index = answer ? blocks.indexOf(answer) : -1
+    if (index >= 0) blocks.splice(index, 0, activity)
+    else blocks.push(activity)
+    return activity
+  }
+  const noteFor = (id) => {
+    const group = startActivity(id)
+    let note = group.lines.find((line) => line.kind === 'note' && line.id === id)
+    if (!note) {
+      note = { kind: 'note', id, text: '' }
+      group.lines.push(note)
+    }
+    return note
+  }
+  const ensureTool = (id, name) => {
+    const group = startActivity(stream?.id ?? id)
+    let tool = group.tools.find((item) => item.id === id)
+    if (!tool) {
+      tool = { id, name: name || 'tool', state: 'pending' }
+      group.tools.push(tool)
+    } else if (name) tool.name = name
+    return tool
+  }
+  const clearAnswer = (streamId) => {
+    if (!answer || (streamId != null && answer.stream !== streamId)) return
+    const index = blocks.indexOf(answer)
+    if (index >= 0) blocks.splice(index, 1)
+    answer = null
+  }
+  const showAnswer = () => {
+    if (!stream) return
+    if (!answer || answer.stream !== stream.id) {
+      if (!stream.text && !stream.interrupted) return
+      answer = { type: 'assistant', stream: stream.id, text: stream.text, interrupted: Boolean(stream.interrupted) }
+      blocks.push(answer)
+    } else {
+      answer.text = stream.text
+      answer.interrupted = Boolean(stream.interrupted)
     }
   }
-  chat.replaceChildren()
-  for (const item of items) {
-    if (!item.text) continue
-    if (item.type === 'user') {
-      const bubble = node('div', 'user')
-      bubble.append(node('p', '', item.text))
-      chat.append(bubble)
-    } else chat.append(node('p', item.type, item.text))
+  const foldStream = () => {
+    if (!stream) return
+    if (stream.text) noteFor(stream.id).text = stream.text
+    stream.folded = true
+    clearAnswer(stream.id)
   }
-  if (!items.length && !pending) chat.append(node('p', 'progress', 'Ready when you are.'))
+  const abandonStream = () => {
+    if (!stream) return
+    const incomplete = !stream.ended || !completeFinish(stream.finish)
+    if (!incomplete) return
+    if (stream.folded && activity) activity.streamInterrupted = true
+    else if (answer?.stream === stream.id) answer.interrupted = true
+  }
+
+  for (const event of events) {
+    if (event.type === 'message' && event.message?.role === 'user') {
+      abandonStream()
+      activity = null
+      stream = null
+      answer = null
+      if (event.message.content) blocks.push({ type: 'user', text: event.message.content })
+    } else if (event.type === 'stream.started') {
+      stream = { id: event.seq, text: '', tool: false, folded: false, ended: false, finish: null, interrupted: false }
+    } else if (event.type === 'stream.delta' && stream && event.stream === stream.id) {
+      if (event.tool_call) {
+        stream.tool = true
+        foldStream()
+      }
+      if (typeof event.text === 'string' && event.text) {
+        stream.text += event.text
+        if (stream.folded) noteFor(stream.id).text = stream.text
+        else showAnswer()
+      }
+    } else if (event.type === 'stream.ended' && stream && event.stream === stream.id) {
+      stream.ended = true
+      stream.finish = event.finish
+      const toolStep = stream.tool || event.finish === 'tool_calls'
+      if (toolStep) {
+        foldStream()
+        if (!completeFinish(event.finish) && activity) activity.streamInterrupted = true
+      } else if (!completeFinish(event.finish)) {
+        stream.interrupted = true
+        showAnswer()
+      }
+    } else if (event.type === 'message' && event.message?.role === 'assistant') {
+      const message = event.message
+      const calls = Array.isArray(message.tool_calls) ? message.tool_calls : []
+      if (calls.length) {
+        const text = typeof message.content === 'string' ? message.content : (stream?.text ?? '')
+        if (text) noteFor(stream?.id ?? event.seq).text = text
+        clearAnswer(stream?.id)
+        for (const call of calls) if (call?.id) ensureTool(call.id, call.function?.name || 'tool')
+        if (stream?.ended && !completeFinish(stream.finish) && activity) activity.streamInterrupted = true
+        stream = null
+      } else if (stream && !stream.folded) {
+        stream.text = message.content ?? ''
+        stream.interrupted = false
+        showAnswer()
+        stream = null
+      } else if (message.content) {
+        answer = { type: 'assistant', stream: null, text: message.content, interrupted: false }
+        blocks.push(answer)
+        stream = null
+      } else stream = null
+    } else if (event.type === 'permission.decided') {
+      startActivity(stream?.id ?? event.seq).lines.push({
+        kind: 'progress',
+        text: `${event.decision === 'allow' ? 'Allowed once' : 'Denied'} · ${event.name}`,
+      })
+      const tool = ensureTool(event.callId, event.name)
+      if (event.decision === 'deny') tool.state = 'denied'
+    } else if (event.type === 'tool.started') {
+      startActivity(stream?.id ?? event.seq).lines.push({ kind: 'progress', text: `Running ${event.name}…` })
+      const tool = ensureTool(event.callId, event.name)
+      if (tool.state !== 'denied') tool.state = 'running'
+    } else if (event.type === 'tool.finished') {
+      startActivity(stream?.id ?? event.seq).lines.push({ kind: 'progress', text: String(event.result) })
+      const tool = ensureTool(event.callId)
+      tool.state = isErrorText(event.result) ? 'failed' : 'ok'
+    }
+  }
+
+  if (stream) {
+    const incomplete = !stream.ended || !completeFinish(stream.finish)
+    const abandoned = incomplete && !live && !writable
+    if ((stream.ended && !completeFinish(stream.finish)) || abandoned) {
+      if (stream.folded && activity) activity.streamInterrupted = true
+      else if (answer?.stream === stream.id) answer.interrupted = true
+    }
+  }
+  if (!live) {
+    for (const block of blocks) {
+      if (block.type !== 'activity') continue
+      for (const tool of block.tools) {
+        if (tool.state === 'running' || tool.state === 'pending') tool.state = 'interrupted'
+      }
+    }
+  }
+  return blocks
+}
+
+function activitySummary(block) {
+  const tools = block.tools
+  const failed = tools.some((tool) => tool.state === 'failed')
+  const denied = tools.some((tool) => tool.state === 'denied')
+  const running = tools.some((tool) => tool.state === 'running')
+  const interrupted = block.streamInterrupted || tools.some((tool) => tool.state === 'interrupted')
+  const tone = interrupted ? 'interrupted' : failed ? 'failed' : denied ? 'denied' : running ? 'running' : 'ok'
+  if (!tools.length) {
+    const note = block.lines.find((line) => line.kind === 'note' && line.text)
+    let text = note ? clip(note.text) : 'Activity'
+    if (tone === 'interrupted') text = text === 'Activity' ? 'Interrupted' : `${text} · interrupted`
+    return { text, tone }
+  }
+  const parts = tools.map((tool) => {
+    if (tool.state === 'running') return `running ${tool.name}`
+    if (tool.state === 'failed') return `${tool.name} failed`
+    if (tool.state === 'interrupted') return `${tool.name} interrupted`
+    if (tool.state === 'denied') return `${tool.name} denied`
+    return tool.name
+  })
+  let text = tools.length === 1 && tools[0].state === 'running' ? `Running ${tools[0].name}…` : parts.join(' · ')
+  if (block.streamInterrupted && !tools.some((tool) => tool.state === 'interrupted')) text = `${text} · interrupted`
+  return { text, tone }
+}
+
+function activityPresent(block) {
+  if (block.tools.length || block.streamInterrupted) return true
+  return block.lines.some((line) => line.text)
+}
+
+function rememberActivity() {
+  for (const child of chat.children) {
+    if (!hasClass(child, 'activity')) continue
+    const id = child.getAttribute('data-id')
+    if (!id) continue
+    const button = childWith(child, (element) => isTag(element, 'button'))
+    const body = childWith(child, (element) => hasClass(element, 'activity-log'))
+    const prior = activityView.get(id)
+    const open = button?.getAttribute('aria-expanded') === 'true'
+    const scrollTop = body && !body.hidden ? body.scrollTop : prior?.scrollTop ?? 0
+    activityView.set(id, { open, scrollTop })
+  }
+}
+
+function focusedActivity() {
+  const active = document.activeElement
+  if (!active?.closest || !chat.contains?.(active)) return null
+  const row = active.closest('.activity')
+  if (!row || !chat.contains(row)) return null
+  return { id: row.getAttribute('data-id'), log: Boolean(active.closest('.activity-log')) }
+}
+
+function renderActivity(block) {
+  const view = activityView.get(block.id) ?? { open: false, scrollTop: 0 }
+  const summary = activitySummary(block)
+  const tone = summary.tone === 'failed' || summary.tone === 'interrupted' || summary.tone === 'denied' ? summary.tone : ''
+  const row = node('section', tone ? `activity ${tone}` : 'activity')
+  row.setAttribute('data-id', block.id)
+  const button = node('button', 'activity-toggle')
+  button.type = 'button'
+  button.setAttribute('aria-expanded', view.open ? 'true' : 'false')
+  button.setAttribute('aria-controls', `activity-log-${block.id}`)
+  const chevron = node('span', 'activity-chevron')
+  chevron.setAttribute('aria-hidden', 'true')
+  button.append(chevron, node('span', 'sr-only', 'Activity'), node('span', 'activity-label', summary.text))
+  const body = node('div', 'activity-log')
+  body.id = `activity-log-${block.id}`
+  body.setAttribute('role', 'region')
+  body.setAttribute('aria-label', 'Activity details')
+  body.tabIndex = 0
+  body.hidden = !view.open
+  for (const line of block.lines) {
+    if (!line.text) continue
+    body.append(node('p', line.kind === 'note' ? 'note' : 'progress', line.text))
+  }
+  button.addEventListener('click', () => {
+    const open = button.getAttribute('aria-expanded') !== 'true'
+    const current = activityView.get(block.id) ?? { open: false, scrollTop: 0 }
+    if (!body.hidden) current.scrollTop = body.scrollTop
+    current.open = open
+    activityView.set(block.id, current)
+    button.setAttribute('aria-expanded', open ? 'true' : 'false')
+    body.hidden = !open
+    if (open) body.scrollTop = current.scrollTop
+  })
+  body.addEventListener('scroll', () => {
+    if (body.hidden) return
+    const current = activityView.get(block.id) ?? { open: true, scrollTop: 0 }
+    current.open = button.getAttribute('aria-expanded') === 'true'
+    current.scrollTop = body.scrollTop
+    activityView.set(block.id, current)
+  })
+  row.append(button, body)
+  return { row, body, scrollTop: view.open ? view.scrollTop : 0 }
+}
+
+function transcript() {
+  const live = Boolean(connection && status.writable && (status.busy || pending))
+  // Keystrokes and tab changes call render(). Skip the rebuild when the log,
+  // the open ask, and the live/read-only flags are unchanged so an open row
+  // keeps its DOM, focus, and scroll position.
+  const signature = `${cursor}|${pending?.id ?? ''}|${live ? 1 : 0}|${status.writable ? 1 : 0}`
+  if (signature === renderedSignature) return
+  renderedSignature = signature
+  const focus = focusedActivity()
+  rememberActivity()
+  const scrollTop = chat.scrollTop
+  const atBottom = chat.scrollHeight - scrollTop - chat.clientHeight < 80
+  const blocks = projectChat(log, live, status.writable)
+  chat.replaceChildren()
+  let visible = false
+  const scrolls = []
+  for (const block of blocks) {
+    if (block.type === 'user') {
+      const bubble = node('div', 'user')
+      bubble.append(node('p', '', block.text))
+      chat.append(bubble)
+      visible = true
+    } else if (block.type === 'activity') {
+      if (!activityPresent(block)) continue
+      const rendered = renderActivity(block)
+      chat.append(rendered.row)
+      if (rendered.scrollTop) scrolls.push([rendered.body, rendered.scrollTop])
+      visible = true
+    } else if (block.type === 'assistant') {
+      if (!block.text && !block.interrupted) continue
+      if (block.interrupted) chat.append(node('p', 'outcome', 'Interrupted'))
+      if (block.text) chat.append(node('p', 'assistant', block.text))
+      visible = true
+    }
+  }
+  if (!visible && !pending) chat.append(node('p', 'progress', 'Ready when you are.'))
   if (pending) chat.append(approvalCard())
+  for (const [body, top] of scrolls) body.scrollTop = top
+  if (focus?.id) {
+    const row = childWith(chat, (element) => hasClass(element, 'activity') && element.getAttribute('data-id') === focus.id)
+    const target = row && (focus.log ? childWith(row, (element) => hasClass(element, 'activity-log')) : childWith(row, (element) => isTag(element, 'button')))
+    if (!target?.hidden) target?.focus?.()
+  }
   chat.scrollTop = atBottom ? chat.scrollHeight : scrollTop
 }
 
