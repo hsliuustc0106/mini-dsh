@@ -52,6 +52,60 @@ const solutions = {
     }`,
 }
 
+const assignmentConfig = `const object = x => x !== null && typeof x === 'object' && !Array.isArray(x)
+  function set(target, key, value) {
+    if (key === '__proto__') Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true })
+    else target[key] = value
+  }
+  const clone = x => Array.isArray(x) ? x.map(clone) : object(x) ? Object.entries(x).reduce((out, [key, value]) => { set(out, key, clone(value)); return out }, {}) : x
+  export function mergeOptions(defaults, overrides) {
+    const result = clone(defaults)
+    for (const [key, value] of Object.entries(overrides)) {
+      const current = Object.hasOwn(defaults, key) ? defaults[key] : undefined
+      set(result, key, object(value) && object(current) ? mergeOptions(current, value) : clone(value))
+    }
+    return result
+  }`
+
+test('quality checks accept constructor assignments but reject unsafe prototype keys', async () => {
+  const task = tasks.find((item) => item.id === 'config')
+  const dir = await mkdtemp(join(tmpdir(), 'mini-benchmark-constructor-'))
+  try {
+    await cp(join(fixtures, task.id), dir, { recursive: true })
+    const file = join(dir, task.file)
+    await writeFile(file, assignmentConfig)
+    const valid = await grade(task, dir, start)
+    assert.equal(valid.passed, true, JSON.stringify(valid))
+
+    const unsafe = assignmentConfig.replace(
+      "if (key === '__proto__') Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true })\n    else target[key] = value",
+      'target[key] = value',
+    )
+    assert.notEqual(unsafe, assignmentConfig)
+    await writeFile(file, unsafe)
+    const invalid = await grade(task, dir, start)
+    assert.equal(invalid.checks.find((check) => check.name === 'JSON keys that resemble prototype properties are retained').passed, false)
+    assert.ok(invalid.checks.filter((check) => check.name !== 'JSON keys that resemble prototype properties are retained').every((check) => check.passed))
+
+    const query = tasks.find((item) => item.id === 'query')
+    const queryDir = join(dir, 'query')
+    await cp(join(fixtures, query.id), queryDir, { recursive: true })
+    await writeFile(join(queryDir, query.file), `export function parseQuery(input) {
+      const result = {}
+      for (const [key, value] of new URLSearchParams(input)) {
+        if (!Object.hasOwn(result, key)) {
+          if (key === '__proto__') Object.defineProperty(result, key, { value: [], enumerable: true })
+          else result[key] = []
+        }
+        result[key].push(value)
+      }
+      return result
+    }`)
+    const queryResult = await grade(query, queryDir, start)
+    assert.equal(queryResult.passed, true, JSON.stringify(queryResult))
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
 test('quality checks reject every starting fixture and accept independently implemented fixes', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'mini-benchmark-grade-'))
   try {
@@ -206,13 +260,22 @@ test('candidate compartment exposes no process or protocol escape through endowm
         for (const fn of [globalThis.constructor.constructor, Params.constructor, console.log.constructor, input.constructor.constructor]) {
           try { escaped.push(!!fn('return process')()) } catch { escaped.push(false) }
         }
-        return { process: typeof process, require: typeof require, buffer: typeof Buffer, escaped, parsed: [...new Params('a=1&a=2')] }
+        const assigned = {}
+        const keys = ['constructor', 'hasOwnProperty', 'toString']
+        for (const key of keys) assigned[key] = key
+        const ownKeys = keys.map(key => Object.hasOwn(assigned, key) && assigned[key] === key)
+        const lockedPrototypes = [Object.prototype, Function.prototype, Map.prototype].map(prototype => {
+          const before = prototype.constructor
+          try { prototype.constructor = 'changed' } catch {}
+          return Object.isFrozen(prototype) && prototype.constructor === before
+        })
+        return { process: typeof process, require: typeof require, buffer: typeof Buffer, escaped, parsed: [...new Params('a=1&a=2')], ownKeys, lockedPrototypes }
       }
     `)
     sandbox = await start(file)
     const response = await sandbox.request('probe', [[]])
     assert.equal(response.ok, true, JSON.stringify(response))
-    assert.deepEqual(response.value, { process: 'undefined', require: 'undefined', buffer: 'undefined', escaped: [false, false, false, false], parsed: [['a', '1'], ['a', '2']] })
+    assert.deepEqual(response.value, { process: 'undefined', require: 'undefined', buffer: 'undefined', escaped: [false, false, false, false], parsed: [['a', '1'], ['a', '2']], ownKeys: [true, true, true], lockedPrototypes: [true, true, true] })
   } finally {
     if (sandbox) await sandbox.close()
     await rm(dir, { recursive: true, force: true })

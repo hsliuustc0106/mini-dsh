@@ -6,7 +6,9 @@ import { ModuleSource } from '@endo/module-source'
 
 // The container protects the host. SES also keeps candidate code away from
 // this worker's stdin, stdout, and mutable intrinsics.
-lockdown()
+// Allow assignments that shadow inherited keys such as `constructor`, while
+// keeping the intrinsic prototypes frozen.
+lockdown({ overrideTaming: 'severe' })
 const getPrototypeOf = Object.getPrototypeOf, objectPrototype = Object.prototype
 const arrayPrototype = Array.prototype
 const symbols = Object.getOwnPropertySymbols, enumerable = Object.prototype.propertyIsEnumerable
