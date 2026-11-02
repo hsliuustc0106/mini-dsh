@@ -1,6 +1,6 @@
 import { spawn, execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { chmod, copyFile, mkdtemp, rm } from 'node:fs/promises'
+import { chmod, copyFile, cp, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -9,6 +9,7 @@ import { deserialize, serialize } from 'node:v8'
 
 const run = promisify(execFile)
 const worker = join(dirname(fileURLToPath(import.meta.url)), 'candidate.mjs')
+const repo = join(dirname(worker), '../..')
 const image = 'node:22-alpine'
 const prefix = 'mini-dsh-response:'
 
@@ -17,13 +18,51 @@ const restrictions = [
   '--pids-limit', '32', '--memory', '256m', '--cpus', '1', '--user', '65534:65534',
 ]
 
-// Fail before making model calls if the container runtime or image is unavailable.
+// Copy only the compartment runtime and its locked dependencies into the
+// container. The project checkout and its other dependencies stay outside.
+async function stageRuntime(destination) {
+  const { packages } = JSON.parse(await readFile(join(repo, 'package-lock.json'), 'utf8'))
+  const queue = ['node_modules/ses', 'node_modules/@endo/module-source']
+  const copied = new Set()
+  await mkdir(destination, { recursive: true, mode: 0o755 })
+  while (queue.length) {
+    const path = queue.shift()
+    if (copied.has(path)) continue
+    const metadata = packages[path]
+    if (!metadata || !path.startsWith('node_modules/')) throw new Error(`Missing sandbox dependency: ${path}`)
+    copied.add(path)
+    const source = join(repo, path), target = join(destination, path.slice('node_modules/'.length))
+    await mkdir(dirname(target), { recursive: true })
+    await cp(source, target, { recursive: true, filter: (file) => file !== join(source, 'node_modules') })
+    for (const name of Object.keys(metadata.dependencies ?? {})) {
+      let parent = path, dependency
+      while (true) {
+        const possible = parent ? `${parent}/node_modules/${name}` : `node_modules/${name}`
+        if (packages[possible]) { dependency = possible; break }
+        if (!parent) throw new Error(`Missing sandbox dependency: ${name}`)
+        const nested = parent.lastIndexOf('/node_modules/')
+        parent = nested < 0 ? '' : parent.slice(0, nested)
+      }
+      queue.push(dependency)
+    }
+  }
+  await chmod(destination, 0o755)
+}
+
+// Verify the actual runtime mount before making any model calls.
 export async function ensureSandbox() {
+  const directory = await mkdtemp(join(tmpdir(), 'mini-dsh-sandbox-check-'))
   try {
-    await run('docker', ['run', '--rm', ...restrictions, image, 'node', '--version'], { timeout: 120000, maxBuffer: 100000 })
+    const dependencies = join(directory, 'node_modules')
+    await stageRuntime(dependencies)
+    await run('docker', [
+      'run', '--rm', ...restrictions,
+      '--mount', `type=bind,source=${dependencies},target=/node_modules,readonly`,
+      image, 'node', '--input-type=module', '-e', "await import('ses'); await import('@endo/module-source')",
+    ], { timeout: 120000, maxBuffer: 100000 })
   } catch (error) {
     throw new Error(`A working Docker sandbox is required for the benchmark: ${String(error.message ?? error).slice(0, 500)}`)
-  }
+  } finally { await rm(directory, { recursive: true, force: true }) }
 }
 
 // The host owns all assertions; this protocol transports only candidate values.
@@ -78,19 +117,22 @@ export function candidateProtocol(child, cleanup = async () => {}) {
   }
 }
 
-export async function startSandbox(file) {
-  // Mount only copies of the candidate and protocol worker, never the workspace.
+export async function startSandbox(file, workerFile = worker) {
+  // Mount only copies of the candidate, worker, and their runtime dependencies.
   const directory = await mkdtemp(join(tmpdir(), 'mini-dsh-sandbox-'))
   const candidate = join(directory, 'candidate.mjs'), protocol = join(directory, 'worker.mjs')
+  const dependencies = join(directory, 'node_modules')
   const name = `mini-dsh-quality-${randomUUID()}`
   try {
     await copyFile(file, candidate)
-    await copyFile(worker, protocol)
+    await copyFile(workerFile, protocol)
+    await stageRuntime(dependencies)
     await Promise.all([chmod(candidate, 0o644), chmod(protocol, 0o644)])
     const child = spawn('docker', [
       'run', '--rm', '-i', '--name', name, ...restrictions,
       '--mount', `type=bind,source=${candidate},target=/candidate.mjs,readonly`,
       '--mount', `type=bind,source=${protocol},target=/worker.mjs,readonly`,
+      '--mount', `type=bind,source=${dependencies},target=/node_modules,readonly`,
       image, 'node', '/worker.mjs', '/candidate.mjs',
     ], { stdio: ['pipe', 'pipe', 'pipe'] })
     return candidateProtocol(child, async () => {

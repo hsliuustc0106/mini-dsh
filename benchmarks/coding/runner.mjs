@@ -88,11 +88,11 @@ export async function grade(task, workspace, start = startSandbox) {
   } finally { if (sandbox) await sandbox.close() }
 }
 
-export async function runOne({ task, variant, repetition, directory, apiKey, model = DEEPSEEK_MODEL, baseUrl, fetchImpl = fetch, maxCalls = 20, timeoutMs = 120000, start = startSandbox }) {
+export async function runOne({ task, variant, repetition, directory, apiKey, model = DEEPSEEK_MODEL, baseUrl, fetchImpl = fetch, maxCalls = 20, timeoutMs = 120000, start = startSandbox, fixtures = join(here, 'fixtures') }) {
   const workspace = join(directory, 'workspace')
   const emptyHome = join(directory, 'empty-skill-home')
   await mkdir(directory, { recursive: true })
-  await cp(join(here, 'fixtures', task.id), workspace, { recursive: true })
+  await cp(join(fixtures, task.id), workspace, { recursive: true })
   await mkdir(emptyHome)
   const initial = await readFile(join(workspace, task.file), 'utf8')
   let calls = 0
@@ -180,7 +180,7 @@ export async function benchmark({ apiKey, model = DEEPSEEK_MODEL, baseUrl, repea
       const order = (repetition + i) % 2 ? ['previous', 'updated'] : ['updated', 'previous']
       for (const variant of order) {
         const directory = join(root, `run-${String(results.length + 1).padStart(3, '0')}`)
-        const result = await runOne({ task: tasks[i], variant, repetition, directory, apiKey, model, baseUrl, fetchImpl, maxCalls, timeoutMs })
+        const result = await runOne({ task: tasks[i], variant, repetition, directory, apiKey, model, baseUrl, fetchImpl, maxCalls, timeoutMs, fixtures: join(root, 'benchmark-source', 'fixtures') })
         results.push(result)
         onResult(result)
       }

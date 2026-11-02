@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { grade, runOne, snapshotSource, summarize } from '../benchmarks/coding/runner.mjs'
+import { benchmark, grade, runOne, snapshotSource, summarize } from '../benchmarks/coding/runner.mjs'
 import { candidateProtocol, startSandbox } from '../benchmarks/coding/sandbox.mjs'
 import { tasks } from '../benchmarks/coding/tasks.mjs'
 
@@ -63,6 +63,12 @@ test('quality checks reject every starting fixture and accept independently impl
       await writeFile(join(workspace, task.file), solutions[task.id])
       const after = await grade(task, workspace, start)
       assert.equal(after.passed, true, `${task.id}: ${JSON.stringify(after)}`)
+      if (task.id === 'ranges' || task.id === 'cart') {
+        const renamed = solutions[task.id].replace('throw new TypeError()', "throw Object.assign(new Error('invalid'), { name: 'TypeError' })")
+        await writeFile(join(workspace, task.file), renamed)
+        const report = await grade(task, workspace, start)
+        assert.equal(report.checks.find((check) => check.name.includes('raise TypeError')).passed, false, `${task.id} must reject a renamed Error`)
+      }
       if (task.id === 'ranges' || task.id === 'config') {
         const aliased = task.id === 'ranges'
           ? 'export function mergeRanges(ranges) { return ranges.toSorted((a, b) => a[0] - b[0]) }'
@@ -86,7 +92,7 @@ test('quality checks reject every starting fixture and accept independently impl
     await writeFile(join(queryWorkspace, query.file), 'process.exit(0)')
     const interrupted = await grade(query, queryWorkspace, start)
     assert.equal(interrupted.passed, false)
-    assert.match(interrupted.error, /did not return a result/)
+    assert.ok(interrupted.checks.every((check) => !check.passed))
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
@@ -157,13 +163,53 @@ test('candidate output cannot supply a passing quality verdict', async () => {
     await writeFile(file, `console.log(${JSON.stringify(forged)}); process.exit(0)`)
     const exited = await grade(tasks[0], dir, start)
     assert.equal(exited.passed, false)
-    assert.match(exited.error, /did not return a result/)
+    assert.ok(exited.checks.every((check) => !check.passed))
     await writeFile(file, `console.log(${JSON.stringify(forged)}); export function parseQuery() { return {} }`)
     const wrong = await grade(tasks[0], dir, start)
     assert.equal(wrong.passed, false)
     assert.equal(wrong.checks.length, 4)
     assert.ok(wrong.checks.some((check) => !check.passed))
+    // The old protocol exploit watched stdin and sent its own responses, even
+    // though it did not export parseQuery. Neither stream is available here.
+    await writeFile(file, `
+      import { deserialize, serialize } from 'node:v8'
+      process.stdin.on('data', chunk => {
+        const { id, args } = deserialize(Buffer.from(String(chunk).trim(), 'base64'))
+        const value = Object.create(null)
+        for (const [key, item] of new URLSearchParams(args[0])) (value[key] ??= []).push(item)
+        const response = { id, ok: true, value, prototype: 'null', plainChildren: true, asynchronous: false }
+        process.stdout.write('mini-dsh-response:' + serialize(response).toString('base64') + '\\n')
+      })
+    `)
+    const protocolForgery = await grade(tasks[0], dir, start)
+    assert.equal(protocolForgery.passed, false)
+    assert.ok(protocolForgery.checks.every((check) => !check.passed))
   } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('candidate compartment exposes no process or protocol escape through endowments', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-benchmark-compartment-'))
+  let sandbox
+  try {
+    const file = join(dir, 'probe.mjs')
+    await writeFile(file, `
+      import { URLSearchParams as Params } from 'node:url'
+      export function probe(input) {
+        const escaped = []
+        for (const fn of [globalThis.constructor.constructor, Params.constructor, console.log.constructor, input.constructor.constructor]) {
+          try { escaped.push(!!fn('return process')()) } catch { escaped.push(false) }
+        }
+        return { process: typeof process, require: typeof require, buffer: typeof Buffer, escaped, parsed: [...new Params('a=1&a=2')] }
+      }
+    `)
+    sandbox = await start(file)
+    const response = await sandbox.request('probe', [[]])
+    assert.equal(response.ok, true, JSON.stringify(response))
+    assert.deepEqual(response.value, { process: 'undefined', require: 'undefined', buffer: 'undefined', escaped: [false, false, false, false], parsed: [['a', '1'], ['a', '2']] })
+  } finally {
+    if (sandbox) await sandbox.close()
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test('source snapshots work when output is nested inside the source tree', async () => {
@@ -178,6 +224,18 @@ test('source snapshots work when output is nested inside the source tree', async
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
+test('benchmark runs when its output is inside a fixture', { skip: !dockerTests }, async () => {
+  const parent = await mkdtemp(join(fixtures, 'query', '.mini-benchmark-output-'))
+  try {
+    const output = join(parent, 'results')
+    const fetchImpl = async () => new Response('data: {"choices":[{"index":0,"delta":{"content":"Done."},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', { headers: { 'Content-Type': 'text/event-stream' } })
+    const { summary, summaryPath } = await benchmark({ apiKey: 'fixture-api-key', output, fetchImpl })
+    assert.equal(summary.results.length, 8)
+    assert.ok(summary.results.every((result) => !result.error && !result.quality.error))
+    assert.equal(JSON.parse(await readFile(summaryPath, 'utf8')).results.length, 8)
+  } finally { await rm(parent, { recursive: true, force: true }) }
+})
+
 test('benchmark fails before model calls when Docker is unavailable', async () => {
   const cli = fileURLToPath(new URL('../benchmarks/coding/run.mjs', import.meta.url))
   const run = promisify(execFile)
@@ -188,6 +246,7 @@ test('Docker isolates candidate code from host secrets, processes, files, and ne
   const dir = await mkdtemp(join(tmpdir(), 'mini-benchmark-isolation-'))
   const hostFile = join(dir, 'host-secret')
   const file = join(dir, 'probe.mjs')
+  const probeWorker = join(dir, 'worker.mjs')
   const server = createServer((socket) => socket.end())
   let signals = 0, sandbox
   const onSignal = () => { signals++ }
@@ -215,7 +274,18 @@ test('Docker isolates candidate code from host secrets, processes, files, and ne
         return { key: process.env.DEEPSEEK_API_KEY ?? null, hostFile: existsSync(${JSON.stringify(hostFile)}), hostEnv, signaled, writable, network, uid: process.getuid() }
       }
     `)
-    sandbox = await startSandbox(file)
+    // This trusted worker deliberately runs outside SES to probe the container
+    // boundary itself, with the same Docker configuration as production.
+    await writeFile(probeWorker, `
+      import { createInterface } from 'node:readline'
+      import { deserialize, serialize } from 'node:v8'
+      const { probe } = await import('file:///candidate.mjs')
+      for await (const line of createInterface({ input: process.stdin })) {
+        const { id } = deserialize(Buffer.from(line, 'base64'))
+        process.stdout.write('mini-dsh-response:' + serialize({ id, ok: true, value: await probe() }).toString('base64') + '\\n')
+      }
+    `)
+    sandbox = await startSandbox(file, probeWorker)
     const response = await sandbox.request('probe', [])
     assert.equal(response.ok, true, JSON.stringify(response))
     assert.deepEqual(response.value, { key: null, hostFile: false, hostEnv: false, signaled: false, writable: false, network: false, uid: 65534 })

@@ -1,8 +1,12 @@
 import { createInterface } from 'node:readline'
-import { pathToFileURL } from 'node:url'
+import { readFile } from 'node:fs/promises'
 import { deserialize, serialize } from 'node:v8'
+import 'ses'
+import { ModuleSource } from '@endo/module-source'
 
-// This process runs inside the container. It reports values, never test verdicts.
+// The container protects the host. SES also keeps candidate code away from
+// this worker's stdin, stdout, and mutable intrinsics.
+lockdown()
 const getPrototypeOf = Object.getPrototypeOf, objectPrototype = Object.prototype
 const arrayPrototype = Array.prototype
 const symbols = Object.getOwnPropertySymbols, enumerable = Object.prototype.propertyIsEnumerable
@@ -14,7 +18,22 @@ function plainStructure(value, seen = new Set()) {
   return Object.values(value).every((item) => plainStructure(item, seen))
 }
 let candidate, loadError
-try { candidate = await import(pathToFileURL(process.argv[2]).href) } catch (error) { loadError = error }
+try {
+  const source = new ModuleSource(await readFile(process.argv[2], 'utf8'))
+  const safeURL = harden(URL), safeParams = harden(URLSearchParams)
+  const quiet = () => {}
+  const console = harden(Object.fromEntries(['log', 'info', 'warn', 'error', 'debug'].map((name) => [name, quiet])))
+  const compartment = new Compartment({
+    globals: { URL: safeURL, URLSearchParams: safeParams, console },
+    modules: {
+      candidate: { source },
+      'node:url': { source: { imports: [], exports: ['URL', 'URLSearchParams'], execute(env) { env.URL = safeURL; env.URLSearchParams = safeParams } } },
+    },
+    resolveHook: (specifier) => specifier,
+    __options__: true,
+  })
+  candidate = (await compartment.import('candidate')).namespace
+} catch (error) { loadError = error }
 
 for await (const line of createInterface({ input: process.stdin })) {
   const { id, method, args, mutations = [] } = deserialize(Buffer.from(line, 'base64'))
@@ -40,7 +59,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     response = { id, ok: true, value, prototype, plain, plainChildren, asynchronous, argsAfterCall, argsAfterMutation: args }
   } catch (error) {
-    response = { id, ok: false, asynchronous, error: { name: String(error?.name), message: String(error?.message ?? error).slice(0, 500) } }
+    response = { id, ok: false, asynchronous, error: { name: String(error?.name), message: String(error?.message ?? error).slice(0, 500), isTypeError: error instanceof TypeError } }
   }
   try { process.stdout.write(`mini-dsh-response:${serialize(response).toString('base64')}\n`) }
   catch { process.stdout.write(`mini-dsh-response:${serialize({ id, ok: false, error: { name: 'Error', message: 'Result is not serializable' } }).toString('base64')}\n`) }

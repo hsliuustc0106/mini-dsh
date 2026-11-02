@@ -1,4 +1,4 @@
-const instructions = 'Only modify the named source file. Use read, glob, grep, write, or edit; shell and skills are unavailable. Independent tests will run after you finish.'
+const instructions = 'Only modify the named source file. Use read, glob, grep, write, or edit; shell and skills are unavailable. Independent tests will run after you finish. The solution must be self-contained: only URL and URLSearchParams are available from node:url, and process, filesystem, network, and other Node APIs are unavailable.'
 
 export const tasks = [
   {

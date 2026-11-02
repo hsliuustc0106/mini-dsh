@@ -29,7 +29,7 @@ const cases = {
     }],
     ['invalid ranges raise TypeError', async ({ value }) => {
       for (const input of [null, [1], [[1]], [[1, 2, 3]], [[2, 1]], [[0, 1.5]], [[0, Infinity]], [[0, Number.MAX_SAFE_INTEGER + 1]]]) {
-        await assert.rejects(() => value('mergeRanges', input), { name: 'TypeError' })
+        await assert.rejects(() => value('mergeRanges', input), TypeError)
       }
     }],
   ],
@@ -44,8 +44,8 @@ const cases = {
       assert.equal(await value('cartTotal', [{ priceCents: 199, quantity: 2 }], 100), 0)
     }],
     ['invalid inputs raise TypeError', async ({ value }) => {
-      for (const items of [null, [{}], [{ priceCents: -1, quantity: 1 }], [{ priceCents: 1, quantity: 1.5 }], [{ priceCents: Infinity, quantity: 1 }]]) await assert.rejects(() => value('cartTotal', items), { name: 'TypeError' })
-      for (const discount of [-1, 101, NaN, Infinity, '5', null]) await assert.rejects(() => value('cartTotal', [], discount), { name: 'TypeError' })
+      for (const items of [null, [{}], [{ priceCents: -1, quantity: 1 }], [{ priceCents: 1, quantity: 1.5 }], [{ priceCents: Infinity, quantity: 1 }]]) await assert.rejects(() => value('cartTotal', items), TypeError)
+      for (const discount of [-1, 101, NaN, Infinity, '5', null]) await assert.rejects(() => value('cartTotal', [], discount), TypeError)
     }],
     ['input is not mutated', async ({ result }) => {
       const items = [{ priceCents: 0, quantity: 5 }, { priceCents: 7, quantity: 0 }]
@@ -88,7 +88,8 @@ export async function checkQuality(task, sandbox) {
     const response = await sandbox.request(method, args, mutations)
     if (response.asynchronous) throw new Error('Candidate must return synchronously')
     if (!response.ok) {
-      const error = new Error(response.error?.message ?? 'Candidate failed')
+      const ErrorType = response.error?.isTypeError ? TypeError : Error
+      const error = new ErrorType(response.error?.message ?? 'Candidate failed')
       error.name = response.error?.name ?? 'Error'
       throw error
     }
