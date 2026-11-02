@@ -1,0 +1,64 @@
+name: prompt benchmark
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: Repetitions per task and prompt
+        default: '1'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    name: Live coding prompt comparison
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run benchmark when a key is available
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          BENCHMARK_REPEATS: ${{ inputs.repeats || '1' }}
+        run: |
+          if [ -z "$DEEPSEEK_API_KEY" ]; then
+            echo 'Skipped: configure the DEEPSEEK_API_KEY repository secret to run the live benchmark.'
+            exit 0
+          fi
+          npm run benchmark:prompts -- --repeats "$BENCHMARK_REPEATS" --output "$RUNNER_TEMP/mini-dsh-prompt-benchmark"
+      - name: Summarize quality and performance
+        if: always()
+        run: |
+          if [ ! -f "$RUNNER_TEMP/mini-dsh-prompt-benchmark/summary.json" ]; then
+            echo 'Live benchmark results are unavailable.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          node --input-type=module <<'NODE' >> "$GITHUB_STEP_SUMMARY"
+          import { readFileSync } from 'node:fs'
+          import { join } from 'node:path'
+          const summary = JSON.parse(readFileSync(join(process.env.RUNNER_TEMP, 'mini-dsh-prompt-benchmark', 'summary.json'), 'utf8'))
+          const { previous, updated } = summary.groups, paired = summary.comparable
+          const fmt = (value) => value == null ? 'n/a' : value.toFixed(2)
+          console.log('## Coding prompt benchmark')
+          console.log(`| | Previous | Updated |\n|---|---:|---:|\n| Completed | ${previous.completed}/${previous.runs} | ${updated.completed}/${updated.runs} |\n| Passed quality | ${previous.passed}/${previous.runs} | ${updated.passed}/${updated.runs} |\n| Mean calls (both passed) | ${fmt(paired.previousCalls)} | ${fmt(paired.updatedCalls)} |\n| Mean latency ms (both passed) | ${fmt(paired.previousMs)} | ${fmt(paired.updatedMs)} |`)
+          console.log(`\n${paired.pairs} paired runs passed quality for both prompts.`)
+          for (const result of summary.results.filter((item) => !item.passed)) {
+            const failures = result.quality.checks.filter((check) => !check.passed).map((check) => check.name).join(', ')
+            console.log(`- ${result.task} / ${result.variant} / ${result.repetition}: ${failures || result.error || result.quality.error || 'did not complete or change the file'}`)
+          }
+          NODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prompt-benchmark-${{ github.run_id }}
+          path: ${{ runner.temp }}/mini-dsh-prompt-benchmark
+          if-no-files-found: ignore
+          retention-days: 14
