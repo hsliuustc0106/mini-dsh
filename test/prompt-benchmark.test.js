@@ -93,6 +93,8 @@ test('quality checks reject every starting fixture and accept independently impl
     assert.equal((await grade(query, queryWorkspace, start)).passed, false, 'unexpected enumerable symbol keys are rejected')
     await writeFile(join(queryWorkspace, query.file), solutions.query.replace('export function', 'export async function'))
     assert.equal((await grade(query, queryWorkspace, start)).passed, false, 'task functions must return synchronously')
+    await writeFile(join(queryWorkspace, query.file), `await Promise.resolve(); ${solutions.query}`)
+    assert.equal((await grade(query, queryWorkspace, start)).passed, false, 'top-level await is unavailable in the compartment')
     await writeFile(join(queryWorkspace, query.file), 'process.exit(0)')
     const interrupted = await grade(query, queryWorkspace, start)
     assert.equal(interrupted.passed, false)
