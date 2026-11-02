@@ -10,6 +10,7 @@ import { composition } from '../../src/composition.js'
 import { Permissions } from '../../src/permissions.js'
 import { Prompt } from '../../src/prompt.js'
 import { deepseekProvider, DEEPSEEK_MODEL } from '../../src/provider.js'
+import { checkPublicConfig } from './public-quality.mjs'
 import { checkQuality } from './quality.mjs'
 import { ensureSandbox, startSandbox } from './sandbox.mjs'
 import { tasks } from './tasks.mjs'
@@ -88,6 +89,21 @@ export async function grade(task, workspace, start = startSandbox) {
   } finally { if (sandbox) await sandbox.close() }
 }
 
+async function publicConfigCheck(task, workspace, start, signal) {
+  const sandbox = await start(join(workspace, task.file))
+  let closing
+  const close = () => closing ??= sandbox.close()
+  const onAbort = () => { void close().catch(() => {}) }
+  signal.addEventListener('abort', onAbort, { once: true })
+  try {
+    if (signal.aborted) throw new Error('Benchmark timeout')
+    return await checkPublicConfig(sandbox)
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+    await close()
+  }
+}
+
 export async function runOne({ task, variant, repetition, directory, apiKey, model = DEEPSEEK_MODEL, baseUrl, fetchImpl = fetch, maxCalls = 20, timeoutMs = 120000, start = startSandbox, fixtures = join(here, 'fixtures') }) {
   const workspace = join(directory, 'workspace')
   const emptyHome = join(directory, 'empty-skill-home')
@@ -110,10 +126,22 @@ export async function runOne({ task, variant, repetition, directory, apiKey, mod
     approve: (detail) => ['write', 'edit'].includes(detail.name),
     skillOptions: { home: emptyHome, env: { DSH_HOME: emptyHome, DSH_AGENTS_HOME: emptyHome, DSH_BUNDLED_SKILL_DIR: emptyHome } },
   })
-  let error = null, timedOut = false
-  const timer = setTimeout(() => { timedOut = true; void app.ctx.agent.shutdown() }, timeoutMs)
+  let error = null, timedOut = false, publicCheck = null, repairAttempted = false
+  const checkController = new AbortController()
+  const timer = setTimeout(() => { timedOut = true; checkController.abort(); void app.ctx.agent.shutdown() }, timeoutMs)
   const startedAt = performance.now()
-  try { await app.ctx.agent.turn(task.prompt) }
+  try {
+    await app.ctx.agent.turn(task.prompt)
+    const first = app.ctx.session.events.filter((event) => event.type === 'message' && event.message?.role === 'assistant').at(-1)?.message
+    if (task.id === 'config' && !timedOut && first && !first.tool_calls?.length) {
+      publicCheck = await publicConfigCheck(task, workspace, start, checkController.signal)
+      if (!publicCheck.passed && !timedOut) {
+        const failures = publicCheck.checks.filter((check) => !check.passed).map((check) => `- ${check.name}`).join('\n')
+        repairAttempted = true
+        await app.ctx.agent.turn(`The sandboxed public check failed:\n${failures}\nYou have one opportunity to repair ${task.file}. The same file and tool restrictions still apply.`)
+      }
+    }
+  }
   catch (caught) { error = String(caught.message ?? caught).replaceAll(apiKey, '[redacted]') }
   const durationMs = Math.round(performance.now() - startedAt)
   clearTimeout(timer)
@@ -128,7 +156,7 @@ export async function runOne({ task, variant, repetition, directory, apiKey, mod
   const quality = await grade(task, workspace, start)
   return {
     task: task.id, variant, repetition, completed, modelCalls: calls, durationMs, toolCalls, deniedCalls, changed,
-    quality, passed: completed && changed && quality.passed, error: timedOut ? 'benchmark timeout' : error,
+    publicCheck, repairAttempted, quality, passed: completed && changed && quality.passed, error: timedOut ? 'benchmark timeout' : error,
     answer: last?.content ?? '', workspace, session,
   }
 }
