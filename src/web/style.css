@@ -25,6 +25,16 @@ body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 ui-s
 .user p { max-width: 86%; margin: 0; padding: 10px 13px; border-radius: 14px; background: var(--panel); white-space: pre-wrap; }
 .assistant { margin: 0 0 16px; white-space: pre-wrap; }
 .progress { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+.activity { margin: 0 0 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); }
+.activity-toggle { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 36px; padding: 7px 10px; border: 0; background: transparent; color: var(--muted); font: 600 12px/1.3 ui-sans-serif, system-ui, sans-serif; text-align: left; cursor: pointer; }
+.activity-chevron { flex: 0 0 auto; width: 0.4rem; height: 0.4rem; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-1px) rotate(-45deg); }
+.activity-toggle[aria-expanded="true"] .activity-chevron { transform: translateY(1px) rotate(45deg); }
+.activity-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity.failed .activity-toggle, .activity.interrupted .activity-toggle, .activity.denied .activity-toggle { color: var(--warning-text); }
+.activity-log { max-height: 240px; overflow: auto; padding: 2px 10px 8px; border-top: 1px solid var(--border); }
+.activity-log .note { margin: 8px 0; white-space: pre-wrap; }
+.activity-log .progress { white-space: pre-wrap; }
+.outcome { margin: 0 0 12px; color: var(--warning-text); font-size: 12px; font-weight: 600; }
 .approval { border: 1px solid light-dark(#e2c6a1, #6e573d); border-radius: 10px; overflow: hidden; background: var(--card); }
 .approval-status { padding: 8px 12px; background: var(--warning); color: var(--warning-text); font-size: 12px; font-weight: 600; }
 .approval-body { padding: 12px; }
@@ -75,6 +85,6 @@ button:disabled { opacity: .4; cursor: default; }
   .composer { margin-left: 14px; margin-right: 14px; }
   .events summary { grid-template-columns: minmax(64px, max-content) 1fr; }
   .events summary span:last-child { grid-column: 2; }
-  .actions button, .send { min-height: 40px; }
+  .actions button, .send, .activity-toggle { min-height: 40px; }
   .send { width: 40px; }
 }
