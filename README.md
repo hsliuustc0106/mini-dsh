@@ -79,11 +79,28 @@ Set `MINI_CONFIG` to an explicit JSON file to customize the interactive agent. R
 }
 ```
 
-An existing name changes that entry; `enabled: false` removes it. A new name needs a local JavaScript `module`, whose default export is a Cordis plugin. Use `export` to select another named export. `config` replaces that entry's config rather than merging it; if omitted, an existing entry keeps its runtime config. For example, `{ "name": "coding", "config": { "tools": ["read", "glob", "grep"] } }` keeps just those coding tools. The `skill` tool is provided by the separate `skills` plugin. `required: false` allows an optional plugin fiber to be pending or fail without blocking boot; invalid config or a module that cannot be imported still fails. New entries are inserted before shared permission services so the agent drains before their effects are removed. `before` can place a new entry before a named existing entry when a different disposal order is needed. Module imports execute code, so use a config and plugins you trust. Config changes take effect on the next boot; restart the process after editing a loaded plugin module.
+An existing name changes that entry; `enabled: false` removes it. A new name needs a local JavaScript `module` with a default Cordis plugin export, or DSH-style named `apply` and optional `inject` exports. Use `export` to select another named export explicitly. `config` replaces that entry's config rather than merging it; if omitted, an existing entry keeps its runtime config. For example, `{ "name": "coding", "config": { "tools": ["read", "glob", "grep"] } }` keeps just those coding tools. The `skill` tool is provided by the separate `skills` plugin. `required: false` allows an optional plugin fiber to be pending or fail without blocking boot; invalid config or a module that cannot be imported still fails. New entries are inserted before shared permission services so the agent drains before their effects are removed. `before` can place a new entry before a named existing entry when a different disposal order is needed. Module imports execute code, so use a config and plugins you trust. Config changes take effect on the next boot; restart the process after editing a loaded plugin module.
 
 Inspect mode ignores `MINI_CONFIG`. The standalone viewer has its own `viewer` and `session` composition and ignores `MINI_CONFIG`; set `MINI_VIEW_CONFIG` to a separate profile to customize it. Its default session is read-only, though configured plugins and replacements can run arbitrary code.
 
 [`examples/plugins/config.json`](examples/plugins/config.json) adds a `greet` tool using [`greeting.mjs`](examples/plugins/greeting.mjs). To try it without a key, run `MINI_CONFIG=examples/plugins/config.json MINI_REPLIES=examples/plugins/replies.json npm start` from the repository and enter a prompt. The tool and its `allow` policy are separate reversible effects. A registered tool without a policy is denied; plugins can register `allow`, `ask`, or `deny` with `ctx.permissions.register(name, policy)`. The default policies are themselves supplied by the `default-tool-permissions` plugin. Replacing that plugin lets a composition define a different policy without changing the agent.
+
+### DSH tool compatibility (initial subset)
+
+Mini-dsh can load a local, built DSH-style module that exports `apply` and `inject` and registers a simple tool through `ctx.tools.register()`. For example, if `./parity-probe.mjs` registers `parity_probe`, configure an explicit policy for it:
+
+```json
+{
+  "plugins": [
+    { "name": "parity-probe", "module": "./parity-probe.mjs" },
+    { "name": "default-tool-permissions", "config": { "policies": { "parity_probe": "ask" } } }
+  ]
+}
+```
+
+Policy values are `allow`, `ask`, or `deny`; configured entries override the built-in policies. A tool without a policy is still denied. Direct tool registrations are removed with their owning plugin.
+
+This is a small compatibility subset: DSH tool definitions may declare an unconstrained string output schema and a renderer returning text blocks. Mini-dsh checks the output's string type and renders the text; its existing argument validation is limited. Tool activation conditions, timeouts, content transforms, and deferred loading are rejected. DSH execution context, hooks, scoped services, presentation metadata, non-text outputs, and UI plugins are not implemented. A module requiring an unavailable service cannot start. Mini-dsh also does not install DSH bundles or interpret `package.json`/`cordis.patch.yml`; provide a built module path and make its own imports resolvable. This is not general DSH plugin compatibility.
 
 The interactive entry calls the `terminal` service's `run({ workspace, sessionPath, viewerUrl, webUrl })` method, and forwards approval requests to `approve(detail, signal)`. A profile can replace the `terminal` plugin with another implementation of that interface. Only an approval result of `true` grants the call; an absent approval method denies it. Browser turns use their own approval callback.
 

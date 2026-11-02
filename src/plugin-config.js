@@ -63,7 +63,7 @@ export async function configurePlugins(entries, file, workspace) {
     if (index >= 0 && change.before) throw new Error(`${change.name}: before is only valid for a new plugin`)
     if (change.module) {
       const modulePath = isAbsolute(change.module) ? change.module : resolve(dirname(path), change.module)
-      modules.push({ name: change.name, path: modulePath, export: change.export ?? 'default' })
+      modules.push({ name: change.name, path: modulePath, export: change.export })
     }
     const updated = {
       ...(index >= 0 ? result[index] : { name: change.name }),
@@ -86,12 +86,15 @@ export async function configurePlugins(entries, file, workspace) {
   // Validate the whole overlay before evaluating any user-supplied module.
   for (const item of modules) {
     let plugin
-    try { plugin = (await import(pathToFileURL(item.path).href))[item.export] }
+    try {
+      const module = await import(pathToFileURL(item.path).href)
+      plugin = item.export ? module[item.export] : module.default ?? (typeof module.apply === 'function' ? module : undefined)
+    }
     catch (error) {
       throw new Error(`Plugin ${item.name} could not load ${item.path}: ${error.message}`, { cause: error })
     }
     if (typeof plugin !== 'function' && (!object(plugin) || typeof plugin.apply !== 'function')) {
-      throw new Error(`Plugin ${item.name} has no valid ${item.export} export`)
+      throw new Error(`Plugin ${item.name} has no valid ${item.export ?? 'default or named apply'} export`)
     }
     result.find((entry) => entry.name === item.name).plugin = plugin
   }

@@ -24,14 +24,26 @@ export function validateArguments(schema, value) {
 
 export class Tools extends Service {
   constructor(ctx) { super(ctx, 'tools'); this.items = new Map() }
-  register(tool) {
+  register(tool, options) {
     if (typeof tool?.name !== 'string' || !tool.name) throw new Error('Tool name is required')
     if (typeof tool.description !== 'string') throw new Error(`Tool ${tool.name} needs a description`)
     if (!tool.parameters || tool.parameters.type !== 'object') throw new Error(`Tool ${tool.name} needs an object schema`)
     if (typeof tool.execute !== 'function') throw new Error(`Tool ${tool.name} needs execute`)
+    if (options != null && Object.keys(options).length) throw new Error(`Tool ${tool.name}: registration options are not supported`)
+    if (tool.output != null) {
+      const schema = tool.output.schema
+      if (schema?.type !== 'string' || Object.keys(schema).some((key) => !['type', 'description', 'title'].includes(key)) || typeof tool.output.render !== 'function') {
+        throw new Error(`Tool ${tool.name}: only plain DSH string output schemas with a renderer are supported`)
+      }
+      if (['timeoutMs', 'projectContent', 'finalizeContent', 'deferLoading'].some((key) => tool[key] !== undefined)) {
+        throw new Error(`Tool ${tool.name}: DSH execution extensions are not supported`)
+      }
+    }
     if (this.items.has(tool.name)) throw new Error(`Duplicate tool: ${tool.name}`)
-    this.items.set(tool.name, tool)
-    return () => { if (this.items.get(tool.name) === tool) this.items.delete(tool.name) }
+    return this.ctx.effect(() => {
+      this.items.set(tool.name, tool)
+      return () => { if (this.items.get(tool.name) === tool) this.items.delete(tool.name) }
+    })
   }
   schemas() {
     return [...this.items.values()].map(({ name, description, parameters }) => ({
@@ -42,7 +54,14 @@ export class Tools extends Service {
     const tool = this.items.get(name)
     if (!tool) throw new Error(`Unknown tool: ${name}`)
     validateArguments(tool.parameters, args)
-    return tool.execute(args)
+    const result = await tool.execute(args)
+    if (!tool.output) return result
+    if (typeof result !== 'string') throw new Error(`Tool ${name}: expected a string result`)
+    const blocks = tool.output.render(args, result)
+    if (!Array.isArray(blocks) || blocks.some((block) => block?.type !== 'text' || typeof block.text !== 'string')) {
+      throw new Error(`Tool ${name}: only text output blocks are supported`)
+    }
+    return blocks.map((block) => block.text).join('\n')
   }
 }
 
