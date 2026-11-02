@@ -4,6 +4,6 @@
   "private": true,
   "type": "module",
   "scripts": { "start": "node src/main.js", "view": "node src/view.js", "test": "node --test", "replay": "node --test test/terminal.test.js", "smoke": "node src/smoke.js", "benchmark:prompts": "node benchmarks/coding/run.mjs" },
-  "dependencies": { "@deepseek-ai/cordis": "4.0.5", "@vscode/ripgrep": "^1.18.0", "yaml": "^2.9.1" },
+  "dependencies": { "@deepseek-ai/cordis": "4.0.5", "@endo/module-source": "1.5.0", "@vscode/ripgrep": "^1.18.0", "ses": "2.3.0", "yaml": "^2.9.1" },
   "engines": { "node": ">=22.13.0" }
 }

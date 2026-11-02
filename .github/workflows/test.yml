@@ -16,5 +16,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Prepare isolated benchmark runner
+        run: docker pull node:22-alpine
       - run: npm test
+        env:
+          BENCHMARK_TEST_DOCKER: '1'
       - run: npm run replay
