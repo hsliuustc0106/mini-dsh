@@ -29,7 +29,7 @@ jobs:
           BENCHMARK_TEST_DOCKER: '1'
         run: |
           docker pull node:22-alpine
-          node --test --test-name-pattern='configuration public check|candidate compartment exposes no process|Docker isolates candidate code' test/prompt-benchmark.test.js
+          node --test --test-name-pattern='configuration public check|configuration checks reject accessor|configuration deadline covers|sandbox protocol distinguishes|candidate compartment exposes no process|Docker isolates candidate code' test/prompt-benchmark.test.js
       - name: Run benchmark when a key is available
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}

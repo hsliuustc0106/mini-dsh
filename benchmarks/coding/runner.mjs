@@ -90,17 +90,35 @@ export async function grade(task, workspace, start = startSandbox) {
 }
 
 async function publicConfigCheck(task, workspace, start, signal) {
-  const sandbox = await start(join(workspace, task.file))
-  let closing
-  const close = () => closing ??= sandbox.close()
-  const onAbort = () => { void close().catch(() => {}) }
-  signal.addEventListener('abort', onAbort, { once: true })
+  if (signal.aborted) throw new Error('Benchmark timeout')
+  let sandbox, closing, onAbort
+  const close = () => closing ??= Promise.resolve().then(() => sandbox.close())
+  const aborted = new Promise((_resolve, reject) => {
+    onAbort = () => {
+      if (sandbox) void close().catch(() => {})
+      reject(new Error('Benchmark timeout'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  const opening = Promise.resolve().then(() => start(join(workspace, task.file))).then(async (started) => {
+    // Startup may finish after the deadline; close the late sandbox without
+    // holding up the timed run.
+    if (signal.aborted) {
+      try { await started.close() } catch { /* Cleanup is best effort after timeout. */ }
+      throw new Error('Benchmark timeout')
+    }
+    return started
+  })
   try {
+    sandbox = await Promise.race([opening, aborted])
     if (signal.aborted) throw new Error('Benchmark timeout')
-    return await checkPublicConfig(sandbox)
+    return await Promise.race([checkPublicConfig(sandbox), aborted])
   } finally {
     signal.removeEventListener('abort', onAbort)
-    await close()
+    if (sandbox) {
+      if (signal.aborted) void close().catch(() => {})
+      else await close()
+    }
   }
 }
 

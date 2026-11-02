@@ -93,6 +93,7 @@ export async function checkQuality(task, sandbox) {
       error.name = response.error?.name ?? 'Error'
       throw error
     }
+    if (task === 'config') assert.equal(response.dataProperties, true, 'Candidate result has an enumerable accessor property')
     return response
   }
   const value = async (method, ...args) => {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { CandidateFailure } from './sandbox.mjs'
 
 // These examples are public feedback, separate from the final quality checks.
 // Assertions run in the host; only the candidate runs in the sandbox.
@@ -27,14 +28,19 @@ const cases = [
 export async function checkPublicConfig(sandbox) {
   const result = async (args, mutations = []) => {
     const response = await sandbox.request('mergeOptions', args, mutations)
-    if (!response.ok || response.asynchronous) throw new Error('Candidate failed')
+    if (!response.ok || response.asynchronous || !response.dataProperties) throw new Error('Candidate failed')
     return response
   }
   const checks = []
   for (const [name, check] of cases) {
-    try { await check(result); checks.push({ name, passed: true }) }
-    catch { checks.push({ name, passed: false }) }
-    if (sandbox.error) throw sandbox.error
+    let passed
+    try { await check(result); passed = true } catch { passed = false }
+    if (sandbox.error) {
+      if (!(sandbox.error instanceof CandidateFailure)) throw sandbox.error
+      checks.push({ name: 'Candidate stopped or timed out during the public check', passed: false })
+      return { checks, passed: false }
+    }
+    checks.push({ name, passed })
   }
   return { checks, passed: checks.every((check) => check.passed) }
 }

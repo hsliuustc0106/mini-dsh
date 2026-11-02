@@ -12,6 +12,7 @@ const worker = join(dirname(fileURLToPath(import.meta.url)), 'candidate.mjs')
 const repo = join(dirname(worker), '../..')
 const image = 'node:22-alpine'
 const prefix = 'mini-dsh-response:'
+const readyLine = 'mini-dsh-worker-ready'
 
 const restrictions = [
   '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
@@ -67,28 +68,37 @@ export async function ensureSandbox() {
 
 // The host owns all assertions; this protocol transports only candidate values.
 // Its child can print anything, so a printed quality verdict is never accepted.
-export function candidateProtocol(child, cleanup = async () => {}) {
-  let buffer = '', outputBytes = 0, nextId = 0, failure, pending
+export class CandidateFailure extends Error {}
+
+export function candidateProtocol(child, cleanup = async () => {}, { timeoutMs = 15000 } = {}) {
+  let buffer = '', outputBytes = 0, nextId = 0, failure, pending, ready = false
   const fail = (error) => {
     failure ??= error
     if (pending) { pending.reject(failure); pending = undefined }
   }
-  const timer = setTimeout(() => fail(new Error('Candidate timed out')), 15000)
+  const timer = setTimeout(() => fail(ready ? new CandidateFailure('Candidate timed out') : new Error('Sandbox worker did not start')), timeoutMs)
   child.on('error', fail)
-  child.on('exit', (code, signal) => fail(new Error(`Candidate did not return a result (exit ${code ?? signal})`)))
-  child.stdin.on('error', fail)
+  child.on('exit', (code, signal) => {
+    const message = `Candidate did not return a result (exit ${code ?? signal})`
+    fail(ready && ![125, 126, 127].includes(code) ? new CandidateFailure(message) : new Error(message))
+  })
+  // An exited child can report EPIPE before its exit status; wait for that
+  // status so Docker startup failures are not mistaken for candidate errors.
+  child.stdin.on('error', (error) => { if (error.code !== 'EPIPE') fail(error) })
   child.stdout.on('data', (chunk) => {
     outputBytes += chunk.length
-    if (outputBytes > 1000000) return fail(new Error('Candidate output exceeded the limit'))
+    if (outputBytes > 1000000) return fail(ready ? new CandidateFailure('Candidate output exceeded the limit') : new Error('Sandbox output exceeded the limit'))
     buffer += chunk.toString()
     let newline
     while ((newline = buffer.indexOf('\n')) !== -1) {
       const line = buffer.slice(0, newline)
       buffer = buffer.slice(newline + 1)
+      if (line === readyLine) { ready = true; continue }
       if (!line.startsWith(prefix) || !pending) continue
       try {
         const response = deserialize(Buffer.from(line.slice(prefix.length), 'base64'))
         if (response.id !== pending.id) continue
+        ready = true
         const current = pending
         pending = undefined
         current.resolve(response)
@@ -117,7 +127,7 @@ export function candidateProtocol(child, cleanup = async () => {}) {
   }
 }
 
-export async function startSandbox(file, workerFile = worker) {
+export async function startSandbox(file, workerFile = worker, options = {}) {
   // Mount only copies of the candidate, worker, and their runtime dependencies.
   const directory = await mkdtemp(join(tmpdir(), 'mini-dsh-sandbox-'))
   const candidate = join(directory, 'candidate.mjs'), protocol = join(directory, 'worker.mjs')
@@ -139,7 +149,7 @@ export async function startSandbox(file, workerFile = worker) {
       // Killing the Docker client alone does not necessarily stop its container.
       try { await run('docker', ['rm', '-f', name], { timeout: 10000 }) } catch { /* Already stopped. */ }
       await rm(directory, { recursive: true, force: true })
-    })
+    }, options)
   } catch (error) {
     await rm(directory, { recursive: true, force: true })
     throw error
