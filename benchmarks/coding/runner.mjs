@@ -171,6 +171,12 @@ export async function benchmark({ apiKey, model = DEEPSEEK_MODEL, baseUrl, repea
   if (!Number.isInteger(maxCalls) || maxCalls < 1 || maxCalls > 50) throw new Error('max-calls must be an integer from 1 to 50')
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1000) throw new Error('timeout-ms must be at least 1000')
   await ensureSandbox()
+  // Record the source state before creating output inside the checkout.
+  let revision = null, dirty = null
+  try {
+    revision = (await run('git', ['rev-parse', 'HEAD'], { cwd: repo })).stdout.trim()
+    dirty = !!(await run('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: repo })).stdout.trim()
+  } catch { /* Git metadata is optional. */ }
   const root = output ? resolve(output) : await mkdtemp(join(tmpdir(), 'mini-dsh-prompt-benchmark-'))
   if (output) await mkdir(root)
   await snapshotSource(here, root)
@@ -186,11 +192,6 @@ export async function benchmark({ apiKey, model = DEEPSEEK_MODEL, baseUrl, repea
       }
     }
   }
-  let revision = null, dirty = null
-  try {
-    revision = (await run('git', ['rev-parse', 'HEAD'], { cwd: repo })).stdout.trim()
-    dirty = !!(await run('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: repo })).stdout.trim()
-  } catch { /* Git metadata is optional. */ }
   const summary = { model, revision, dirty, repeats, maxCalls, timeoutMs, results, ...summarize(results) }
   const summaryPath = join(root, 'summary.json')
   await writeFile(summaryPath, `${JSON.stringify(summary, null, 2)}\n`)

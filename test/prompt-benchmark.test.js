@@ -13,6 +13,7 @@ import { tasks } from '../benchmarks/coding/tasks.mjs'
 
 const fixtures = fileURLToPath(new URL('../benchmarks/coding/fixtures/', import.meta.url))
 const worker = fileURLToPath(new URL('../benchmarks/coding/candidate.mjs', import.meta.url))
+const repo = fileURLToPath(new URL('../', import.meta.url))
 const dockerTests = process.env.BENCHMARK_TEST_DOCKER === '1'
 // Only test-owned fixture code runs locally. The benchmark itself has no local fallback.
 const start = dockerTests ? startSandbox : (file) => candidateProtocol(spawn(process.execPath, [worker, file], { env: {}, stdio: ['pipe', 'pipe', 'pipe'] }))
@@ -233,11 +234,14 @@ test('source snapshots work when output is nested inside the source tree', async
 test('benchmark runs when its output is inside a fixture', { skip: !dockerTests }, async () => {
   const parent = await mkdtemp(join(fixtures, 'query', '.mini-benchmark-output-'))
   try {
+    let sourceDirty = null
+    try { sourceDirty = !!(await promisify(execFile)('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: repo })).stdout.trim() } catch { /* Git metadata is optional. */ }
     const output = join(parent, 'results')
     const fetchImpl = async () => new Response('data: {"choices":[{"index":0,"delta":{"content":"Done."},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', { headers: { 'Content-Type': 'text/event-stream' } })
     const { summary, summaryPath } = await benchmark({ apiKey: 'fixture-api-key', output, fetchImpl })
     assert.equal(summary.results.length, 8)
     assert.ok(summary.results.every((result) => !result.error && !result.quality.error))
+    assert.equal(summary.dirty, sourceDirty)
     assert.equal(JSON.parse(await readFile(summaryPath, 'utf8')).results.length, 8)
   } finally { await rm(parent, { recursive: true, force: true }) }
 })
