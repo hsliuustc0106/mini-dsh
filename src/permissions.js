@@ -85,12 +85,23 @@ export class Permissions extends Service {
 
 export const defaultToolPermissions = {
   inject: ['permissions'],
-  apply(ctx) {
-    for (const name of ['read', 'glob', 'grep', 'skill']) {
-      ctx.effect(() => ctx.permissions.register(name, 'allow'))
+  apply(ctx, config = {}) {
+    const configured = config?.policies ?? {}
+    if (!configured || typeof configured !== 'object' || Array.isArray(configured)) {
+      throw new Error('default-tool-permissions: policies must be an object')
     }
-    for (const name of ['write', 'edit', 'shell']) {
-      ctx.effect(() => ctx.permissions.register(name, 'ask'))
+    const policies = new Map([
+      ...['read', 'glob', 'grep', 'skill'].map((name) => [name, 'allow']),
+      ...['write', 'edit', 'shell'].map((name) => [name, 'ask']),
+    ])
+    for (const [name, decision] of Object.entries(configured)) {
+      if (!name || !['allow', 'ask', 'deny'].includes(decision)) {
+        throw new Error(`default-tool-permissions: invalid policy for ${name}`)
+      }
+      policies.set(name, decision)
+    }
+    for (const [name, decision] of policies) {
+      ctx.effect(() => ctx.permissions.register(name, decision))
     }
   },
 }
