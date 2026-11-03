@@ -99,6 +99,8 @@ npm start
 
 The installer uses `MINI_WORKSPACE` (or the current directory) and npm, stores each installation under `<workspace>/.mini-dsh/`, and adds plugin rows to `.mini-dsh/plugins.json`. The interactive entry automatically loads this profile on the next start. An explicit `MINI_CONFIG` takes precedence; to combine it with installed plugins, copy the installed rows into that profile. Inspect mode and the standalone viewer do not load this profile. Paths beginning with `.` are resolved from the shell's current directory. npm installation and plugin loading can execute package code, so install only packages you trust. The installer leaves the profile unchanged on failure and rejects duplicate plugin names; remove a row from the profile to disable it.
 
+Concurrent installers serialize updates with a SQLite advisory lock beside the profile and wait up to 30 seconds. As with the session writer lock, use a local filesystem; external editors do not participate in the lock.
+
 The installer accepts a package exposing a plugin entry point, or a DSH bundle declaring `dsh.bundle.patch`. Bundle support is limited to ordered patch files containing `insert` arrays with `id`, `name`, and optional `config` rows. Other patch operations and row fields are rejected. It does not implement DSH's profile layering, version checks, or general bundle compatibility. Plugins still need the services and tool features supported by mini-dsh; a successful install does not guarantee a plugin can boot. For npm dependencies, install a built package with resolvable imports.
 
 Installed tools have no automatic permission grant and are denied by default. To allow a particular tool, add a policy to `.mini-dsh/plugins.json`, for example:

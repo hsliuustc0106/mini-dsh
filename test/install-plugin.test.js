@@ -1,13 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { execFileSync, spawn } from 'node:child_process'
+import { access, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { installPlugin } from '../src/install-plugin.js'
 import { boot } from '../src/boot.js'
 import { fakeProvider } from '../src/provider.js'
 import { pluginInstallSpec } from '../src/web-control.js'
+import { acquireWriter } from '../src/lock.js'
 
 test('web plugin inputs support GitHub repositories and npm package names', () => {
   assert.equal(pluginInstallSpec('https://github.com/owner/plugin#v1'), 'git+https://github.com/owner/plugin#v1')
@@ -69,4 +70,75 @@ test('DSH-specific YAML tags are rejected rather than converted to strings', asy
   const workspace = join(dir, 'workspace'); await mkdir(workspace)
   await assert.rejects(installPlugin(join(dir, archive), workspace), /Unsupported or invalid bundle YAML/)
   await assert.rejects(readFile(join(workspace, '.mini-dsh/plugins.json')), { code: 'ENOENT' })
+})
+
+test('installs an import-only package entry point', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-install-esm-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const pkg = join(dir, 'package'), workspace = join(dir, 'workspace')
+  await mkdir(pkg); await mkdir(workspace)
+  await writeFile(join(pkg, 'package.json'), JSON.stringify({ name: 'import-only-plugin', version: '1.0.0', type: 'module', exports: { import: './index.js' } }))
+  await writeFile(join(pkg, 'index.js'), 'export function apply() {}')
+  const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()
+  const result = await installPlugin(join(dir, archive), workspace)
+  const app = await boot({ workspace, pluginConfig: result.configPath, provider: fakeProvider([]) })
+  try { assert.equal(app.report.find((entry) => entry.name === 'import-only-plugin').state, 'active') }
+  finally { await app.dispose() }
+})
+
+test('resolves bundle rows from the bundle and uses import conditions', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-install-nested-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const pkg = join(dir, 'bundle'), nested = join(pkg, 'node_modules', 'nested-plugin'), workspace = join(dir, 'workspace')
+  await mkdir(nested, { recursive: true }); await mkdir(workspace)
+  await writeFile(join(pkg, 'package.json'), JSON.stringify({ name: 'local-bundle', version: '1.0.0', type: 'module', dsh: { bundle: { patch: 'patch.yml' } } }))
+  await writeFile(join(pkg, 'patch.yml'), '- insert:\n    - id: nested\n      name: nested-plugin\n')
+  await writeFile(join(nested, 'package.json'), JSON.stringify({ name: 'nested-plugin', version: '1.0.0', type: 'module', exports: { import: './index.js' } }))
+  await writeFile(join(nested, 'index.js'), 'export function apply() {}')
+  const result = await installPlugin(pkg, workspace)
+  const app = await boot({ workspace, pluginConfig: result.configPath, provider: fakeProvider([]) })
+  try { assert.equal(app.report.find((entry) => entry.name === 'nested').state, 'active') }
+  finally { await app.dispose() }
+})
+
+test('competing installer processes serialize profile updates', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-install-race-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const workspace = join(dir, 'workspace'), home = join(workspace, '.mini-dsh')
+  await mkdir(home, { recursive: true })
+  const archives = []
+  for (const name of ['race-first', 'race-second']) {
+    const pkg = join(dir, name); await mkdir(pkg)
+    await writeFile(join(pkg, 'package.json'), JSON.stringify({ name, version: '1.0.0', type: 'module', main: 'index.js' }))
+    await writeFile(join(pkg, 'index.js'), 'export function apply() {}')
+    archives.push(join(dir, execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()))
+  }
+  const lock = await acquireWriter(join(home, 'plugins.json.install.lock'))
+  const script = new URL('../src/install.js', import.meta.url).pathname
+  const children = archives.map((archive) => spawn(process.execPath, [script, archive], { env: { ...process.env, MINI_WORKSPACE: workspace }, stdio: ['ignore', 'ignore', 'pipe'] }))
+  const completions = children.map((child) => new Promise((resolve, reject) => {
+    let errorText = ''
+    child.stderr.on('data', (chunk) => { errorText += chunk })
+    child.once('error', reject)
+    child.once('close', (code) => code === 0 ? resolve() : reject(new Error(`installer failed: ${errorText}`)))
+  }))
+  try {
+    const deadline = Date.now() + 15000
+    let readyCount = 0
+    while (Date.now() < deadline) {
+      const entries = (await readdir(home)).filter((name) => name.startsWith('.install-'))
+      const ready = await Promise.all(entries.map(async (entry) => access(join(home, entry, 'package-lock.json')).then(() => true, () => false)))
+      readyCount = ready.filter(Boolean).length
+      if (readyCount === 2) break
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    assert.equal(readyCount, 2, 'both packages should finish staging')
+    // The pre-held lock keeps both processes out of the profile update.
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    await assert.rejects(access(join(home, 'plugins.json')), { code: 'ENOENT' })
+    assert.equal(children.every((child) => child.exitCode === null), true, 'both installers must wait for the profile lock')
+  } finally { lock.release() }
+  await Promise.all(completions)
+  const profile = JSON.parse(await readFile(join(home, 'plugins.json'), 'utf8'))
+  assert.deepEqual(profile.plugins.map((entry) => entry.name).sort(), ['race-first', 'race-second'])
 })
