@@ -17,6 +17,17 @@ body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 ui-s
 .header { display: flex; align-items: baseline; gap: 12px; padding: 17px 20px 10px; }
 .header strong { font-size: 18px; }
 .header span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.header button, .plugins-panel button { border: 1px solid var(--border); border-radius: 7px; padding: 7px 12px; background: var(--card); color: var(--text); font: inherit; cursor: pointer; }
+.header button { margin-left: auto; }
+.plugins-panel { margin: 4px 20px 12px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); }
+.plugins-panel h2 { margin: 0; font-size: 15px; }
+.plugins-panel p { margin: 6px 0 10px; color: var(--muted); font-size: 12px; }
+.plugins-panel label { display: block; font-size: 12px; margin-bottom: 4px; }
+.plugins-input { display: flex; gap: 8px; }
+.plugins-input input { flex: 1; min-width: 0; padding: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); font: inherit; }
+.plugins-panel button:disabled { opacity: .5; cursor: wait; }
+.plugins-panel #plugin-result { color: var(--text); overflow-wrap: anywhere; }
+.plugins-panel #plugin-result:empty { display: none; }
 .tabs { display: flex; gap: 24px; padding: 0 20px; border-bottom: 1px solid var(--border); }
 .tabs button { border: 0; border-bottom: 2px solid transparent; padding: 8px 0; background: transparent; color: var(--muted); font: inherit; cursor: pointer; }
 .tabs button[aria-selected="true"] { color: var(--blue); border-bottom-color: var(--blue); }

@@ -3,9 +3,22 @@ import { readFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { Service } from '@deepseek-ai/cordis'
 import { project } from './trajectory.js'
+import { installPlugin } from './install-plugin.js'
 
 const HOST = '127.0.0.1'
 const MAX_BODY = 1024 * 1024
+
+export function pluginInstallSpec(input) {
+  if (typeof input !== 'string') throw new Error('Enter a GitHub repository URL or npm package')
+  const value = input.trim()
+  if (/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:@[a-z0-9][a-z0-9._-]*)?$/i.test(value)) return value
+  let url
+  try { url = new URL(value) } catch { throw new Error('Enter a GitHub repository URL or npm package') }
+  if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'github.com' || url.port || url.username || url.password || url.search || !/^\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\/?$/.test(url.pathname) || (url.hash && !/^#[a-zA-Z0-9_.\/-]+$/.test(url.hash))) {
+    throw new Error('Use an HTTPS GitHub repository URL, optionally followed by #ref')
+  }
+  return `git+https://github.com${url.pathname.replace(/\/$/, '')}${url.hash}`
+}
 
 export function webControlSettings(env = process.env) {
   const raw = env.MINI_WEB_PORT
@@ -63,6 +76,8 @@ export class WebControl extends Service {
     super(ctx, 'webControl')
     if (config.host != null && config.host !== HOST) throw new Error('Web control listens on 127.0.0.1 only')
     this.port = config.port ?? 0
+    this.pluginConfig = config.pluginConfig
+    this.installing = false
     if (!Number.isInteger(this.port) || this.port < 0 || this.port > 65535) throw new Error('Web control port is invalid')
     this.clients = new Map()
     this.pending = null
@@ -159,7 +174,7 @@ export class WebControl extends Service {
       return json(res, 200, { cursor: projection.cursor, overview })
     }
     if (req.method === 'GET' && url.pathname === '/events') return this.stream(req, res, url)
-    if (req.method !== 'POST' || !['/turn', '/approval'].includes(url.pathname)) {
+    if (req.method !== 'POST' || !['/turn', '/approval', '/plugins/install'].includes(url.pathname)) {
       return send(res, 404, 'text/plain; charset=utf-8', 'Not found\n')
     }
     if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '')) return json(res, 415, { error: 'JSON required' })
@@ -169,7 +184,21 @@ export class WebControl extends Service {
     catch { return json(res, 400, { error: 'Invalid request body' }) }
     if (!data || typeof data !== 'object' || Array.isArray(data)) return json(res, 400, { error: 'Invalid request body' })
     if (url.pathname === '/turn') return this.startTurn(res, data)
+    if (url.pathname === '/plugins/install') return this.install(res, data)
     return this.answer(res, data)
+  }
+
+  async install(res, data) {
+    let spec
+    try { spec = pluginInstallSpec(data.spec) }
+    catch (error) { return json(res, 400, { error: error.message }) }
+    if (this.installing) return json(res, 409, { error: 'A plugin installation is already in progress' })
+    this.installing = true
+    try {
+      const result = await installPlugin(spec, this.ctx.workspace.root, { configPath: this.pluginConfig, captureOutput: true })
+      return json(res, 200, { packageName: result.packageName, names: result.names, configPath: result.configPath, restartRequired: true })
+    } catch (error) { return json(res, 400, { error: error.message }) }
+    finally { this.installing = false }
   }
 
   stream(req, res, url) {

@@ -31,8 +31,8 @@ class Element {
   fire(type, event = {}) { this.listeners.get(type)?.(event) }
 }
 
-async function browser() {
-  const elements = Object.fromEntries(['chat', 'trajectory', 'events', 'timeline', 'prompt', 'send', 'notice', 'hint', 'workspace', 'chat-tab', 'trajectory-tab'].map((id) => [id, new Element(id)]))
+async function browser(installResponse) {
+  const elements = Object.fromEntries(['chat', 'trajectory', 'events', 'timeline', 'prompt', 'send', 'notice', 'hint', 'workspace', 'chat-tab', 'trajectory-tab', 'plugins-panel', 'plugins-toggle', 'plugins-form', 'plugin-spec', 'plugin-install', 'plugin-result'].map((id) => [id, new Element(id)]))
   elements.trajectory.hidden = true
   const find = (element, id) => element.id === id ? element : element.children.map((child) => child instanceof Element ? find(child, id) : null).find(Boolean)
   const document = {
@@ -58,6 +58,10 @@ async function browser() {
     setTimeout: (callback) => { timers.push(callback); return timers.length },
     fetch: async (url, init) => {
       if (url === '/trajectory') return { ok: true, json: async () => snapshot }
+      if (url === '/plugins/install' && installResponse) {
+        posts.push(JSON.parse(init.body))
+        return { ok: true, json: async () => installResponse }
+      }
       if (url === '/approval') {
         posts.push(JSON.parse(init.body))
         return { ok: true, json: async () => ({}) }
@@ -71,6 +75,15 @@ async function browser() {
     async flush() { while (timers.length) await timers.shift()() },
   }
 }
+
+test('plugin form submits the URL and explains restart and permissions', async () => {
+  const { elements, posts } = await browser({ packageName: 'example', names: ['example'] })
+  elements['plugin-spec'].value = 'https://github.com/example/plugin'
+  await elements['plugins-form'].listeners.get('submit')({ preventDefault() {} })
+  assert.equal(posts[0].spec, 'https://github.com/example/plugin')
+  assert.match(elements['plugin-result'].textContent, /Restart mini-dsh/)
+  assert.match(elements['plugin-result'].textContent, /denied/)
+})
 
 function descendants(element) {
   return element.children.flatMap((child) => child instanceof Element ? [child, ...descendants(child)] : [])
