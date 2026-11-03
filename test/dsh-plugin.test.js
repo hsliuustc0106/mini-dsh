@@ -102,13 +102,107 @@ test('unsupported DSH output schemas are rejected rather than silently mishandle
   const ctx = new Context(), tools = ctx.plugin(Tools)
   await tools.await()
   assert.throws(() => ctx.tools.register({
-    name: 'object_result', description: 'Unsupported output', parameters: { type: 'object' }, execute: () => ({}),
-    output: { schema: { type: 'object' }, render: () => [{ type: 'text', text: 'value' }] },
-  }), /only plain DSH string output schemas/)
+    name: 'unknown_keyword', description: 'Unsupported output', parameters: { type: 'object' }, execute: () => ({}),
+    output: { schema: { type: 'object', unknownKeyword: true }, render: () => [{ type: 'text', text: 'value' }] },
+  }), /unsupported DSH output schema/)
   assert.throws(() => ctx.tools.register({
-    name: 'constrained_result', description: 'Unsupported constraint', parameters: { type: 'object' }, execute: () => 'short',
-    output: { schema: { type: 'string', minLength: 10 }, render: () => [{ type: 'text', text: 'value' }] },
-  }), /only plain DSH string output schemas/)
+    name: 'async_schema', description: 'Unsupported async schema', parameters: { type: 'object' }, execute: () => 'value',
+    output: { schema: { $async: true, type: 'string' }, render: () => [{ type: 'text', text: 'value' }] },
+  }), /asynchronous DSH output schemas are not supported/)
+  await tools.dispose()
+})
+
+test('a DSH tool can validate and render a structured object result', async (t) => {
+  const dir = await workspace(t, { object_data: 'ask' })
+  await writeFile(join(dir, 'dsh-tool.mjs'), `
+    export const inject = ['tools']
+    export function apply(ctx) {
+      ctx.tools.register({
+        name: 'object_data', description: 'Return structured data.', parameters: { type: 'object', properties: {} },
+        output: {
+          schema: { type: 'object', properties: { name: { type: 'string' }, count: { type: 'integer' }, values: { type: 'array', items: { oneOf: [{ type: 'boolean' }, { type: 'null' }] } } }, required: ['name', 'count', 'values'], additionalProperties: false },
+          render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+        },
+        execute: () => ({ name: 'Ada', count: 2, values: [true, null] }),
+      })
+    }
+  `)
+  const model = fakeProvider([
+    { role: 'assistant', content: null, tool_calls: [{ id: 'object-1', type: 'function', function: { name: 'object_data', arguments: '{}' } }] },
+    { role: 'assistant', content: 'done' },
+  ])
+  const approvals = []
+  const app = await boot({ workspace: dir, pluginConfig: 'plugins.json', provider: model, approve: (detail) => { approvals.push(detail.name); return true } })
+  try {
+    await app.ctx.agent.turn('Return structured data')
+    assert.deepEqual(approvals, ['object_data'])
+    assert.equal(app.ctx.session.events.find((event) => event.type === 'tool.finished').result, '{"name":"Ada","count":2,"values":[true,null]}')
+    assert.equal(model.sent[1].messages.at(-1).content, '{"name":"Ada","count":2,"values":[true,null]}')
+  } finally { await app.dispose() }
+})
+
+test('invalid or non-JSON DSH results are rejected before rendering', async () => {
+  const ctx = new Context(), tools = ctx.plugin(Tools)
+  await tools.await()
+  let result = { nested: { status: 'unknown' } }, renders = 0
+  ctx.tools.register({
+    name: 'structured', description: 'Structured result', parameters: { type: 'object' }, execute: () => result,
+    output: {
+      schema: { type: 'object', properties: { nested: { type: 'object', properties: { status: { type: 'string', enum: ['ready'] } }, required: ['status'], additionalProperties: false } }, required: ['nested'], additionalProperties: false },
+      render: () => { renders++; return [{ type: 'text', text: 'value' }] },
+    },
+  })
+  await assert.rejects(ctx.tools.run('structured', {}), /output does not match schema/)
+  result = { nested: { status: 'ready' }, extra: true }
+  await assert.rejects(ctx.tools.run('structured', {}), /output does not match schema/)
+  result = { nested: { status: 'ready' }, extra: undefined }
+  await assert.rejects(ctx.tools.run('structured', {}), /expected a lossless JSON result/)
+  result = { nested: { status: 'ready' }, extra: NaN }
+  await assert.rejects(ctx.tools.run('structured', {}), /expected a lossless JSON result/)
+  result = JSON.parse('{"nested":{"status":"ready"},"__proto__":{"extra":true}}')
+  await assert.rejects(ctx.tools.run('structured', {}), /output does not match schema/)
+  result = { nested: { status: 'ready' } }
+  result.circular = result
+  await assert.rejects(ctx.tools.run('structured', {}), /expected a lossless JSON result/)
+  assert.equal(renders, 0)
+  await tools.dispose()
+})
+
+test('DSH object output is detached and frozen before it reaches the renderer', async () => {
+  const ctx = new Context(), tools = ctx.plugin(Tools)
+  await tools.await()
+  const result = Object.assign(Object.create(null), { nested: { value: 'ready' } })
+  ctx.tools.register({
+    name: 'snapshot', description: 'Snapshot output', parameters: { type: 'object' }, execute: () => result,
+    output: {
+      schema: { type: 'object', properties: { nested: { type: 'object', properties: { value: { type: 'string' } } } } },
+      render: (_args, value) => {
+        assert.notEqual(value, result)
+        assert.notEqual(value.nested, result.nested)
+        assert.equal(Object.isFrozen(value.nested), true)
+        return [{ type: 'text', text: value.nested.value }]
+      },
+    },
+  })
+  assert.equal(await ctx.tools.run('snapshot', {}), 'ready')
+  assert.equal(Object.isFrozen(result.nested), false)
+  await tools.dispose()
+})
+
+test('an in-flight DSH call retains its output contract when the tool unloads', async () => {
+  const ctx = new Context(), tools = ctx.plugin(Tools)
+  await tools.await()
+  let finish
+  const pending = new Promise((resolve) => { finish = resolve })
+  const remove = ctx.tools.register({
+    name: 'slow', description: 'Slow result', parameters: { type: 'object' }, execute: () => pending,
+    output: { schema: { type: 'object' }, render: (_args, value) => [{ type: 'text', text: value.message }] },
+  })
+  const result = ctx.tools.run('slow', {})
+  remove()
+  finish({ message: 'finished' })
+  assert.equal(await result, 'finished')
+  await assert.rejects(ctx.tools.run('slow', {}), /Unknown tool/)
   await tools.dispose()
 })
 
@@ -144,6 +238,6 @@ test('DSH tool results must match their declared string type', async () => {
     name: 'wrong_result', description: 'Wrong result type', parameters: { type: 'object' }, execute: () => 42,
     output: { schema: { type: 'string' }, render: () => [{ type: 'text', text: 'value' }] },
   })
-  await assert.rejects(ctx.tools.run('wrong_result', {}), /expected a string result/)
+  await assert.rejects(ctx.tools.run('wrong_result', {}), /output does not match schema/)
   await tools.dispose()
 })
