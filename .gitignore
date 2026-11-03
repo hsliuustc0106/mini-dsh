@@ -1,3 +1,4 @@
 node_modules/
+.mini-dsh/
 .mini-session.jsonl*
 .env

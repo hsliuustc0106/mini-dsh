@@ -214,9 +214,37 @@ test('DSH activation and execution extensions are not silently ignored', async (
     output: { schema: { type: 'string' }, render: () => [{ type: 'text', text: 'value' }] },
   }
   assert.throws(() => ctx.tools.register(base, { when: () => false }), /registration options are not supported/)
-  for (const extension of [{ timeoutMs: 10 }, { projectContent() {} }, { finalizeContent() {} }, { deferLoading: true }]) {
+  for (const extension of [{ projectContent() {} }, { finalizeContent() {} }, { deferLoading: true }]) {
     assert.throws(() => ctx.tools.register({ ...base, ...extension }), /DSH execution extensions are not supported/)
   }
+  for (const timeoutMs of [0, -1, Infinity, 2147483648]) assert.throws(() => ctx.tools.register({ ...base, timeoutMs }), /timeoutMs/)
+  await tools.dispose()
+})
+
+test('DSH timeouts signal the tool and wait for its work to settle', async () => {
+  const ctx = new Context(), tools = ctx.plugin(Tools)
+  await tools.await()
+  let aborted, finish
+  const abortSeen = new Promise((resolve) => { aborted = resolve })
+  const cleanup = new Promise((resolve) => { finish = resolve })
+  ctx.tools.register({
+    name: 'timed', description: 'Cooperative timeout', parameters: { type: 'object' }, timeoutMs: 10,
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute(_args, exec) {
+      assert.equal(exec.name, 'timed')
+      assert.equal(exec.callId, 'test-call')
+      await new Promise((resolve) => exec.signal.addEventListener('abort', resolve, { once: true }))
+      aborted()
+      await cleanup
+      return 'late success'
+    },
+  })
+  let settled = false
+  const result = ctx.tools.run('timed', {}, { callId: 'test-call' }).finally(() => { settled = true })
+  await abortSeen
+  assert.equal(settled, false)
+  finish()
+  await assert.rejects(result, /tool call timed out after 10ms/)
   await tools.dispose()
 })
 

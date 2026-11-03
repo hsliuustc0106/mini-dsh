@@ -3,6 +3,9 @@ import { isAbsolute, join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { composition as defaultComposition } from './composition.js'
 import { configurePlugins } from './plugin-config.js'
+import { WebControl } from './web-control.js'
+import { DshAgent } from './dsh-agent.js'
+import { Agent } from './agent.js'
 
 // Cordis FiberState is a const enum, so the published build does not export it.
 // These values match @deepseek-ai/cordis 4.0.5.
@@ -95,6 +98,26 @@ export async function boot(options = {}) {
   })
   if (!Array.isArray(entries)) throw new Error('Composition must return an array of plugins')
   entries = await configurePlugins(entries, options.pluginConfig, workspace)
+  const loops = entries.filter((entry) => entry.dshAgentLoopModule)
+  if (loops.length > 1) throw new Error('Only one DSH agent loop can be active')
+  if (loops.length) {
+    const [loop] = loops
+    if (loop.required === false) throw new Error('The DSH agent loop cannot be optional')
+    if (loop.config != null && (typeof loop.config !== 'object' || Array.isArray(loop.config) || Object.keys(loop.config).length)) {
+      throw new Error('DSH agent-loop configuration is not supported by the mini-dsh bridge')
+    }
+    const agent = entries.find((entry) => entry.name === 'agent')
+    if (!agent || agent.plugin !== Agent) throw new Error('The DSH agent loop requires the default mini-dsh agent')
+    agent.plugin = DshAgent
+    agent.config = { loopModule: loop.dshAgentLoopModule, loopPlugin: loop.plugin }
+    entries = entries.filter((entry) => entry !== loop)
+  }
+  for (const entry of entries) {
+    if (entry.plugin === WebControl) {
+      const configPath = options.pluginConfig ? (isAbsolute(options.pluginConfig) ? options.pluginConfig : join(workspace, options.pluginConfig)) : join(workspace, '.mini-dsh', 'plugins.json')
+      entry.config = { ...entry.config, pluginConfig: configPath }
+    }
+  }
   const ctx = new Context()
   const started = []
   try {
