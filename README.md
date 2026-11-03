@@ -85,6 +85,30 @@ Inspect mode ignores `MINI_CONFIG`. The standalone viewer has its own `viewer` a
 
 [`examples/plugins/config.json`](examples/plugins/config.json) adds a `greet` tool using [`greeting.mjs`](examples/plugins/greeting.mjs). To try it without a key, run `MINI_CONFIG=examples/plugins/config.json MINI_REPLIES=examples/plugins/replies.json npm start` from the repository and enter a prompt. The tool and its `allow` policy are separate reversible effects. A registered tool without a policy is denied; plugins can register `allow`, `ask`, or `deny` with `ctx.permissions.register(name, policy)`. The default policies are themselves supplied by the `default-tool-permissions` plugin. Replacing that plugin lets a composition define a different policy without changing the agent.
 
+### Installing a DSH plugin package
+
+In the live Web interface, open **Plugins**, enter an npm package name or an HTTPS GitHub repository URL (optionally followed by `#ref`), and select **Install**. The installer writes to the profile used by that server, including an explicit `MINI_CONFIG`; restart mini-dsh to load it. Installation can execute package code. Only install plugins you trust.
+
+Install a trusted npm package, local package directory, or tarball into the current workspace:
+
+```sh
+npm run plugin:install -- @example/dsh-plugin
+# Or: npm run plugin:install -- ./path/to/plugin.tgz
+npm start
+```
+
+The installer uses `MINI_WORKSPACE` (or the current directory) and npm, stores each installation under `<workspace>/.mini-dsh/`, and adds plugin rows to `.mini-dsh/plugins.json`. The interactive entry automatically loads this profile on the next start. An explicit `MINI_CONFIG` takes precedence; to combine it with installed plugins, copy the installed rows into that profile. Inspect mode and the standalone viewer do not load this profile. Paths beginning with `.` are resolved from the shell's current directory. npm installation and plugin loading can execute package code, so install only packages you trust. The installer leaves the profile unchanged on failure and rejects duplicate plugin names; remove a row from the profile to disable it.
+
+The installer accepts a package exposing a plugin entry point, or a DSH bundle declaring `dsh.bundle.patch`. Bundle support is limited to ordered patch files containing `insert` arrays with `id`, `name`, and optional `config` rows. Other patch operations and row fields are rejected. It does not implement DSH's profile layering, version checks, or general bundle compatibility. Plugins still need the services and tool features supported by mini-dsh; a successful install does not guarantee a plugin can boot. For npm dependencies, install a built package with resolvable imports.
+
+Installed tools have no automatic permission grant and are denied by default. To allow a particular tool, add a policy to `.mini-dsh/plugins.json`, for example:
+
+```json
+{ "name": "default-tool-permissions", "config": { "policies": { "my_tool": "ask" } } }
+```
+
+Add that object to the existing `plugins` array. Use `allow`, `ask`, or `deny` and restart the agent. Installed files can be removed manually after their profile rows have been removed.
+
 ### DSH tool compatibility (initial subset)
 
 Mini-dsh can load a local, built DSH-style module that exports `apply` and `inject` and registers a simple tool through `ctx.tools.register()`. For example, if `./parity-probe.mjs` registers `parity_probe`, configure an explicit policy for it:
@@ -100,7 +124,7 @@ Mini-dsh can load a local, built DSH-style module that exports `apply` and `inje
 
 Policy values are `allow`, `ask`, or `deny`; configured entries override the built-in policies. A tool without a policy is still denied. Direct tool registrations are removed with their owning plugin.
 
-This is a small compatibility subset: DSH tools may return lossless JSON, including objects and arrays, declared by a JSON Schema accepted by Ajv's strict mode. Mini-dsh snapshots and validates the result before passing it to a renderer that returns text blocks. Unsupported or asynchronous schemas are rejected; existing argument validation is limited. Tool activation conditions, timeouts, content transforms, and deferred loading are rejected. DSH execution context, hooks, scoped services, presentation metadata, non-text outputs, and UI plugins are not implemented. A module requiring an unavailable service cannot start. Mini-dsh also does not install DSH bundles or interpret `package.json`/`cordis.patch.yml`; provide a built module path and make its own imports resolvable. This is not general DSH plugin compatibility.
+This is a small compatibility subset: DSH tools may return lossless JSON, including objects and arrays, declared by a JSON Schema accepted by Ajv's strict mode. Mini-dsh snapshots and validates the result before passing it to a renderer that returns text blocks. Unsupported or asynchronous schemas are rejected; existing argument validation is limited. Tool activation conditions, timeouts, content transforms, and deferred loading are rejected. DSH execution context, hooks, scoped services, presentation metadata, non-text outputs, and UI plugins are not implemented. A module requiring an unavailable service cannot start. The installer supports only the bundle subset described above; other DSH bundle semantics are not implemented. This is not general DSH plugin compatibility.
 
 To test the unmodified `@deepseek-ai/dsh-tool-workspace-dependencies` plugin against a temporary fixture payload, set `DSH_TEST_WORKSPACE_DEPENDENCIES` to its absolute built module path and run `node --test test/dsh-workspace-dependencies.test.js`. The module's imports must already resolve. The test uses a fake provider and placeholder files, not a real Python runtime.
 

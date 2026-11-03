@@ -6,6 +6,32 @@ const prompt = get('prompt')
 const send = get('send')
 const notice = get('notice')
 const hint = get('hint')
+const pluginPanel = get('plugins-panel')
+const pluginToggle = get('plugins-toggle')
+const pluginForm = get('plugins-form')
+const pluginSpec = get('plugin-spec')
+const pluginInstall = get('plugin-install')
+const pluginResult = get('plugin-result')
+
+pluginToggle.addEventListener('click', () => {
+  pluginPanel.hidden = !pluginPanel.hidden
+  pluginToggle.setAttribute('aria-expanded', String(!pluginPanel.hidden))
+})
+pluginForm.addEventListener('submit', async (event) => {
+  event.preventDefault()
+  if (pluginInstall.disabled) return
+  pluginInstall.disabled = true
+  pluginResult.textContent = 'Installing…'
+  try {
+    const response = await fetch('/plugins/install', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ spec: pluginSpec.value }),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.error || 'Installation failed')
+    pluginResult.textContent = `Installed ${result.packageName} (${result.names.join(', ')}). Restart mini-dsh to load it. New tools are denied until a permission policy is configured.`
+  } catch (error) { pluginResult.textContent = error.message || 'Installation failed' }
+  finally { pluginInstall.disabled = false }
+})
 // Followed session events, in order. transcript() rebuilds the chat from `log`.
 // `pending` is the open ask on this connection. Allow once and Deny post that
 // ask; the chat shows the decision only after `permission.decided` arrives.

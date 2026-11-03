@@ -3,6 +3,7 @@ import { isAbsolute, join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { composition as defaultComposition } from './composition.js'
 import { configurePlugins } from './plugin-config.js'
+import { WebControl } from './web-control.js'
 
 // Cordis FiberState is a const enum, so the published build does not export it.
 // These values match @deepseek-ai/cordis 4.0.5.
@@ -95,6 +96,12 @@ export async function boot(options = {}) {
   })
   if (!Array.isArray(entries)) throw new Error('Composition must return an array of plugins')
   entries = await configurePlugins(entries, options.pluginConfig, workspace)
+  for (const entry of entries) {
+    if (entry.plugin === WebControl) {
+      const configPath = options.pluginConfig ? (isAbsolute(options.pluginConfig) ? options.pluginConfig : join(workspace, options.pluginConfig)) : join(workspace, '.mini-dsh', 'plugins.json')
+      entry.config = { ...entry.config, pluginConfig: configPath }
+    }
+  }
   const ctx = new Context()
   const started = []
   try {

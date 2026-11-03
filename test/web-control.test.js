@@ -41,6 +41,19 @@ async function start(replies, options = {}) {
   }
 }
 
+test('web plugin installation rejects invalid and cross-origin requests', async () => {
+  const run = await start([])
+  try {
+    assert.equal(run.app.ctx.webControl.pluginConfig, join(run.dir, '.mini-dsh', 'plugins.json'))
+    const denied = await request(run.url, '/plugins/install', { method: 'POST', headers: { origin: 'http://attacker.example' }, data: { spec: 'dsh-find-plugin' } })
+    assert.equal(denied.status, 403)
+    const invalid = await request(run.url, '/plugins/install', { method: 'POST', data: { spec: 'https://github.com/owner/project/tree/main' } })
+    assert.equal(invalid.status, 400)
+    assert.match(JSON.parse(invalid.body).error, /GitHub/)
+    await assert.rejects(access(join(run.dir, '.mini-dsh/plugins.json')), { code: 'ENOENT' })
+  } finally { await run.close() }
+})
+
 async function request(url, path, { method = 'GET', headers = {}, data } = {}) {
   const response = await fetch(url + path, {
     method, headers: { ...(method === 'POST' ? { origin: url, 'content-type': 'application/json' } : {}), ...headers },

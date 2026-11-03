@@ -1,4 +1,6 @@
 import { stdin, stdout } from 'node:process'
+import { access } from 'node:fs/promises'
+import { join } from 'node:path'
 import { boot } from './boot.js'
 import { composition } from './composition.js'
 import { environmentProvider } from './provider.js'
@@ -16,11 +18,17 @@ function fixedClock() {
 let app
 try {
   const provider = inspect ? undefined : environmentProvider()
+  const workspace = process.env.MINI_WORKSPACE || process.cwd()
+  const installedConfig = join(workspace, '.mini-dsh', 'plugins.json')
+  const hasInstalledConfig = !inspect && !process.env.MINI_CONFIG && await access(installedConfig).then(() => true, (error) => {
+    if (error.code === 'ENOENT') return false
+    throw error
+  })
   app = await boot({
-    workspace: process.env.MINI_WORKSPACE || process.cwd(),
+    workspace,
     session: process.env.MINI_SESSION,
     composition,
-    pluginConfig: inspect ? undefined : process.env.MINI_CONFIG,
+    pluginConfig: inspect ? undefined : process.env.MINI_CONFIG || (hasInstalledConfig ? installedConfig : undefined),
     writable: !inspect,
     provider,
     terminal: inspect ? undefined : { input: stdin, output: stdout },
