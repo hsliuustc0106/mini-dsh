@@ -43,8 +43,11 @@ export class Tools extends Service {
       if (!schema || typeof schema !== 'object' || Array.isArray(schema) || typeof tool.output.render !== 'function') {
         throw new Error(`Tool ${tool.name}: DSH output needs a schema and renderer`)
       }
-      if (['timeoutMs', 'projectContent', 'finalizeContent', 'deferLoading'].some((key) => tool[key] !== undefined)) {
+      if (['projectContent', 'finalizeContent', 'deferLoading'].some((key) => tool[key] !== undefined)) {
         throw new Error(`Tool ${tool.name}: DSH execution extensions are not supported`)
+      }
+      if (tool.timeoutMs !== undefined && (!Number.isFinite(tool.timeoutMs) || tool.timeoutMs <= 0 || tool.timeoutMs > 2147483647)) {
+        throw new Error(`Tool ${tool.name}: timeoutMs must be positive and at most 2147483647`)
       }
       let validate
       try {
@@ -71,12 +74,25 @@ export class Tools extends Service {
       type: 'function', function: { name, description, parameters },
     }))
   }
-  async run(name, args) {
+  async run(name, args, { callId } = {}) {
     const tool = this.items.get(name)
     if (!tool) throw new Error(`Unknown tool: ${name}`)
     validateArguments(tool.parameters, args)
     const output = this.outputs.get(name)
-    const result = await tool.execute(args)
+    let result
+    if (output) {
+      const controller = new AbortController()
+      let timedOut = false
+      const timer = tool.timeoutMs === undefined ? undefined : setTimeout(() => {
+        timedOut = true
+        controller.abort(new Error(`tool call timed out after ${tool.timeoutMs}ms`))
+      }, tool.timeoutMs)
+      try {
+        try { result = await tool.execute(args, { name, callId, signal: controller.signal }) }
+        catch (error) { if (!timedOut) throw error }
+        if (timedOut) throw new Error(`tool call timed out after ${tool.timeoutMs}ms`)
+      } finally { clearTimeout(timer) }
+    } else result = await tool.execute(args)
     if (!output) return result
     let value
     try { value = snapshotJsonValue(result) }

@@ -176,7 +176,7 @@ export class Agent extends Service {
     try {
       result = await checkpoint.guard(
         { type: 'tool.started', callId: id, name, arguments: structuredClone(args), workspace: workspace.root },
-        () => tools.run(name, args),
+        () => tools.run(name, args, { callId: id }),
       )
     } catch (error) {
       if (error.code === 'CHECKPOINT') throw error
