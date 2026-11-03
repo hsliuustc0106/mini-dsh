@@ -30,8 +30,9 @@ export class DshAgent extends Agent {
           prepare: async (exec) => ({ kind: 'dispatch', exec }),
           dispatch: async (exec) => {
             let text
-            const call = { id: exec.callId, function: { name: exec.name, arguments: typeof exec.arguments === 'string' ? exec.arguments : JSON.stringify(exec.arguments) } }
             try {
+              const call = owner.pendingCalls.find((item) => item.id === exec.callId && item.function.name === exec.name)
+              if (!call) throw new Error(`DSH tool call ${exec.callId} does not match an observed call`)
               if (owner.stopping) await owner.denyUnstarted([call])
               else await owner.oneCall(call, (event) => { if (event.type === 'result') text = event.content; owner.report(event) }, owner.controller?.signal, owner.approve)
               owner.pendingCalls = owner.pendingCalls.filter((item) => item.id !== call.id)

@@ -69,6 +69,23 @@ test('DSH loop executes multiple model calls in order with separate decisions', 
   assert.deepEqual(provider.sent[1].messages.slice(-2).map((message) => message.content), ['one', 'two'])
 })
 
+for (const [label, argumentsText] of [
+  ['JSON string containing an object', JSON.stringify('{"path":"hello.txt"}')],
+  ['empty arguments', ''],
+]) {
+  test(`DSH loop rejects ${label} without executing the tool`, async (t) => {
+    const toolCall = { id: 'call-1', type: 'function', function: { name: 'read', arguments: argumentsText } }
+    const { app, dir, provider } = await setup(t, [
+      { role: 'assistant', content: null, tool_calls: [toolCall] },
+      { role: 'assistant', content: 'Call rejected.' },
+    ])
+    await writeFile(join(dir, 'hello.txt'), 'must not be read')
+    await app.ctx.agent.turn('Read the file')
+    assert.equal(app.ctx.session.events.some((event) => event.type === 'tool.started'), false)
+    assert.match(provider.sent[1].messages.at(-1).content, /^Error:/)
+  })
+}
+
 test('DSH loop propagates model errors and preserves unknown streams', async (t) => {
   const provider = { inject: ['model'], apply(ctx) { ctx.effect(() => ctx.model.register({
     name: 'fake', prepare: () => ({ model: 'fake' }),
