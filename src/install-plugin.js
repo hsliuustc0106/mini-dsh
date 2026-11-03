@@ -1,11 +1,31 @@
 import { spawn } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { createRequire } from 'node:module'
+import { mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { resolve as resolveImport } from 'import-meta-resolve'
 import { parseDocument } from 'yaml'
 import { composition } from './composition.js'
+import { acquireWriter } from './lock.js'
 
 const object = (value) => value && typeof value === 'object' && !Array.isArray(value)
+
+async function lockProfile(configPath) {
+  // Resolving the directory makes different symlinked paths share one lock.
+  const path = join(await realpath(dirname(configPath)), `${basename(configPath)}.install.lock`)
+  const deadline = Date.now() + 30000
+  for (;;) {
+    try { return await acquireWriter(path) }
+    catch (error) {
+      if (error.code !== 'SESSION_LOCKED') throw error
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for plugin profile lock: ${configPath}`)
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+}
+
+function resolveModule(spec, parentPath) {
+  return fileURLToPath(resolveImport(spec, pathToFileURL(parentPath).href))
+}
 
 // Install in a staging directory so failed installs never alter the active profile.
 export async function installPlugin(spec, workspace, options = {}) {
@@ -35,7 +55,6 @@ export async function installPlugin(spec, workspace, options = {}) {
     const packageName = packages[0]
     const root = join(stage, 'node_modules', ...packageName.split('/'))
     const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
-    const require = createRequire(join(stage, 'package.json'))
     const patch = pkg.dsh?.bundle?.patch
     const rows = []
     if (patch !== undefined) {
@@ -54,34 +73,37 @@ export async function installPlugin(spec, workspace, options = {}) {
           for (const row of op.insert) {
             if (!object(row) || Object.keys(row).some((key) => !['id', 'name', 'config'].includes(key)) || typeof row.id !== 'string' || typeof row.name !== 'string') throw new Error('Unsupported bundle plugin row')
             let path
-            try { path = row.name.startsWith('.') ? resolve(dirname(patchPath), row.name) : require.resolve(row.name) }
+            try { path = resolveModule(row.name, patchPath) }
             catch (error) { throw new Error(`Cannot resolve bundle plugin ${row.name}: ${error.message}`) }
             rows.push({ name: row.id, module: path, ...(Object.hasOwn(row, 'config') ? { config: row.config } : {}) })
           }
         }
       }
     } else {
-      rows.push({ name: packageName.replace(/^@/, '').replaceAll('/', '-'), module: require.resolve(packageName) })
+      rows.push({ name: packageName.replace(/^@/, '').replaceAll('/', '-'), module: resolveModule(packageName, join(stage, 'package.json')) })
     }
     if (!rows.length) throw new Error('Bundle contains no plugin rows')
-    let config
-    try { config = JSON.parse(await readFile(configPath, 'utf8')) }
-    catch (error) { if (error.code !== 'ENOENT') throw error; config = { plugins: [] } }
-    if (!object(config) || Object.keys(config).some((key) => key !== 'plugins') || !Array.isArray(config.plugins)) throw new Error(`Invalid plugin configuration: ${configPath}`)
-    const names = new Set([...composition({ terminal: {}, view: true, web: true }).map((entry) => entry.name), ...config.plugins.map((entry) => entry.name)])
-    for (const row of rows) {
-      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(row.name) || names.has(row.name)) throw new Error(`Invalid or duplicate plugin name: ${row.name}`)
-      names.add(row.name)
-    }
-    // Keep the staging directory as the installed package: absolute paths in
-    // the profile stay valid, including npm's local package links.
-    config.plugins.push(...rows)
-    const temp = join(dirname(configPath), `.plugins-${basename(stage)}.json`)
+    const lock = await lockProfile(configPath)
     try {
-      await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx' })
-      await rename(temp, configPath)
-    } catch (error) { await rm(temp, { force: true }); throw error }
-    return { packageName, configPath, names: rows.map((row) => row.name) }
+      let config
+      try { config = JSON.parse(await readFile(configPath, 'utf8')) }
+      catch (error) { if (error.code !== 'ENOENT') throw error; config = { plugins: [] } }
+      if (!object(config) || Object.keys(config).some((key) => key !== 'plugins') || !Array.isArray(config.plugins)) throw new Error(`Invalid plugin configuration: ${configPath}`)
+      const names = new Set([...composition({ terminal: {}, view: true, web: true }).map((entry) => entry.name), ...config.plugins.map((entry) => entry.name)])
+      for (const row of rows) {
+        if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(row.name) || names.has(row.name)) throw new Error(`Invalid or duplicate plugin name: ${row.name}`)
+        names.add(row.name)
+      }
+      // Keep the staging directory as the installed package: absolute paths in
+      // the profile stay valid, including npm's local package links.
+      config.plugins.push(...rows)
+      const temp = join(dirname(configPath), `.plugins-${basename(stage)}.json`)
+      try {
+        await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx' })
+        await rename(temp, configPath)
+      } catch (error) { await rm(temp, { force: true }); throw error }
+      return { packageName, configPath, names: rows.map((row) => row.name) }
+    } finally { lock.release() }
   } catch (error) {
     await rm(stage, { recursive: true, force: true })
     throw error

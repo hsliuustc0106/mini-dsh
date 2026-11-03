@@ -18,6 +18,7 @@
     "@endo/module-source": "1.5.0",
     "@vscode/ripgrep": "^1.18.0",
     "ajv": "8.20.0",
+    "import-meta-resolve": "4.2.0",
     "ses": "2.3.0",
     "yaml": "^2.9.1"
   },
