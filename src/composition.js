@@ -8,6 +8,7 @@ import { skills } from './skills.js'
 import { Terminal } from './terminal.js'
 import { TrajectoryViewer } from './viewer.js'
 import { WebControl } from './web-control.js'
+import { LivePlugins } from './live-plugins.js'
 
 // Consumers are listed before the services they use. Shutdown disposes in
 // this order, so a turn can record a known outcome before the session
@@ -30,6 +31,7 @@ export function composition({ workspace, sessionPath, writable = true, provider,
     { name: 'runtime-context', plugin: runtimeContext },
     { name: 'default-tool-permissions', plugin: defaultToolPermissions },
     { name: 'permissions', plugin: Permissions, config: { ask: approve } },
+    { name: 'live-plugins', plugin: LivePlugins },
     { name: 'checkpoint', plugin: Checkpoint },
     { name: 'tools', plugin: Tools },
     { name: 'prompt', plugin: Prompt },

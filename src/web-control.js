@@ -4,6 +4,7 @@ import { createServer } from 'node:http'
 import { Service } from '@deepseek-ai/cordis'
 import { project } from './trajectory.js'
 import { installPlugin } from './install-plugin.js'
+import { loadProfileEntries, uninstallPlugin } from './live-plugins.js'
 
 const HOST = '127.0.0.1'
 const MAX_BODY = 1024 * 1024
@@ -12,6 +13,8 @@ export function pluginInstallSpec(input) {
   if (typeof input !== 'string') throw new Error('Enter a GitHub repository URL or npm package')
   const value = input.trim()
   if (/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:@[a-z0-9][a-z0-9._-]*)?$/i.test(value)) return value
+  // Local package paths are allowed on loopback so tests and trusted local tarballs can activate live.
+  if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return value
   let url
   try { url = new URL(value) } catch { throw new Error('Enter a GitHub repository URL or npm package') }
   if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'github.com' || url.port || url.username || url.password || url.search || !/^\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\/?$/.test(url.pathname) || (url.hash && !/^#[a-zA-Z0-9_.\/-]+$/.test(url.hash))) {
@@ -70,7 +73,7 @@ function cursorOf(req, url) {
 // A web turn owns its approval channel. Disconnecting that channel never
 // transfers an approval to a later connection, even for the same call id.
 export class WebControl extends Service {
-  static inject = ['agent', 'session', 'workspace']
+  static inject = ['agent', 'session', 'workspace', 'livePlugins']
 
   constructor(ctx, config = {}) {
     super(ctx, 'webControl')
@@ -78,6 +81,7 @@ export class WebControl extends Service {
     this.port = config.port ?? 0
     this.pluginConfig = config.pluginConfig
     this.installing = false
+    this.changing = false
     if (!Number.isInteger(this.port) || this.port < 0 || this.port > 65535) throw new Error('Web control port is invalid')
     this.clients = new Map()
     this.pending = null
@@ -174,7 +178,10 @@ export class WebControl extends Service {
       return json(res, 200, { cursor: projection.cursor, overview })
     }
     if (req.method === 'GET' && url.pathname === '/events') return this.stream(req, res, url)
-    if (req.method !== 'POST' || !['/turn', '/approval', '/plugins/install'].includes(url.pathname)) {
+    if (req.method === 'GET' && url.pathname === '/plugins') {
+      return json(res, 200, { plugins: this.ctx.livePlugins.list() })
+    }
+    if (req.method !== 'POST' || !['/turn', '/approval', '/plugins/install', '/plugins/uninstall'].includes(url.pathname)) {
       return send(res, 404, 'text/plain; charset=utf-8', 'Not found\n')
     }
     if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '')) return json(res, 415, { error: 'JSON required' })
@@ -185,6 +192,7 @@ export class WebControl extends Service {
     if (!data || typeof data !== 'object' || Array.isArray(data)) return json(res, 400, { error: 'Invalid request body' })
     if (url.pathname === '/turn') return this.startTurn(res, data)
     if (url.pathname === '/plugins/install') return this.install(res, data)
+    if (url.pathname === '/plugins/uninstall') return this.uninstall(res, data)
     return this.answer(res, data)
   }
 
@@ -192,13 +200,55 @@ export class WebControl extends Service {
     let spec
     try { spec = pluginInstallSpec(data.spec) }
     catch (error) { return json(res, 400, { error: error.message }) }
-    if (this.installing) return json(res, 409, { error: 'A plugin installation is already in progress' })
+    if (this.installing || this.changing) return json(res, 409, { error: 'A plugin change is already in progress' })
     this.installing = true
     try {
-      const result = await installPlugin(spec, this.ctx.workspace.root, { configPath: this.pluginConfig, captureOutput: true })
-      return json(res, 200, { packageName: result.packageName, names: result.names, configPath: result.configPath, restartRequired: true })
-    } catch (error) { return json(res, 400, { error: error.message }) }
-    finally { this.installing = false }
+      let result
+      try {
+        result = await installPlugin(spec, this.ctx.workspace.root, { configPath: this.pluginConfig, captureOutput: true })
+      } catch (error) {
+        return json(res, 400, { error: error.message, phase: 'package' })
+      }
+      try {
+        const entries = await loadProfileEntries(result.configPath, result.names)
+        const plugins = await this.ctx.livePlugins.mountAll(entries)
+        return json(res, 200, {
+          packageName: result.packageName,
+          names: result.names,
+          configPath: result.configPath,
+          restartRequired: false,
+          phase: 'active',
+          plugins,
+        })
+      } catch (error) {
+        return json(res, 400, {
+          error: error.message,
+          phase: 'activation',
+          packageName: result.packageName,
+          names: result.names,
+          configPath: result.configPath,
+          restartRequired: true,
+        })
+      }
+    } finally { this.installing = false }
+  }
+
+  async uninstall(res, data) {
+    if (typeof data.name !== 'string' || !data.name.trim()) return json(res, 400, { error: 'Plugin name is required' })
+    if (this.installing || this.changing) return json(res, 409, { error: 'A plugin change is already in progress' })
+    this.changing = true
+    try {
+      try { await this.ctx.livePlugins.unmount(data.name) }
+      catch (error) {
+        if (!/not mounted/.test(error.message)) return json(res, 400, { error: error.message, phase: 'dispose' })
+      }
+      try {
+        const result = await uninstallPlugin(data.name, this.ctx.workspace.root, { configPath: this.pluginConfig })
+        return json(res, 200, { name: result.name, configPath: result.configPath, restartRequired: false, phase: 'removed' })
+      } catch (error) {
+        return json(res, 400, { error: error.message, phase: 'profile' })
+      }
+    } finally { this.changing = false }
   }
 
   stream(req, res, url) {

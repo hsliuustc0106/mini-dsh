@@ -1,0 +1,218 @@
+import { Service } from '@deepseek-ai/cordis'
+import { readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { acquireWriter } from './lock.js'
+
+// Cordis FiberState values from @deepseek-ai/cordis 4.0.5 (const enum, not exported).
+const LOADING = 1
+const UNLOADING = 5
+const STATE_NAME = ['pending', 'loading', 'active', 'failed', 'disposed', 'unloading']
+
+const object = (value) => value && typeof value === 'object' && !Array.isArray(value)
+
+export const BUILTIN_PLUGIN_NAMES = new Set([
+  'viewer', 'web-control', 'terminal', 'agent', 'coding', 'skills', 'instructions',
+  'runtime-context', 'default-tool-permissions', 'permissions', 'checkpoint', 'tools',
+  'prompt', 'model', 'provider', 'session', 'workspace', 'live-plugins',
+])
+
+function statusOf(fiber) {
+  if (fiber._error) return 'failed'
+  return STATE_NAME[fiber.state] ?? 'unknown'
+}
+
+function describe(name, fiber) {
+  const missing = Object.keys(fiber.inject ?? {}).filter((key) => fiber.ctx.reflect.get(key, false) == null)
+  const error = fiber._error
+  return {
+    name,
+    state: statusOf(fiber),
+    missing,
+    error: error ? String(error.message ?? error) : undefined,
+  }
+}
+
+async function settle(fiber) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    await fiber.await().catch(() => {})
+    if (!fiber.inertia && fiber.state !== LOADING && fiber.state !== UNLOADING) return
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  throw new Error('Plugin did not settle')
+}
+
+async function lockProfile(configPath) {
+  const path = join(await realpath(dirname(configPath)), `${basename(configPath)}.install.lock`)
+  const deadline = Date.now() + 30000
+  for (;;) {
+    try { return await acquireWriter(path) }
+    catch (error) {
+      if (error.code !== 'SESSION_LOCKED') throw error
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for plugin profile lock: ${configPath}`)
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+}
+
+export async function readPluginProfile(configPath) {
+  let config
+  try { config = JSON.parse(await readFile(configPath, 'utf8')) }
+  catch (error) {
+    if (error.code === 'ENOENT') return { plugins: [] }
+    throw error
+  }
+  if (!object(config) || Object.keys(config).some((key) => key !== 'plugins') || !Array.isArray(config.plugins)) {
+    throw new Error(`Invalid plugin configuration: ${configPath}`)
+  }
+  return config
+}
+
+export async function loadProfileEntries(configPath, names) {
+  const wanted = new Set(names)
+  const config = await readPluginProfile(configPath)
+  const rows = config.plugins.filter((entry) => wanted.has(entry.name))
+  if (rows.length !== names.length) {
+    const found = new Set(rows.map((entry) => entry.name))
+    const missing = names.filter((name) => !found.has(name))
+    throw new Error(`Profile is missing plugin entries: ${missing.join(', ')}`)
+  }
+  const entries = []
+  for (const row of rows) {
+    if (row.enabled === false) throw new Error(`Plugin ${row.name} is disabled in the profile`)
+    if (typeof row.module !== 'string' || !row.module) throw new Error(`Plugin ${row.name} has no module path`)
+    const modulePath = isAbsolute(row.module) ? row.module : resolve(dirname(configPath), row.module)
+    let plugin
+    try {
+      const module = await import(pathToFileURL(modulePath).href)
+      plugin = row.export ? module[row.export] : module.default ?? (typeof module.apply === 'function' ? module : undefined)
+    } catch (error) {
+      throw new Error(`Plugin ${row.name} could not load ${modulePath}: ${error.message}`, { cause: error })
+    }
+    if (typeof plugin !== 'function' && (!object(plugin) || typeof plugin.apply !== 'function')) {
+      throw new Error(`Plugin ${row.name} has no valid ${row.export ?? 'default or named apply'} export`)
+    }
+    if (plugin.name === 'AgentLoop') {
+      throw new Error(`Live mounting the DSH agent loop (${row.name}) is not supported; restart with it in the profile`)
+    }
+    entries.push({
+      name: row.name,
+      plugin,
+      ...(Object.hasOwn(row, 'config') ? { config: row.config } : {}),
+      ...(Object.hasOwn(row, 'required') ? { required: row.required } : {}),
+      module: modulePath,
+    })
+  }
+  return entries
+}
+
+export async function uninstallPlugin(name, workspace, options = {}) {
+  if (typeof name !== 'string' || !name.trim()) throw new Error('Plugin name is required')
+  if (BUILTIN_PLUGIN_NAMES.has(name)) throw new Error(`Built-in plugin cannot be uninstalled: ${name}`)
+  if (!isAbsolute(workspace)) throw new Error('Workspace must be an absolute path')
+  const configPath = options.configPath ?? join(workspace, '.mini-dsh', 'plugins.json')
+  if (!isAbsolute(configPath)) throw new Error('Plugin config path must be absolute')
+  const lock = await lockProfile(configPath)
+  try {
+    const config = await readPluginProfile(configPath)
+    const before = config.plugins.length
+    config.plugins = config.plugins.filter((entry) => entry.name !== name)
+    if (config.plugins.length === before) throw new Error(`Plugin is not in the profile: ${name}`)
+    const temp = join(dirname(configPath), `.plugins-uninstall-${process.pid}.json`)
+    try {
+      await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx' })
+      await rename(temp, configPath)
+    } catch (error) {
+      await rm(temp, { force: true })
+      throw error
+    }
+    return { name, configPath }
+  } finally { lock.release() }
+}
+
+// Tracks profile/runtime plugins so install can mount and uninstall can dispose
+// without a process restart. Built-ins stay owned by boot().
+export class LivePlugins extends Service {
+  static inject = ['session', 'agent']
+
+  constructor(ctx) {
+    super(ctx, 'livePlugins')
+    this.mounted = new Map()
+  }
+
+  adopt(started = []) {
+    for (const entry of started) {
+      if (!entry?.name || BUILTIN_PLUGIN_NAMES.has(entry.name)) continue
+      if (this.mounted.has(entry.name)) continue
+      this.mounted.set(entry.name, { fiber: entry.fiber, module: entry.module, source: 'boot' })
+    }
+  }
+
+  list() {
+    return [...this.mounted.entries()].map(([name, info]) => ({
+      ...describe(name, info.fiber),
+      source: info.source,
+      module: info.module,
+    }))
+  }
+
+  busy() {
+    return Boolean(this.ctx.agent.busy)
+  }
+
+  async mount(entry) {
+    if (!entry?.plugin || typeof entry.name !== 'string' || !entry.name) throw new Error('Mount needs a name and a plugin')
+    if (BUILTIN_PLUGIN_NAMES.has(entry.name)) throw new Error(`Built-in plugin cannot be mounted at runtime: ${entry.name}`)
+    if (this.mounted.has(entry.name)) throw new Error(`Plugin already mounted: ${entry.name}`)
+    if (this.busy()) throw new Error('Cannot mount plugins while a turn is in progress')
+    if (entry.plugin?.name === 'AgentLoop' || entry.dshAgentLoopModule) {
+      throw new Error(`Live mounting the DSH agent loop (${entry.name}) is not supported; restart with it in the profile`)
+    }
+    // Mount under the root context so injected services like tools resolve
+    // the same way as boot-time plugins (service method ctx is shadowed).
+    const fiber = this.ctx.root.plugin(entry.plugin, entry.config)
+    try {
+      await settle(fiber)
+      const report = describe(entry.name, fiber)
+      if (entry.required !== false && report.state !== 'active') {
+        await Promise.resolve(fiber.dispose()).catch(() => {})
+        await this.record('plugin.failed', { name: entry.name, state: report.state, error: report.error, missing: report.missing })
+        const detail = report.error ? `: ${report.error}` : report.missing?.length ? `: waiting for ${report.missing.join(', ')}` : ''
+        throw new Error(`Plugin ${entry.name} ${report.state === 'failed' ? 'failed' : `is ${report.state}`}${detail}`)
+      }
+      this.mounted.set(entry.name, { fiber, module: entry.module, source: 'live' })
+      await this.record('plugin.mounted', { name: entry.name, state: report.state })
+      return report
+    } catch (error) {
+      if (!this.mounted.has(entry.name)) await Promise.resolve(fiber.dispose()).catch(() => {})
+      throw error
+    }
+  }
+
+  async mountAll(entries) {
+    const reports = []
+    for (const entry of entries) reports.push(await this.mount(entry))
+    return reports
+  }
+
+  async unmount(name) {
+    if (typeof name !== 'string' || !name.trim()) throw new Error('Plugin name is required')
+    if (BUILTIN_PLUGIN_NAMES.has(name)) throw new Error(`Built-in plugin cannot be unmounted: ${name}`)
+    if (this.busy()) throw new Error('Cannot unmount plugins while a turn is in progress')
+    const info = this.mounted.get(name)
+    if (!info) throw new Error(`Plugin is not mounted: ${name}`)
+    await Promise.resolve(info.fiber.dispose())
+    this.mounted.delete(name)
+    await this.record('plugin.unmounted', { name })
+    return { name, state: 'disposed' }
+  }
+
+  async record(type, fields) {
+    if (!this.ctx.session?.writable) return
+    try { await this.ctx.session.append({ type, ...fields }) }
+    catch (error) {
+      // Profile/runtime changes still apply; the session record is best-effort when writable.
+      this.ctx.logger?.warn?.(error) ?? this.ctx.logger?.error?.(error)
+    }
+  }
+}

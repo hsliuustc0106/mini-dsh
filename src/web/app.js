@@ -12,10 +12,50 @@ const pluginForm = get('plugins-form')
 const pluginSpec = get('plugin-spec')
 const pluginInstall = get('plugin-install')
 const pluginResult = get('plugin-result')
+const pluginList = get('plugin-list')
+
+async function refreshPlugins() {
+  if (!pluginList) return
+  try {
+    const response = await fetch('/plugins')
+    if (!response.ok) throw new Error('Plugin list unavailable')
+    const data = await response.json()
+    pluginList.replaceChildren()
+    if (!data.plugins?.length) {
+      pluginList.append(node('li', 'plugin-empty', 'No runtime plugins mounted.'))
+      return
+    }
+    for (const plugin of data.plugins) {
+      const row = node('li', `plugin-row ${plugin.state}`)
+      const label = node('span', '', `${plugin.name} · ${plugin.state}${plugin.error ? ` · ${plugin.error}` : ''}`)
+      const remove = node('button', '', 'Uninstall')
+      remove.type = 'button'
+      remove.addEventListener('click', () => uninstallPlugin(plugin.name))
+      row.append(label, remove)
+      pluginList.append(row)
+    }
+  } catch (error) {
+    pluginList.replaceChildren(node('li', 'plugin-empty', error.message || 'Plugin list unavailable'))
+  }
+}
+
+async function uninstallPlugin(name) {
+  pluginResult.textContent = `Uninstalling ${name}…`
+  try {
+    const response = await fetch('/plugins/uninstall', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.error || 'Uninstall failed')
+    pluginResult.textContent = `Uninstalled ${result.name}.`
+    await refreshPlugins()
+  } catch (error) { pluginResult.textContent = error.message || 'Uninstall failed' }
+}
 
 pluginToggle.addEventListener('click', () => {
   pluginPanel.hidden = !pluginPanel.hidden
   pluginToggle.setAttribute('aria-expanded', String(!pluginPanel.hidden))
+  if (!pluginPanel.hidden) refreshPlugins()
 })
 pluginForm.addEventListener('submit', async (event) => {
   event.preventDefault()
@@ -27,8 +67,16 @@ pluginForm.addEventListener('submit', async (event) => {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ spec: pluginSpec.value }),
     })
     const result = await response.json()
-    if (!response.ok) throw new Error(result.error || 'Installation failed')
-    pluginResult.textContent = `Installed ${result.packageName} (${result.names.join(', ')}). Restart mini-dsh to load it. New tools are denied until a permission policy is configured.`
+    if (!response.ok) {
+      const phase = result.phase === 'activation' ? 'Package installed, but activation failed: ' : ''
+      throw new Error(`${phase}${result.error || 'Installation failed'}`)
+    }
+    if (result.restartRequired) {
+      pluginResult.textContent = `Installed ${result.packageName} (${result.names.join(', ')}). Restart mini-dsh to load it. New tools are denied until a permission policy is configured.`
+    } else {
+      pluginResult.textContent = `Installed and activated ${result.packageName} (${result.names.join(', ')}). New tools are denied until a permission policy is configured.`
+    }
+    await refreshPlugins()
   } catch (error) { pluginResult.textContent = error.message || 'Installation failed' }
   finally { pluginInstall.disabled = false }
 })

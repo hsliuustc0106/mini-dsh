@@ -129,6 +129,7 @@ export async function boot(options = {}) {
     const report = started.map(describe)
     const problems = report.filter((item, index) => started[index].required !== false && item.state !== 'active')
     if (problems.length) throw new BootError(problems.map(formatProblem).join('; '), report)
+    ctx.livePlugins?.adopt(started)
     let disposing
     return {
       ctx,
