@@ -167,16 +167,16 @@ test('projects the recorded fixture into turns, timing, and inspectable records'
   const events = (await readSession(join(fixtureDir, 'session.jsonl'))).events
   const view = project(events)
   assert.equal(view.wordmark, 'mini-dsh')
-  assert.equal(view.count, 19)
-  assert.equal(view.cursor, 19)
+  assert.equal(view.count, 22)
+  assert.equal(view.cursor, 22)
   assert.deepEqual(view.unknown, [])
   assert.deepEqual(view.unknownStreams, [])
   assert.deepEqual(view.overview.map((span) => span.kind), ['input', 'model', 'tool', 'model'])
   assert.deepEqual(view.overview.map((span) => [span.seq, span.endSeq, span.status, span.durationMs]), [
     [2, 2, 'ok', 0],
-    [3, 8, 'ok', 0],
-    [11, 12, 'ok', 0],
-    [14, 18, 'ok', 0],
+    [4, 9, 'ok', 0],
+    [12, 13, 'ok', 0],
+    [16, 20, 'ok', 0],
   ])
   assert.equal(view.overview[2].callId, 'write-hello')
   assert.equal(view.overview[2].name, 'write')
@@ -189,16 +189,17 @@ test('projects the recorded fixture into turns, timing, and inspectable records'
   assert.deepEqual(cards.map((card) => card.kind), ['user', 'tool', 'assistant'])
   assert.equal(cards[0].content, 'Write hello.txt')
   assert.deepEqual([cards[1].name, cards[1].status, cards[1].seq, cards[1].decisionSeq, cards[1].startSeq, cards[1].resultSeq],
-    ['write', 'ok', 9, 10, 11, 13])
+    ['write', 'ok', 10, 11, 12, 14])
   assert.deepEqual(cards[1].arguments, { path: 'hello.txt', content: 'hello\n' })
   assert.equal(cards[1].result, 'File written.')
   assert.equal(cards[2].content, 'Wrote hello.txt.')
   assert.deepEqual(view.turns[0].rows.map((row) => row.label), [
-    'message:user', 'model.request', 'stream.started', 'stream.delta', 'stream.delta', 'stream.delta', 'stream.ended', 'message:assistant', 'permission.decided',
-    'tool.started', 'tool.finished', 'message:tool', 'model.request', 'stream.started', 'stream.delta', 'stream.delta', 'stream.ended', 'message:assistant',
+    'message:user', 'agent.pre-step', 'model.request', 'stream.started', 'stream.delta', 'stream.delta', 'stream.delta', 'stream.ended', 'message:assistant', 'permission.decided',
+    'tool.started', 'tool.finished', 'message:tool', 'agent.pre-step', 'model.request', 'stream.started', 'stream.delta', 'stream.delta', 'stream.ended', 'message:assistant',
+    'turn/end',
   ])
   const rows = rowsOf(view)
-  assert.deepEqual(rows.map((row) => row.seq), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
+  assert.deepEqual(rows.map((row) => row.seq), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22])
   const requestRow = rows.find((row) => row.type === 'model.request')
   assert.equal(requestRow.detail.provider, 'fake')
   assert.equal(requestRow.detail.body.messages[0].content, 'Write hello.txt')
@@ -214,13 +215,15 @@ test('projects the recorded fixture into turns, timing, and inspectable records'
   const decision = rows.find((row) => row.type === 'permission.decided')
   assert.equal(decision.detail.decision, 'allow')
   assert.equal(decision.detail.arguments.path, 'hello.txt')
-  assert.equal(rows.at(-1).detail.content, 'Wrote hello.txt.')
+  const finalAssistant = rows.filter((row) => row.label === 'message:assistant').at(-1)
+  assert.equal(finalAssistant.detail.content, 'Wrote hello.txt.')
+  assert.equal(rows.at(-1).type, 'turn/end')
   const ends = rows.filter((row) => row.type === 'stream.ended')
   assert.equal(ends[0].detail.tool_calls[0].id, 'write-hello')
   assert.equal(ends[0].detail.tool_calls[0].function.arguments, '{"path":"hello.txt","content":"hello\\n"}')
   assert.equal(ends[1].detail.text, 'Wrote hello.txt.')
   assert.deepEqual(view.overview[3].tokens.map((token) => token.text), ['Wrote he', 'llo.txt.'])
-  assert.equal(view.overview[3].tokens.map((token) => token.text).join(''), rows.at(-1).detail.content)
+  assert.equal(view.overview[3].tokens.map((token) => token.text).join(''), finalAssistant.detail.content)
 })
 
 test('projects an interrupted tool and an unresolved tool call as unknown', () => {
@@ -509,7 +512,7 @@ test('serves the fixture read-only and renders the same history after restart', 
     assert.match(page.body, /class="card user"/)
     assert.match(page.body, /class="card tool ok"/)
     assert.match(page.body, /class="card assistant"/)
-    assert.match(page.body, /data-seq="13">Result #13/)
+    assert.match(page.body, /data-seq="14">Result #14/)
     assert.match(page.body, /<summary>Event ledger/)
     assert.match(page.body, />input</)
     assert.match(page.body, />model</)

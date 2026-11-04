@@ -27,15 +27,15 @@ function toolCard(view) {
 test('trajectory and the viewer recompute stream, ask, and tool facts from the log', async () => {
   const events = (await readSession(fixture)).events
   const snapshot = structuredClone(events)
-  assert.equal(events[8].type, 'message')
-  assert.equal(events[9].type, 'permission.decided')
-  assert.equal(events[10].type, 'tool.started')
-  assert.equal(events[15].text, 'Wrote he')
+  assert.equal(events[9].type, 'message')
+  assert.equal(events[10].type, 'permission.decided')
+  assert.equal(events[11].type, 'tool.started')
+  assert.equal(events[17].text, 'Wrote he')
 
   const full = project(events)
-  const beforeAsk = project(events.slice(0, 9))
-  const started = project(events.slice(0, 11))
-  const midReply = project(events.slice(0, 16))
+  const beforeAsk = project(events.slice(0, 10))
+  const started = project(events.slice(0, 12))
+  const midReply = project(events.slice(0, 18))
 
   assert.equal(toolCard(full).decision, 'allow')
   assert.equal(toolCard(full).status, 'ok')
