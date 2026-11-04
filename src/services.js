@@ -37,17 +37,40 @@ export class Tools extends Service {
     if (typeof tool.execute !== 'function') throw new Error(`Tool ${tool.name} needs execute`)
     if (options != null && Object.keys(options).length) throw new Error(`Tool ${tool.name}: registration options are not supported`)
     if (this.items.has(tool.name)) throw new Error(`Duplicate tool: ${tool.name}`)
+    // Execution-affecting DSH extensions fail closed. Presentation / concurrency
+    // classifiers from defineTool are accepted and ignored (no UI; tools run sequentially).
+    if (['projectContent', 'finalizeContent', 'deferLoading'].some((key) => tool[key] !== undefined)) {
+      throw new Error(`Tool ${tool.name}: DSH execution extensions are not supported`)
+    }
+    const ignoredToolFields = new Set(['presentCall', 'presentResult', 'isConcurrencySafe'])
+    const supportedToolFields = new Set(['name', 'description', 'parameters', 'execute', 'output', 'timeoutMs', ...ignoredToolFields])
+    for (const key of Object.keys(tool)) {
+      if (!supportedToolFields.has(key)) throw new Error(`Tool ${tool.name}: unsupported tool field '${key}'`)
+    }
+    for (const key of ignoredToolFields) {
+      if (tool[key] !== undefined && typeof tool[key] !== 'function') {
+        throw new Error(`Tool ${tool.name}: ${key} must be a function when provided`)
+      }
+    }
+    if (tool.timeoutMs !== undefined && (!Number.isFinite(tool.timeoutMs) || tool.timeoutMs <= 0 || tool.timeoutMs > 2147483647)) {
+      throw new Error(`Tool ${tool.name}: timeoutMs must be positive and at most 2147483647`)
+    }
     let output
     if (tool.output != null) {
+      if (typeof tool.output !== 'object' || Array.isArray(tool.output)) {
+        throw new Error(`Tool ${tool.name}: DSH output needs a schema and renderer`)
+      }
+      const ignoredOutputFields = new Set(['presentationMeta'])
+      const supportedOutputFields = new Set(['schema', 'render', ...ignoredOutputFields])
+      for (const key of Object.keys(tool.output)) {
+        if (!supportedOutputFields.has(key)) throw new Error(`Tool ${tool.name}: unsupported output field '${key}'`)
+      }
+      if (tool.output.presentationMeta !== undefined && typeof tool.output.presentationMeta !== 'function') {
+        throw new Error(`Tool ${tool.name}: presentationMeta must be a function when provided`)
+      }
       const schema = tool.output.schema
       if (!schema || typeof schema !== 'object' || Array.isArray(schema) || typeof tool.output.render !== 'function') {
         throw new Error(`Tool ${tool.name}: DSH output needs a schema and renderer`)
-      }
-      if (['projectContent', 'finalizeContent', 'deferLoading'].some((key) => tool[key] !== undefined)) {
-        throw new Error(`Tool ${tool.name}: DSH execution extensions are not supported`)
-      }
-      if (tool.timeoutMs !== undefined && (!Number.isFinite(tool.timeoutMs) || tool.timeoutMs <= 0 || tool.timeoutMs > 2147483647)) {
-        throw new Error(`Tool ${tool.name}: timeoutMs must be positive and at most 2147483647`)
       }
       let validate
       try {
