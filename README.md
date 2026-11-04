@@ -104,7 +104,7 @@ Concurrent installers serialize updates with a SQLite advisory lock beside the p
 The installer accepts a package exposing a plugin entry point, or a DSH bundle declaring `dsh.bundle.patch`. Bundle support covers ordered patch files that use:
 
 - `insert` arrays with `id`, `name`, and optional `config` or boolean-literal `disabled` rows (`disabled: true` becomes profile `enabled: false`)
-- id-targeted replace ops (`id` plus `config`, `name`, and/or boolean `disabled`) that rewrite a matching profile row as a whole, including rows inserted earlier in the same install
+- id-targeted replace ops (`id` plus `config`, `name`, and/or boolean `disabled`) that rewrite a row inserted earlier **in the same install** as a whole; replacing a pre-existing profile row from another package fails explicitly with no profile write
 
 `remove`, `preset`, `group`, `isolate`, `!!js` expressions, profile layering, and version checks stay unsupported and fail explicitly without changing the profile. npm installs never pass `--force` or `--legacy-peer-deps`; an `ERESOLVE` peer conflict leaves the profile unchanged and surfaces the conflicting peer rather than treating a forced install as compatibility. Plugins still need the services and tool features supported by mini-dsh; a successful install does not guarantee a plugin can boot. For npm dependencies, install a built package whose peers resolve cleanly.
 

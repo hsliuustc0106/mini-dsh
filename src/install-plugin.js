@@ -31,7 +31,7 @@ function resolveModule(spec, parentPath) {
 
 // npm suggests --force / --legacy-peer-deps; those bypass peer contracts and are
 // not accepted here as proof that a plugin is compatible with mini-dsh.
-function npmInstallError(detail, code, signal) {
+export function npmInstallError(detail, code, signal) {
   const text = detail.trim()
   const eresolve = /ERESOLVE|unable to resolve dependency tree|peer .* from /i.test(text)
   if (eresolve) {
@@ -46,7 +46,8 @@ function npmInstallError(detail, code, signal) {
       `(or pin a compatible set).${text ? ` npm said: ${text.slice(0, 1500)}` : ''}`
     )
   }
-  return new Error(`npm install failed (${signal ?? code})${text ? `: ${text}` : ''}`)
+  const tail = text ? `: ${text.slice(-1500)}` : ''
+  return new Error(`npm install failed (${signal ?? code})${tail}`)
 }
 
 function rowFromInsert(row, patchPath) {
@@ -67,7 +68,7 @@ function rowFromInsert(row, patchPath) {
   }
 }
 
-function applyReplace(plugins, op, patchPath) {
+function applyReplace(plugins, op, patchPath, inserted) {
   if (!object(op) || typeof op.id !== 'string' || !op.id || Object.keys(op).some((key) => !REPLACE_KEYS.has(key))) {
     throw new Error('Unsupported bundle patch operation: id-targeted replace allows id plus optional name, config, and boolean disabled')
   }
@@ -80,8 +81,17 @@ function applyReplace(plugins, op, patchPath) {
   if (Object.hasOwn(op, 'name') && (typeof op.name !== 'string' || !op.name)) {
     throw new Error(`Unsupported bundle patch operation: name for ${op.id} must be a non-empty string`)
   }
+  // Option 1 (#67 Review): replace may only target rows inserted earlier in THIS install.
+  // Rewriting a pre-existing profile row from another package is refused with no write.
+  if (!inserted.has(op.id)) {
+    const known = plugins.some((entry) => entry.name === op.id)
+    throw new Error(
+      known
+        ? `Bundle patch cannot replace pre-existing plugin id: ${op.id} (only rows inserted earlier in this install)`
+        : `Bundle patch targets unknown plugin id: ${op.id}`
+    )
+  }
   const index = plugins.findIndex((entry) => entry.name === op.id)
-  if (index < 0) throw new Error(`Bundle patch targets unknown plugin id: ${op.id}`)
   const next = { ...plugins[index] }
   if (Object.hasOwn(op, 'config')) next.config = op.config
   if (Object.hasOwn(op, 'name')) {
@@ -139,6 +149,7 @@ export async function installPlugin(spec, workspace, options = {}) {
       const plugins = config.plugins.map((entry) => ({ ...entry }))
       const builtin = new Set(composition({ terminal: {}, view: true, web: true }).map((entry) => entry.name))
       const touched = []
+      const inserted = new Set()
       const patch = pkg.dsh?.bundle?.patch
       if (patch !== undefined) {
         const patches = Array.isArray(patch) ? patch : [patch]
@@ -162,20 +173,21 @@ export async function installPlugin(spec, workspace, options = {}) {
                   throw new Error(`Invalid or duplicate plugin name: ${entry.name}`)
                 }
                 plugins.push(entry)
+                inserted.add(entry.name)
                 touched.push(entry.name)
               }
               continue
             }
             if (Object.hasOwn(op, 'id') && !Object.hasOwn(op, 'insert')) {
-              applyReplace(plugins, op, patchPath)
+              applyReplace(plugins, op, patchPath, inserted)
               touched.push(op.id)
               continue
             }
             const key = Object.keys(op)[0] ?? 'unknown'
             throw new Error(
               `Unsupported bundle patch operation: ${key}. ` +
-              'Supported: insert arrays, and id-targeted replace of name/config/disabled. ' +
-              'Not supported: remove, preset, group, isolate, !!js, profile layering, or version checks.'
+              'Supported: insert arrays, and id-targeted replace of name/config/disabled for rows inserted earlier in this install. ' +
+              'Not supported: replacing pre-existing profile rows, remove, preset, group, isolate, !!js, profile layering, or version checks.'
             )
           }
         }
