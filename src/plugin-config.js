@@ -96,7 +96,17 @@ export async function configurePlugins(entries, file, workspace) {
     if (typeof plugin !== 'function' && (!object(plugin) || typeof plugin.apply !== 'function')) {
       throw new Error(`Plugin ${item.name} has no valid ${item.export ?? 'default or named apply'} export`)
     }
-    result.find((entry) => entry.name === item.name).plugin = plugin
+    const target = result.find((entry) => entry.name === item.name)
+    target.plugin = plugin
+    if (plugin.name === 'AgentLoop') {
+      let manifest
+      try { manifest = JSON.parse(await readFile(resolve(dirname(item.path), '../package.json'), 'utf8')) }
+      catch (error) { if (error.code !== 'ENOENT') throw error }
+      if (manifest?.name === '@deepseek-ai/dsh-agent-loop') {
+        if (manifest.version !== '0.1.0-rc.6') throw new Error(`Plugin ${item.name}: unsupported DSH agent-loop version ${manifest.version}; expected 0.1.0-rc.6`)
+        target.dshAgentLoopModule = item.path
+      }
+    }
   }
   return result
 }
