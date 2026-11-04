@@ -269,3 +269,87 @@ test('DSH tool results must match their declared string type', async () => {
   await assert.rejects(ctx.tools.run('wrong_result', {}), /output does not match schema/)
   await tools.dispose()
 })
+
+test('presentation and concurrency fields are accepted and never invoked', async () => {
+  const ctx = new Context(), tools = ctx.plugin(Tools)
+  await tools.await()
+  let presentCall = 0, presentResult = 0, presentationMeta = 0, concurrency = 0
+  ctx.tools.register({
+    name: 'presented', description: 'Ignores UI helpers', parameters: { type: 'object', properties: {} },
+    timeoutMs: 1000,
+    presentCall: () => { presentCall++; return { card: 'generic', title: 'x' } },
+    presentResult: () => { presentResult++; return { card: 'generic', title: 'y' } },
+    isConcurrencySafe: () => { concurrency++; return true },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'], additionalProperties: false },
+      presentationMeta: () => { presentationMeta++; return { kind: 'ignored' } },
+      render: (_args, value) => [{ type: 'text', text: value.ok ? 'yes' : 'no' }],
+    },
+    execute: () => ({ ok: true }),
+  })
+  assert.equal(await ctx.tools.run('presented', {}), 'yes')
+  assert.deepEqual({ presentCall, presentResult, presentationMeta, concurrency }, { presentCall: 0, presentResult: 0, presentationMeta: 0, concurrency: 0 })
+  await tools.dispose()
+})
+
+test('unknown tool or output fields fail closed at registration', async () => {
+  const ctx = new Context(), tools = ctx.plugin(Tools)
+  await tools.await()
+  const base = {
+    name: 'unknown_field', description: 'Reject extras', parameters: { type: 'object' }, execute: () => 'x',
+    output: { schema: { type: 'string' }, render: () => [{ type: 'text', text: 'x' }] },
+  }
+  assert.throws(() => ctx.tools.register({ ...base, restrict: () => {} }), /unsupported tool field 'restrict'/)
+  assert.throws(() => ctx.tools.register({ ...base, presentCall: true }), /presentCall must be a function/)
+  assert.throws(() => ctx.tools.register({
+    ...base, output: { ...base.output, mediaType: 'image/png' },
+  }), /unsupported output field 'mediaType'/)
+  assert.throws(() => ctx.tools.register({
+    ...base, output: { ...base.output, presentationMeta: 'nope' },
+  }), /presentationMeta must be a function/)
+  for (const extension of [{ projectContent() {} }, { finalizeContent() {} }, { deferLoading: true }]) {
+    assert.throws(() => ctx.tools.register({
+      name: 'legacy', description: 'no output', parameters: { type: 'object' }, execute: () => 'x', ...extension,
+    }), /DSH execution extensions are not supported/)
+  }
+  await tools.dispose()
+})
+
+test('tool ownership is identity-scoped across plugins', async () => {
+  const ctx = new Context(), tools = ctx.plugin(Tools)
+  await tools.await()
+  const first = ctx.plugin({ inject: ['tools'], apply(inner) {
+    inner.tools.register({
+      name: 'shared_name', description: 'first', parameters: { type: 'object' }, execute: () => 'first',
+      output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    })
+  } })
+  await Promise.all([tools.await(), first.await()])
+  const second = ctx.plugin({ inject: ['tools'], apply(inner) {
+    assert.throws(() => inner.tools.register({
+      name: 'shared_name', description: 'second', parameters: { type: 'object' }, execute: () => 'second',
+    }), /Duplicate tool: shared_name/)
+  } })
+  await second.await()
+  assert.equal(await ctx.tools.run('shared_name', {}), 'first')
+  await first.dispose()
+  assert.equal(ctx.tools.items.has('shared_name'), false)
+  await assert.rejects(ctx.tools.run('shared_name', {}), /Unknown tool/)
+  await second.dispose()
+  await tools.dispose()
+})
+
+test('array DSH output validates and renders as text', async () => {
+  const ctx = new Context(), tools = ctx.plugin(Tools)
+  await tools.await()
+  ctx.tools.register({
+    name: 'list_data', description: 'Array output', parameters: { type: 'object', properties: {} },
+    output: {
+      schema: { type: 'array', items: { type: 'string' }, minItems: 1 },
+      render: (_args, value) => [{ type: 'text', text: value.join(',') }],
+    },
+    execute: () => ['a', 'b'],
+  })
+  assert.equal(await ctx.tools.run('list_data', {}), 'a,b')
+  await tools.dispose()
+})
