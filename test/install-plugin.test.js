@@ -4,7 +4,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { access, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { installPlugin } from '../src/install-plugin.js'
+import { installPlugin, npmInstallError } from '../src/install-plugin.js'
 import { boot } from '../src/boot.js'
 import { fakeProvider } from '../src/provider.js'
 import { pluginInstallSpec } from '../src/web-control.js'
@@ -48,15 +48,21 @@ test('install a DSH bundle and boot its tool with default deny', async (t) => {
   assert.equal(await readFile(result.configPath, 'utf8'), before)
 })
 
-test('unsupported bundle patches do not modify the profile', async (t) => {
+test('unsupported bundle patch ops and unknown replace targets leave the profile unchanged', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'mini-install-test-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
-  await writeFile(join(dir, 'package.json'), JSON.stringify({ name: 'bad-bundle', version: '1.0.0', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
-  await writeFile(join(dir, 'index.js'), '')
-  await writeFile(join(dir, 'patch.yml'), '- id: existing\n  config: {}\n')
-  const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: dir, encoding: 'utf8' }).trim()
   const workspace = join(dir, 'workspace'); await mkdir(workspace)
-  await assert.rejects(installPlugin(join(dir, archive), workspace), /Unsupported bundle patch operation/)
+  for (const [name, patch, pattern] of [
+    ['bad-remove', '- remove:\n    - existing\n', /Unsupported bundle patch operation: remove/],
+    ['bad-replace', '- id: missing\n  config: {}\n', /unknown plugin id: missing/],
+  ]) {
+    const pkg = join(dir, name); await mkdir(pkg)
+    await writeFile(join(pkg, 'package.json'), JSON.stringify({ name, version: '1.0.0', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
+    await writeFile(join(pkg, 'index.js'), 'export function apply() {}')
+    await writeFile(join(pkg, 'patch.yml'), patch)
+    const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()
+    await assert.rejects(installPlugin(join(dir, archive), workspace), pattern)
+  }
   await assert.rejects(readFile(join(workspace, '.mini-dsh/plugins.json')), { code: 'ENOENT' })
 })
 
@@ -141,4 +147,83 @@ test('competing installer processes serialize profile updates', async (t) => {
   await Promise.all(completions)
   const profile = JSON.parse(await readFile(join(home, 'plugins.json'), 'utf8'))
   assert.deepEqual(profile.plugins.map((entry) => entry.name).sort(), ['race-first', 'race-second'])
+})
+
+test('id-targeted replace updates a row inserted earlier in the same install', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-install-replace-same-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const pkg = join(dir, 'package'), workspace = join(dir, 'workspace')
+  await mkdir(pkg); await mkdir(workspace)
+  await writeFile(join(pkg, 'package.json'), JSON.stringify({ name: 'replace-same', version: '1.0.0', type: 'module', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
+  await writeFile(join(pkg, 'patch.yml'), '- insert:\n    - id: example\n      name: replace-same\n      config:\n        mode: initial\n- id: example\n  config:\n    mode: replaced\n- insert:\n    - id: extra\n      name: replace-same\n      disabled: true\n')
+  await writeFile(join(pkg, 'index.js'), 'export function apply() {}')
+  const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()
+  const result = await installPlugin(join(dir, archive), workspace)
+  assert.deepEqual(result.names, ['example', 'example', 'extra'])
+  const profile = JSON.parse(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8'))
+  assert.equal(profile.plugins.find((row) => row.name === 'example').config.mode, 'replaced')
+  assert.equal(profile.plugins.find((row) => row.name === 'extra').enabled, false)
+  const app = await boot({ workspace, pluginConfig: result.configPath, provider: fakeProvider([]) })
+  try {
+    assert.equal(app.report.find((row) => row.name === 'example').state, 'active')
+    assert.equal(app.report.find((row) => row.name === 'extra'), undefined)
+  } finally { await app.dispose() }
+})
+
+test('id-targeted replace cannot rewrite a pre-existing profile row from another package', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-install-replace-cross-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const first = join(dir, 'first'), second = join(dir, 'second'), workspace = join(dir, 'workspace')
+  await mkdir(first); await mkdir(second); await mkdir(workspace)
+  await writeFile(join(first, 'package.json'), JSON.stringify({ name: 'replace-first', version: '1.0.0', type: 'module', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
+  await writeFile(join(first, 'patch.yml'), '- insert:\n    - id: example\n      name: replace-first\n      config:\n        mode: initial\n')
+  await writeFile(join(first, 'index.js'), 'export function apply() {}')
+  const firstArchive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: first, encoding: 'utf8' }).trim()
+  await installPlugin(join(dir, firstArchive), workspace)
+  const before = await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8')
+  await writeFile(join(second, 'package.json'), JSON.stringify({ name: 'replace-second', version: '1.0.0', type: 'module', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
+  await writeFile(join(second, 'patch.yml'), '- id: example\n  config:\n    mode: hijacked\n')
+  await writeFile(join(second, 'index.js'), 'export function apply() {}')
+  const secondArchive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: second, encoding: 'utf8' }).trim()
+  await assert.rejects(
+    installPlugin(join(dir, secondArchive), workspace),
+    /cannot replace pre-existing plugin id: example/
+  )
+  assert.equal(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8'), before)
+  assert.equal(JSON.parse(before).plugins.find((row) => row.name === 'example').config.mode, 'initial')
+})
+
+test('non-ERESOLVE npm failures keep only a short error tail', () => {
+  const noise = 'x'.repeat(4000)
+  const error = npmInstallError(`${noise}final-tail-marker`, 1)
+  assert.match(error.message, /^npm install failed \(1\): /)
+  assert.match(error.message, /final-tail-marker$/)
+  assert.ok(error.message.length < 1700)
+  assert.equal(error.message.includes(noise), false)
+})
+
+test('peer dependency conflicts fail closed without force or legacy-peer-deps', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-install-peer-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const pkg = join(dir, 'package'), workspace = join(dir, 'workspace')
+  await mkdir(pkg); await mkdir(join(workspace, '.mini-dsh'), { recursive: true })
+  await writeFile(join(workspace, '.mini-dsh/plugins.json'), JSON.stringify({ plugins: [{ name: 'keep-me', module: './keep.js' }] }, null, 2) + '\n')
+  const before = await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8')
+  await writeFile(join(pkg, 'package.json'), JSON.stringify({
+    name: 'peer-conflict-plugin',
+    version: '1.0.0',
+    type: 'module',
+    main: 'index.js',
+    // Unresolvable peer mirrors the @mixian/dsh-desktop-plugin ERESOLVE class of failure.
+    peerDependencies: { 'mini-dsh-no-such-peer-package-zzzz': '^1.0.0' },
+  }))
+  await writeFile(join(pkg, 'index.js'), 'export function apply() {}')
+  const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()
+  await assert.rejects(
+    installPlugin(join(dir, archive), workspace),
+    /ERESOLVE|does not accept --force or --legacy-peer-deps/
+  )
+  assert.equal(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8'), before)
+  const stages = await readdir(join(workspace, '.mini-dsh'))
+  assert.equal(stages.some((name) => name.startsWith('.install-')), false)
 })

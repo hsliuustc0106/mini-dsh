@@ -101,7 +101,12 @@ The installer uses `MINI_WORKSPACE` (or the current directory) and npm, stores e
 
 Concurrent installers serialize updates with a SQLite advisory lock beside the profile and wait up to 30 seconds. As with the session writer lock, use a local filesystem; external editors do not participate in the lock.
 
-The installer accepts a package exposing a plugin entry point, or a DSH bundle declaring `dsh.bundle.patch`. Bundle support is limited to ordered patch files containing `insert` arrays with `id`, `name`, and optional `config` rows. Other patch operations and row fields are rejected. It does not implement DSH's profile layering, version checks, or general bundle compatibility. Plugins still need the services and tool features supported by mini-dsh; a successful install does not guarantee a plugin can boot. For npm dependencies, install a built package with resolvable imports.
+The installer accepts a package exposing a plugin entry point, or a DSH bundle declaring `dsh.bundle.patch`. Bundle support covers ordered patch files that use:
+
+- `insert` arrays with `id`, `name`, and optional `config` or boolean-literal `disabled` rows (`disabled: true` becomes profile `enabled: false`)
+- id-targeted replace ops (`id` plus `config`, `name`, and/or boolean `disabled`) that rewrite a row inserted earlier **in the same install** as a whole; replacing a pre-existing profile row from another package fails explicitly with no profile write
+
+`remove`, `preset`, `group`, `isolate`, `!!js` expressions, profile layering, and version checks stay unsupported and fail explicitly without changing the profile. npm installs never pass `--force` or `--legacy-peer-deps`; an `ERESOLVE` peer conflict leaves the profile unchanged and surfaces the conflicting peer rather than treating a forced install as compatibility. Plugins still need the services and tool features supported by mini-dsh; a successful install does not guarantee a plugin can boot. For npm dependencies, install a built package whose peers resolve cleanly.
 
 Installed tools have no automatic permission grant and are denied by default. To allow a particular tool, add a policy to `.mini-dsh/plugins.json`, for example:
 
