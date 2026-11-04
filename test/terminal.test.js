@@ -121,6 +121,7 @@ test('keyless entry point records a write and inspects the same session after re
     assert.deepEqual(saved.events.map(label), [
       'session.opened',
       'message:user',
+      'agent.pre-step',
       'model.request',
       'stream.started',
       'stream.delta',
@@ -132,12 +133,14 @@ test('keyless entry point records a write and inspects the same session after re
       'tool.started',
       'tool.finished',
       'message:tool',
+      'agent.pre-step',
       'model.request',
       'stream.started',
       'stream.delta',
       'stream.delta',
       'stream.ended',
       'message:assistant',
+      'turn/end',
     ])
     const decision = saved.events.find((event) => event.type === 'permission.decided')
     assert.equal(decision.decision, 'allow')

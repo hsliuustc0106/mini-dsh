@@ -1,5 +1,6 @@
 import { Service } from '@deepseek-ai/cordis'
 import { completeFinish, observeStream, unknownReason } from './log.js'
+import { flattenHookMessage, miniAgentHandle, toPreStepMessages } from './agents.js'
 import { validateArguments } from './services.js'
 
 function fail(message, code) {
@@ -34,7 +35,7 @@ function assistantMessage(response, calls) {
 }
 
 export class Agent extends Service {
-  static inject = ['model', 'tools', 'session', 'checkpoint', 'prompt', 'permissions', 'workspace']
+  static inject = ['model', 'tools', 'session', 'checkpoint', 'prompt', 'permissions', 'workspace', 'agents']
   constructor(ctx) {
     super(ctx, 'agent')
     this.busy = false
@@ -42,6 +43,9 @@ export class Agent extends Service {
     this.current = null
     this.controller = null
     this.ctx.effect(() => () => this.shutdown())
+    // Expose a DSH-shaped handle so agent/pre-step listeners can read turn/end
+    // facts from the mini-dsh JSONL session via session.snapshotEvents().
+    this.ctx.effect(() => this.ctx.agents.bind(miniAgentHandle(this.ctx.session)))
   }
 
   turn(input, report = () => {}, { approve } = {}) {
@@ -70,20 +74,44 @@ export class Agent extends Service {
   }
 
   async runTurn(input, report, signal, approve) {
-    const { checkpoint, prompt } = this.ctx
+    const { checkpoint, prompt, agents } = this.ctx
     const skillInvocations = await prompt.resolveUserInput(input)
     await checkpoint.commit({ role: 'user', content: input, ...(skillInvocations.length ? { skillInvocations } : {}) })
-    while (!this.stopping) {
-      const message = await this.complete(signal)
-      const calls = message.tool_calls ?? []
-      if (message.content) report({ type: 'assistant', content: message.content })
-      if (!calls.length) return
-      for (let index = 0; index < calls.length; index++) {
-        if (this.stopping) {
-          await this.denyUnstarted(calls.slice(index))
-          return
+    // One agent.turn() is one DSH-style turn; each model complete() is a step.
+    const turn = this.ctx.session.events.filter((event) => event.type === 'turn/end').length + 1
+    let step = 0
+    try {
+      while (!this.stopping) {
+        step += 1
+        const baseline = toPreStepMessages(this.ctx.session.messages)
+        const decision = await agents.runPreStep({ turn, step, signal, messages: baseline })
+        await checkpoint.commit({
+          type: 'agent.pre-step',
+          turn,
+          step,
+          kind: decision.kind,
+          added: decision.kind === 'enter' ? decision.messages.length - baseline.length : 0,
+        })
+        if (decision.kind === 'reject') return
+        for (const message of decision.messages.slice(baseline.length)) {
+          await checkpoint.commit(flattenHookMessage(message))
         }
-        await this.oneCall(calls[index], report, signal, approve)
+        const message = await this.complete(signal)
+        const calls = message.tool_calls ?? []
+        if (message.content) report({ type: 'assistant', content: message.content })
+        if (!calls.length) return
+        for (let index = 0; index < calls.length; index++) {
+          if (this.stopping) {
+            await this.denyUnstarted(calls.slice(index))
+            return
+          }
+          await this.oneCall(calls[index], report, signal, approve)
+        }
+      }
+    } finally {
+      // Durable turn/end for hooks such as dsh-message-datetime's idle-gap reading.
+      if (this.ctx.session.writable) {
+        await checkpoint.commit({ type: 'turn/end', turn, steps: step })
       }
     }
   }
