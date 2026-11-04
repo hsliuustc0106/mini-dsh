@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { boot } from '../src/boot.js'
 import { installPlugin } from '../src/install-plugin.js'
-import { loadProfileEntries, uninstallPlugin } from '../src/live-plugins.js'
+import { CORDIS_PIN, LivePlugins, loadProfileEntries, uninstallPlugin } from '../src/live-plugins.js'
 import { fakeProvider } from '../src/provider.js'
 
 async function packToolPlugin(dir, { name = 'live-tool', tool = 'live_echo' } = {}) {
@@ -162,4 +162,86 @@ test('web install activates without restart and uninstall removes the tool', asy
     assert.equal(removed.status, 200, removedBody.error)
     assert.equal(app.ctx.tools.items.has('web_live_echo'), false)
   } finally { await app.dispose() }
+})
+
+async function writeToolModule(dir, name, tool) {
+  const file = join(dir, `${name}.mjs`)
+  await writeFile(file, `export default {
+  inject: ['tools'],
+  apply(ctx) {
+    ctx.effect(() => ctx.tools.register({
+      name: ${JSON.stringify(tool)},
+      description: 'live',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      execute: () => 'ok',
+    }))
+  },
+}
+`)
+  return file
+}
+
+async function disposeLivePlugins(app) {
+  const runtime = app.ctx.registry.get(LivePlugins)
+  assert.ok(runtime, 'live-plugins runtime missing')
+  for (const fiber of [...runtime.fibers]) await fiber.dispose()
+}
+
+test('disposing livePlugins removes live-mounted tools', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-live-svc-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const workspace = join(dir, 'workspace')
+  await mkdir(workspace)
+  const module = await writeToolModule(dir, 'owned', 'owned_tool')
+  const profile = join(workspace, 'plugins.json')
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'owned', module }] }))
+  const app = await boot({ workspace, provider: fakeProvider([]) })
+  try {
+    await app.ctx.livePlugins.mountAll(await loadProfileEntries(profile, ['owned']))
+    assert.ok(app.ctx.tools.items.has('owned_tool'))
+    await disposeLivePlugins(app)
+    assert.equal(app.ctx.tools.items.has('owned_tool'), false)
+  } finally { await app.dispose() }
+})
+
+test('manual unmount then livePlugins dispose emits one unmounted and does not double-dispose', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-live-once-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const workspace = join(dir, 'workspace')
+  await mkdir(workspace)
+  const module = await writeToolModule(dir, 'once', 'once_tool')
+  const profile = join(workspace, 'plugins.json')
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'once', module }] }))
+  const app = await boot({ workspace, provider: fakeProvider([]) })
+  try {
+    await app.ctx.livePlugins.mountAll(await loadProfileEntries(profile, ['once']))
+    await app.ctx.livePlugins.unmount('once')
+    assert.equal(app.ctx.tools.items.has('once_tool'), false)
+    await disposeLivePlugins(app)
+    const unmounted = app.ctx.session.events.filter((event) => event.type === 'plugin.unmounted' && event.name === 'once')
+    assert.equal(unmounted.length, 1)
+  } finally { await app.dispose() }
+})
+
+test('pins Cordis 4.0.5 fiber internals used by live plugins and boot', async () => {
+  const pkg = JSON.parse(await readFile(new URL('../node_modules/@deepseek-ai/cordis/package.json', import.meta.url)))
+  assert.equal(pkg.version, CORDIS_PIN)
+  const declared = JSON.parse(await readFile(new URL('../package.json', import.meta.url))).dependencies['@deepseek-ai/cordis']
+  assert.equal(declared, CORDIS_PIN)
+  const dir = await mkdtemp(join(tmpdir(), 'mini-live-pin-'))
+  try {
+    const workspace = join(dir, 'workspace')
+    await mkdir(workspace)
+    const module = await writeToolModule(dir, 'pin', 'pin_tool')
+    const profile = join(workspace, 'plugins.json')
+    await writeFile(profile, JSON.stringify({ plugins: [{ name: 'pin', module }] }))
+    const app = await boot({ workspace, provider: fakeProvider([]) })
+    try {
+      const [report] = await app.ctx.livePlugins.mountAll(await loadProfileEntries(profile, ['pin']))
+      assert.equal(report.state, 'active')
+      const listed = app.ctx.livePlugins.list().find((row) => row.name === 'pin')
+      assert.equal(listed.state, 'active')
+      assert.equal(listed.missing.length, 0)
+    } finally { await app.dispose() }
+  } finally { await rm(dir, { recursive: true, force: true }) }
 })

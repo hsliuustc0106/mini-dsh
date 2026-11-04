@@ -4,7 +4,10 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { acquireWriter } from './lock.js'
 
-// Cordis FiberState values from @deepseek-ai/cordis 4.0.5 (const enum, not exported).
+// Cordis 4.0.5 keeps FiberState as a const enum, so the published build does not
+// export the names. live-plugins (like boot.js) pins these numeric values and
+// private fields (`_error`, `inertia`) against @deepseek-ai/cordis@4.0.5 only.
+// Bump Cordis only with a matching update to these constants and the pin test.
 const LOADING = 1
 const UNLOADING = 5
 const STATE_NAME = ['pending', 'loading', 'active', 'failed', 'disposed', 'unloading']
@@ -16,6 +19,8 @@ export const BUILTIN_PLUGIN_NAMES = new Set([
   'runtime-context', 'default-tool-permissions', 'permissions', 'checkpoint', 'tools',
   'prompt', 'model', 'provider', 'session', 'workspace', 'live-plugins',
 ])
+
+export const CORDIS_PIN = '4.0.5'
 
 function statusOf(fiber) {
   if (fiber._error) return 'failed'
@@ -137,6 +142,9 @@ export class LivePlugins extends Service {
 
   constructor(ctx) {
     super(ctx, 'livePlugins')
+    // After init, service `this.ctx` is the root context. Keep the constructing
+    // fiber so live mounts' ctx.effect cleanups run when this service disposes.
+    this.owner = ctx.fiber
     this.mounted = new Map()
   }
 
@@ -144,6 +152,7 @@ export class LivePlugins extends Service {
     for (const entry of started) {
       if (!entry?.name || BUILTIN_PLUGIN_NAMES.has(entry.name)) continue
       if (this.mounted.has(entry.name)) continue
+      // Boot-started fibers stay owned by boot(); live mounts use ctx.effect below.
       this.mounted.set(entry.name, { fiber: entry.fiber, module: entry.module, source: 'boot' })
     }
   }
@@ -168,23 +177,38 @@ export class LivePlugins extends Service {
     if (entry.plugin?.name === 'AgentLoop' || entry.dshAgentLoopModule) {
       throw new Error(`Live mounting the DSH agent loop (${entry.name}) is not supported; restart with it in the profile`)
     }
-    // Mount under the root context so injected services like tools resolve
-    // the same way as boot-time plugins (service method ctx is shadowed).
-    const fiber = this.ctx.root.plugin(entry.plugin, entry.config)
+
+    // Tie the child fiber to this service via the constructing fiber's effect
+    // list: disposing livePlugins runs the cleanup. Manual unmount calls the
+    // same disposer (not fiber.dispose) so service teardown does not double-dispose.
+    // Child plugins still start under root so injected services like tools resolve.
+    let fiber
+    const release = this.owner.effect(() => {
+      fiber = this.ctx.root.plugin(entry.plugin, entry.config)
+      return () => fiber.dispose()
+    }, `live-plugin:${entry.name}`)
+
     try {
       await settle(fiber)
+      // A turn may have started while the fiber was settling; roll back if so.
+      if (this.busy()) {
+        release()
+        throw new Error('Cannot mount plugins while a turn is in progress')
+      }
       const report = describe(entry.name, fiber)
       if (entry.required !== false && report.state !== 'active') {
-        await Promise.resolve(fiber.dispose()).catch(() => {})
+        release()
         await this.record('plugin.failed', { name: entry.name, state: report.state, error: report.error, missing: report.missing })
         const detail = report.error ? `: ${report.error}` : report.missing?.length ? `: waiting for ${report.missing.join(', ')}` : ''
         throw new Error(`Plugin ${entry.name} ${report.state === 'failed' ? 'failed' : `is ${report.state}`}${detail}`)
       }
-      this.mounted.set(entry.name, { fiber, module: entry.module, source: 'live' })
+      this.mounted.set(entry.name, { fiber, release, module: entry.module, source: 'live' })
       await this.record('plugin.mounted', { name: entry.name, state: report.state })
       return report
     } catch (error) {
-      if (!this.mounted.has(entry.name)) await Promise.resolve(fiber.dispose()).catch(() => {})
+      if (!this.mounted.has(entry.name)) {
+        try { release() } catch { /* already released on busy/failed paths */ }
+      }
       throw error
     }
   }
@@ -201,17 +225,18 @@ export class LivePlugins extends Service {
     if (this.busy()) throw new Error('Cannot unmount plugins while a turn is in progress')
     const info = this.mounted.get(name)
     if (!info) throw new Error(`Plugin is not mounted: ${name}`)
-    await Promise.resolve(info.fiber.dispose())
     this.mounted.delete(name)
+    if (info.release) await Promise.resolve(info.release())
+    else await Promise.resolve(info.fiber.dispose())
     await this.record('plugin.unmounted', { name })
     return { name, state: 'disposed' }
   }
 
   async record(type, fields) {
+    // Best-effort: profile/runtime changes still apply if the session append fails.
     if (!this.ctx.session?.writable) return
     try { await this.ctx.session.append({ type, ...fields }) }
     catch (error) {
-      // Profile/runtime changes still apply; the session record is best-effort when writable.
       this.ctx.logger?.warn?.(error) ?? this.ctx.logger?.error?.(error)
     }
   }
