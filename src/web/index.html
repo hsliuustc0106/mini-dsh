@@ -11,8 +11,10 @@
   <main class="app">
     <header class="header"><strong>mini-dsh</strong><span id="workspace"></span><button id="plugins-toggle" type="button" aria-expanded="false" aria-controls="plugins-panel">Plugins</button></header>
     <section id="plugins-panel" class="plugins-panel" aria-label="Install plugin" hidden>
-      <h2>Install a plugin</h2>
-      <p>Enter an npm package or HTTPS GitHub repository URL. Installation can run package code; install only plugins you trust.</p>
+      <h2>Plugins</h2>
+      <ul id="plugin-list" class="plugin-list" aria-live="polite"></ul>
+      <h3>Install a plugin</h3>
+      <p>Enter an npm package or HTTPS GitHub repository URL. Installation can run package code; install only plugins you trust. Compatible plugins activate without a restart.</p>
       <form id="plugins-form">
         <label for="plugin-spec">Package or GitHub URL</label>
         <div class="plugins-input"><input id="plugin-spec" type="text" placeholder="https://github.com/owner/repository" required><button id="plugin-install" type="submit">Install</button></div>
