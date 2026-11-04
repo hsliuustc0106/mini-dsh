@@ -15,7 +15,7 @@ const STATE_NAME = ['pending', 'loading', 'active', 'failed', 'disposed', 'unloa
 const object = (value) => value && typeof value === 'object' && !Array.isArray(value)
 
 export const BUILTIN_PLUGIN_NAMES = new Set([
-  'viewer', 'web-control', 'terminal', 'agent', 'coding', 'skills', 'instructions',
+  'viewer', 'web-control', 'terminal', 'agent', 'agents', 'coding', 'skills', 'instructions',
   'runtime-context', 'default-tool-permissions', 'permissions', 'checkpoint', 'tools',
   'prompt', 'model', 'provider', 'session', 'workspace', 'live-plugins',
 ])

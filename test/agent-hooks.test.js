@@ -6,11 +6,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { boot } from '../src/boot.js'
 import { installPlugin } from '../src/install-plugin.js'
-import { loadProfileEntries } from '../src/live-plugins.js'
+import { loadProfileEntries, uninstallPlugin } from '../src/live-plugins.js'
 import { fakeProvider } from '../src/provider.js'
 import { SUPPORTED_HOOKS } from '../src/agents.js'
 
 const packedDatetime = '/tmp/dsh-message-datetime-0.1.3.tgz'
+
+function projectMessages(messages) {
+  return messages.map((message) => ({ role: message.role, content: message.content }))
+}
 
 async function workspace(t) {
   const dir = await mkdtemp(join(tmpdir(), 'mini-hooks-'))
@@ -177,4 +181,73 @@ test('unmodified dsh-message-datetime injects a reading on a real turn', async (
     const reading = model.sent[0].messages.find((message) => typeof message.content === 'string' && /UTC|GMT|[A-Z][a-z]+day|\d{1,2}:\d{2}/.test(message.content))
     assert.ok(reading, `expected a datetime reading in model messages: ${JSON.stringify(model.sent[0].messages)}`)
   } finally { await app.dispose() }
+})
+
+test('built-in agents cannot be unmounted or uninstalled', async (t) => {
+  const dir = await workspace(t)
+  const app = await boot({ workspace: dir, web: false, provider: fakeProvider([{ role: 'assistant', content: 'hi' }]) })
+  try {
+    await assert.rejects(app.ctx.livePlugins.unmount('agents'), /Built-in plugin cannot be unmounted: agents/)
+    await assert.rejects(uninstallPlugin('agents', dir), /Built-in plugin cannot be uninstalled: agents/)
+  } finally { await app.dispose() }
+})
+
+test('hook-injected content replays from the JSONL log and is not re-run under a different clock', async (t) => {
+  const dir = await workspace(t)
+  const sessionPath = join(dir, 'session.jsonl')
+  await writeFile(join(dir, 'stamp-hook.mjs'), `
+export const inject = ['agents']
+export function apply(ctx, config = {}) {
+  const stamp = config.stamp ?? 'missing'
+  ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next()
+    if (decision.kind !== 'enter' || payload.step !== 1) return decision
+    return { ...decision, messages: [...decision.messages, { role: 'user', content: 'reading@' + stamp }] }
+  }, { prepend: true })
+}
+`)
+  await writeFile(join(dir, 'plugins.json'), JSON.stringify({
+    plugins: [{ name: 'stamp-hook', module: './stamp-hook.mjs', config: { stamp: 'clock-A' } }],
+  }))
+
+  const recorded = fakeProvider([{ role: 'assistant', content: 'noted-A' }])
+  const writer = await boot({
+    workspace: dir,
+    sessionPath,
+    pluginConfig: 'plugins.json',
+    web: false,
+    clock: () => '2026-01-01T00:00:00.000Z',
+    provider: recorded,
+  })
+  let firstProjection
+  try {
+    await writer.ctx.agent.turn('hello')
+    assert.ok(writer.ctx.session.messages.some((message) => message.content === 'reading@clock-A'))
+    assert.ok(recorded.sent[0].messages.some((message) => message.content === 'reading@clock-A'))
+    firstProjection = projectMessages(writer.ctx.session.messages)
+  } finally { await writer.dispose() }
+
+  // Replay: reopen the same log with a different clock and a hook config that
+  // would inject clock-B if the hook re-ran. Projection must stay identical.
+  await writeFile(join(dir, 'plugins.json'), JSON.stringify({
+    plugins: [{ name: 'stamp-hook', module: './stamp-hook.mjs', config: { stamp: 'clock-B' } }],
+  }))
+  const reader = await boot({
+    workspace: dir,
+    sessionPath,
+    pluginConfig: 'plugins.json',
+    web: false,
+    writable: false,
+    clock: () => '2026-06-15T12:00:00.000Z',
+    provider: fakeProvider([]),
+  })
+  try {
+    assert.equal(reader.report.find((entry) => entry.name === 'stamp-hook').state, 'active')
+    assert.deepEqual(projectMessages(reader.ctx.session.messages), firstProjection)
+    assert.equal(reader.ctx.session.messages.some((message) => message.content === 'reading@clock-B'), false)
+    assert.ok(reader.ctx.session.messages.some((message) => message.content === 'reading@clock-A'))
+    assert.ok(reader.ctx.session.events.some((event) => event.type === 'turn/end'))
+    // Event times stay from the recording clock, not the replay clock.
+    assert.ok(reader.ctx.session.events.every((event) => event.time === '2026-01-01T00:00:00.000Z'))
+  } finally { await reader.dispose() }
 })

@@ -1,5 +1,15 @@
 import { Service } from '@deepseek-ai/cordis'
 
+
+/** Project mini-dsh JSONL turn/end events for DSH-style idle-gap readers. */
+export function snapshotTurnEnds(events) {
+  return events.flatMap((event) => {
+    if (event.type !== 'turn/end') return []
+    const time = Date.parse(event.time)
+    return Number.isFinite(time) ? [{ type: 'turn/end', time }] : []
+  })
+}
+
 /** Hook names mini-dsh dispatches on its own agent loop. */
 export const SUPPORTED_HOOKS = Object.freeze(['agent/pre-step'])
 
@@ -45,6 +55,18 @@ function samePrefix(baseline, messages) {
   return true
 }
 
+/** DSH-shaped handle whose session.snapshotEvents reads mini-dsh JSONL turn/end facts. */
+export function miniAgentHandle(session, id = 'mini-dsh') {
+  return {
+    id,
+    get session() {
+      return {
+        snapshotEvents: () => snapshotTurnEnds(session.events),
+      }
+    },
+  }
+}
+
 /**
  * Lean DSH-compatible `agents` service over mini-dsh's own loop and JSONL session.
  * Plugins inject this service and may register `agent/pre-step` via Cordis `ctx.on`
@@ -71,21 +93,7 @@ export class Agents extends Service {
   }
 
   defaultHandle() {
-    const session = this.ctx.session
-    return {
-      id: 'mini-dsh',
-      get session() {
-        return {
-          snapshotEvents() {
-            return session.events.flatMap((event) => {
-              if (event.type !== 'turn/end') return []
-              const time = Date.parse(event.time)
-              return Number.isFinite(time) ? [{ type: 'turn/end', time }] : []
-            })
-          },
-        }
-      },
-    }
+    return miniAgentHandle(this.ctx.session)
   }
 
   list() {

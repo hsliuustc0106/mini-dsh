@@ -1,6 +1,6 @@
 import { Service } from '@deepseek-ai/cordis'
 import { completeFinish, observeStream, unknownReason } from './log.js'
-import { flattenHookMessage, toPreStepMessages } from './agents.js'
+import { flattenHookMessage, miniAgentHandle, toPreStepMessages } from './agents.js'
 import { validateArguments } from './services.js'
 
 function fail(message, code) {
@@ -45,16 +45,7 @@ export class Agent extends Service {
     this.ctx.effect(() => () => this.shutdown())
     // Expose a DSH-shaped handle so agent/pre-step listeners can read turn/end
     // facts from the mini-dsh JSONL session via session.snapshotEvents().
-    this.ctx.effect(() => this.ctx.agents.bind({
-      id: 'mini-dsh',
-      session: {
-        snapshotEvents: () => this.ctx.session.events.flatMap((event) => {
-          if (event.type !== 'turn/end') return []
-          const time = Date.parse(event.time)
-          return Number.isFinite(time) ? [{ type: 'turn/end', time }] : []
-        }),
-      },
-    }))
+    this.ctx.effect(() => this.ctx.agents.bind(miniAgentHandle(this.ctx.session)))
   }
 
   turn(input, report = () => {}, { approve } = {}) {

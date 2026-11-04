@@ -130,7 +130,7 @@ This is a small compatibility subset: DSH tools may return lossless JSON, includ
 
 ### DSH agent services and hooks
 
-The `agents` Cordis service satisfies plugins that inject `agents`. It exposes a single mini-dsh handle (`id: mini-dsh`) whose `session.snapshotEvents()` projects JSONL `turn/end` events for idle-gap readers. Supported hook: `agent/pre-step` only (waterfall). Unsupported semantics throw: other hook names via `agents.on`, factory APIs, and pre-step decisions that replace or shorten the baseline message list. Pre-step baselines are presented with a DSH-shaped `source` so unmodified readers such as `dsh-message-datetime` do not crash on plain history messages. This adapter does not replace the mini-dsh loop with the DSH loop; see the agent-loop bridge below for that path.
+The `agents` Cordis service satisfies plugins that inject `agents`. It exposes a single mini-dsh handle (`id: mini-dsh`) whose `session.snapshotEvents()` projects JSONL `turn/end` events for idle-gap readers. A recorded `turn/end` means that turn ended (completed, rejected at pre-step, or shut down), not that it succeeded. Supported hook: `agent/pre-step` only (waterfall). Unsupported semantics throw: other hook names via `agents.on`, factory APIs, and pre-step decisions that replace or shorten the baseline message list. Pre-step baselines are presented with a DSH-shaped `source` so unmodified readers such as `dsh-message-datetime` do not crash on plain history messages. This adapter does not replace the mini-dsh loop with the DSH loop; see the agent-loop bridge below for that path.
 
 ### DSH agent-loop bridge
 
