@@ -4,7 +4,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { access, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { installPlugin, npmInstallError } from '../src/install-plugin.js'
+import { assertPackageCompatible, evaluateJsExpression, installPlugin, npmInstallError, satisfiesVersion } from '../src/install-plugin.js'
 import { boot } from '../src/boot.js'
 import { fakeProvider } from '../src/provider.js'
 import { pluginInstallSpec } from '../src/web-control.js'
@@ -48,13 +48,14 @@ test('install a DSH bundle and boot its tool with default deny', async (t) => {
   assert.equal(await readFile(result.configPath, 'utf8'), before)
 })
 
-test('unsupported bundle patch ops and unknown replace targets leave the profile unchanged', async (t) => {
+test('unknown replace/remove targets and isolate leave the profile unchanged', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'mini-install-test-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const workspace = join(dir, 'workspace'); await mkdir(workspace)
   for (const [name, patch, pattern] of [
-    ['bad-remove', '- remove:\n    - existing\n', /Unsupported bundle patch operation: remove/],
+    ['bad-remove', '- remove:\n    - existing\n', /removes unknown plugin id: existing/],
     ['bad-replace', '- id: missing\n  config: {}\n', /unknown plugin id: missing/],
+    ['bad-isolate', '- insert:\n    - id: g\n      name: cordis:group\n      group: true\n      isolate:\n        shell: true\n      config:\n        - id: child\n          name: bad-isolate\n', /isolate realms are not implemented/],
   ]) {
     const pkg = join(dir, name); await mkdir(pkg)
     await writeFile(join(pkg, 'package.json'), JSON.stringify({ name, version: '1.0.0', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
@@ -66,16 +67,37 @@ test('unsupported bundle patch ops and unknown replace targets leave the profile
   await assert.rejects(readFile(join(workspace, '.mini-dsh/plugins.json')), { code: 'ENOENT' })
 })
 
-test('DSH-specific YAML tags are rejected rather than converted to strings', async (t) => {
+test('teaching-scoped !!js evaluates at install time; Loader ctx expressions fail closed', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'mini-install-tag-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
-  await writeFile(join(dir, 'package.json'), JSON.stringify({ name: 'tag-bundle', version: '1.0.0', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
-  await writeFile(join(dir, 'index.js'), 'export function apply() {}')
-  await writeFile(join(dir, 'patch.yml'), "- insert:\n    - id: tagged\n      name: tag-bundle\n      config:\n        root: !!js dshHomePath('speech-to-text')\n")
-  const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: dir, encoding: 'utf8' }).trim()
   const workspace = join(dir, 'workspace'); await mkdir(workspace)
-  await assert.rejects(installPlugin(join(dir, archive), workspace), /Unsupported or invalid bundle YAML/)
-  await assert.rejects(readFile(join(workspace, '.mini-dsh/plugins.json')), { code: 'ENOENT' })
+  const ok = join(dir, 'ok'); await mkdir(ok)
+  await writeFile(join(ok, 'package.json'), JSON.stringify({ name: 'tag-bundle', version: '1.0.0', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
+  await writeFile(join(ok, 'index.js'), 'export function apply() {}')
+  await writeFile(join(ok, 'patch.yml'), `- insert:
+    - id: tagged
+      name: tag-bundle
+      disabled: !!js process.platform === 'not-a-real-platform'
+      config:
+        root: !!js dshHomePath('speech-to-text')
+        cwd: !!js process.cwd()
+`)
+  const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: ok, encoding: 'utf8' }).trim()
+  const result = await installPlugin(join(dir, archive), workspace)
+  assert.deepEqual(result.names, ['tagged'])
+  const row = JSON.parse(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8')).plugins.find((item) => item.name === 'tagged')
+  assert.equal(row.enabled, undefined)
+  assert.match(row.config.root, /speech-to-text$/)
+  assert.equal(row.config.cwd, process.cwd())
+
+  const bad = join(dir, 'bad'); await mkdir(bad)
+  await writeFile(join(bad, 'package.json'), JSON.stringify({ name: 'bad-js', version: '1.0.0', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
+  await writeFile(join(bad, 'index.js'), 'export function apply() {}')
+  await writeFile(join(bad, 'patch.yml'), "- insert:\n    - id: tagged\n      name: bad-js\n      config:\n        flag: !!js \"!ctx.get('profileContext')\"\n")
+  const badArchive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: bad, encoding: 'utf8' }).trim()
+  const before = await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8')
+  await assert.rejects(installPlugin(join(dir, badArchive), workspace), /Unsupported !!js expression/)
+  assert.equal(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8'), before)
 })
 
 test('installs an import-only package entry point', async (t) => {
@@ -231,4 +253,164 @@ test('peer dependency conflicts fail closed without force or legacy-peer-deps', 
   assert.equal(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8'), before)
   const stages = await readdir(join(workspace, '.mini-dsh'))
   assert.equal(stages.some((name) => name.startsWith('.install-')), false)
+})
+
+test('same-install remove and multi-file layering update earlier layers only', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-install-layer-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const pkg = join(dir, 'package'), workspace = join(dir, 'workspace')
+  await mkdir(pkg); await mkdir(workspace)
+  await writeFile(join(pkg, 'package.json'), JSON.stringify({
+    name: 'layer-bundle', version: '1.0.0', type: 'module', main: 'index.js',
+    dsh: { bundle: { patch: ['base.yml', 'overlay.yml'] } },
+  }))
+  await writeFile(join(pkg, 'index.js'), 'export function apply() {}')
+  await writeFile(join(pkg, 'base.yml'), `- insert:
+    - id: keep
+      name: layer-bundle
+      config:
+        mode: base
+    - id: drop
+      name: layer-bundle
+    - id: grouped
+      name: cordis:group
+      group: true
+      config:
+        - id: child
+          name: layer-bundle
+          config:
+            role: child
+`)
+  await writeFile(join(pkg, 'overlay.yml'), `- id: keep
+  config:
+    mode: overlay
+- remove:
+    - drop
+`)
+  const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()
+  const result = await installPlugin(join(dir, archive), workspace)
+  assert.deepEqual(result.names.sort(), ['child', 'keep'])
+  const profile = JSON.parse(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8'))
+  assert.equal(profile.plugins.find((row) => row.name === 'keep').config.mode, 'overlay')
+  assert.equal(profile.plugins.find((row) => row.name === 'drop'), undefined)
+  assert.equal(profile.plugins.find((row) => row.name === 'child').config.role, 'child')
+})
+
+test('remove cannot delete a pre-existing profile row from another package', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-install-remove-cross-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const first = join(dir, 'first'), second = join(dir, 'second'), workspace = join(dir, 'workspace')
+  await mkdir(first); await mkdir(second); await mkdir(workspace)
+  await writeFile(join(first, 'package.json'), JSON.stringify({ name: 'remove-first', version: '1.0.0', type: 'module', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
+  await writeFile(join(first, 'patch.yml'), '- insert:\n    - id: example\n      name: remove-first\n')
+  await writeFile(join(first, 'index.js'), 'export function apply() {}')
+  const firstArchive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: first, encoding: 'utf8' }).trim()
+  await installPlugin(join(dir, firstArchive), workspace)
+  const before = await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8')
+  await writeFile(join(second, 'package.json'), JSON.stringify({ name: 'remove-second', version: '1.0.0', type: 'module', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
+  await writeFile(join(second, 'patch.yml'), '- remove:\n    - example\n')
+  await writeFile(join(second, 'index.js'), 'export function apply() {}')
+  const secondArchive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: second, encoding: 'utf8' }).trim()
+  await assert.rejects(installPlugin(join(dir, secondArchive), workspace), /cannot remove pre-existing plugin id: example/)
+  assert.equal(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8'), before)
+})
+
+test('nested preset config.plugins are kept as config; nested group fails closed', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-install-preset-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const pkg = join(dir, 'package'), workspace = join(dir, 'workspace')
+  await mkdir(pkg); await mkdir(workspace)
+  await writeFile(join(pkg, 'package.json'), JSON.stringify({ name: 'preset-host', version: '1.0.0', type: 'module', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
+  await writeFile(join(pkg, 'index.js'), 'export function apply() {}')
+  await writeFile(join(pkg, 'patch.yml'), `- insert:
+    - id: preset
+      name: preset-host
+      config:
+        id: demo
+        plugins:
+          - id: persona
+            name: preset-host
+            config:
+              prefix: hi
+`)
+  const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()
+  const result = await installPlugin(join(dir, archive), workspace)
+  assert.deepEqual(result.names, ['preset'])
+  const row = JSON.parse(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8')).plugins.find((item) => item.name === 'preset')
+  assert.equal(row.config.id, 'demo')
+  assert.equal(row.config.plugins[0].id, 'persona')
+
+  const bad = join(dir, 'bad'); await mkdir(bad)
+  await writeFile(join(bad, 'package.json'), JSON.stringify({ name: 'preset-bad', version: '1.0.0', type: 'module', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
+  await writeFile(join(bad, 'index.js'), 'export function apply() {}')
+  await writeFile(join(bad, 'patch.yml'), `- insert:
+    - id: preset
+      name: preset-bad
+      config:
+        plugins:
+          - id: shell
+            name: cordis:group
+            group: true
+            config: []
+`)
+  const badArchive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: bad, encoding: 'utf8' }).trim()
+  const before = await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8')
+  await assert.rejects(installPlugin(join(dir, badArchive), workspace), /group\/isolate inside nested presets are not implemented/)
+  assert.equal(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8'), before)
+})
+
+test('version/compat checks reject malformed engines.dsh and DSH client peers', async (t) => {
+  assert.equal(satisfiesVersion('0.1.0', '^0.1.0'), true)
+  assert.equal(satisfiesVersion('0.1.0', '^1.0.0'), false)
+  assert.equal(evaluateJsExpression("process.platform === 'linux'") === (process.platform === 'linux'), true)
+  assert.throws(() => evaluateJsExpression('ctx.pluginPackages'), /Unsupported !!js expression/)
+  assert.throws(
+    () => assertPackageCompatible({ name: 'x', engines: { dsh: 'workspace:^' } }, '0.1.0'),
+    /invalid engines\.dsh/,
+  )
+  // Ordinary DSH engines.dsh ranges are not refused against mini-dsh's teaching runtime id.
+  assert.doesNotThrow(() => assertPackageCompatible({ name: 'tool', engines: { dsh: '>=0.2.0-rc.2' } }, '0.1.0'))
+  assert.throws(
+    () => assertPackageCompatible({
+      name: 'desktopish',
+      peerDependencies: { '@deepseek-ai/dsh-client-runtime': '*' },
+    }),
+    /DSH client peers unsupported/,
+  )
+  const dir = await mkdtemp(join(tmpdir(), 'mini-install-compat-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const pkg = join(dir, 'package'), workspace = join(dir, 'workspace')
+  await mkdir(pkg); await mkdir(join(workspace, '.mini-dsh'), { recursive: true })
+  await writeFile(join(workspace, '.mini-dsh/plugins.json'), JSON.stringify({ plugins: [{ name: 'keep-me', module: './keep.js' }] }, null, 2) + '\n')
+  const before = await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8')
+  await writeFile(join(pkg, 'package.json'), JSON.stringify({
+    name: 'compat-fail', version: '1.0.0', type: 'module', main: 'index.js',
+    peerDependencies: { '@deepseek-ai/dsh-client-runtime': '*', '@deepseek-ai/dsh-client-ui-slots': '*' },
+    dsh: { bundle: { patch: 'patch.yml' } },
+  }))
+  await writeFile(join(pkg, 'index.js'), 'export function apply() {}')
+  await writeFile(join(pkg, 'patch.yml'), '- insert:\n    - id: x\n      name: compat-fail\n')
+  // Local directory preflight refuses client peers before npm.
+  await assert.rejects(installPlugin(pkg, workspace), /DSH client peers unsupported/)
+  assert.equal(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8'), before)
+})
+
+test('desktop-shaped bundle patch installs when peers resolve; real desktop peers stay fail-closed', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-install-desktop-path-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const pkg = join(dir, 'package'), workspace = join(dir, 'workspace')
+  await mkdir(pkg); await mkdir(workspace)
+  // Mirrors @mixian/dsh-desktop-plugin@0.1.3 patch shape with satisfiable peers.
+  await writeFile(join(pkg, 'package.json'), JSON.stringify({
+    name: 'desktop-shaped', version: '1.0.0', type: 'module', main: 'index.js',
+    dsh: { bundle: { patch: './cordis.patch.yml' } },
+  }))
+  await writeFile(join(pkg, 'index.js'), 'export function apply() {}')
+  await writeFile(join(pkg, 'cordis.patch.yml'), `- insert:
+    - id: dsh-desktop-plugin
+      name: 'desktop-shaped'
+`)
+  const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()
+  const result = await installPlugin(join(dir, archive), workspace)
+  assert.deepEqual(result.names, ['dsh-desktop-plugin'])
 })
