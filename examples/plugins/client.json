@@ -1,0 +1,5 @@
+{
+  "plugins": [
+    { "name": "header-action", "module": "./header-action.mjs" }
+  ]
+}
