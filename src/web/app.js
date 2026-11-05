@@ -155,6 +155,59 @@ function node(tag, className, text) {
   return element
 }
 
+// Shell surfaces for the client slot projection. Names match src/ui-slots.js.
+const clientSurfaces = [
+  ['client-slots', 'conversation.session.header.actions'],
+  ['client-dock', 'conversation.input.dock'],
+  ['client-activity', 'conversation.input.activity'],
+]
+const clientTags = new Set(['button', 'span', 'div', 'p'])
+const clientEnabled = clientSurfaces.some(([id]) => get(id))
+
+function domFrom(value) {
+  if (!value || typeof value !== 'object') return []
+  if (value.type === 'text') return [document.createTextNode(String(value.text ?? ''))]
+  if (value.type === 'fragment') return (value.children ?? []).flatMap((child) => domFrom(child))
+  if (!clientTags.has(value.type)) return []
+  const element = document.createElement(value.type)
+  const props = value.props ?? {}
+  if (typeof props.className === 'string') element.className = props.className
+  if (typeof props['aria-label'] === 'string') element.setAttribute('aria-label', props['aria-label'])
+  if (typeof props.title === 'string') element.title = props.title
+  if (props.disabled === true) element.disabled = true
+  if (value.type === 'button') element.type = 'button'
+  for (const child of value.children ?? []) element.append(...domFrom(child))
+  return [element]
+}
+
+function paintClient(payload) {
+  const slots = payload?.slots ?? {}
+  for (const [id, name] of clientSurfaces) {
+    const root = get(id)
+    if (!root) continue
+    const slot = slots[name]
+    const nodes = Array.isArray(slot?.nodes) ? slot.nodes : []
+    const errors = Array.isArray(slot?.errors) ? slot.errors : []
+    root.replaceChildren()
+    if (!nodes.length && !errors.length) {
+      root.hidden = true
+      continue
+    }
+    root.hidden = false
+    for (const item of nodes) root.append(...domFrom(item?.node))
+    for (const error of errors) root.append(node('span', 'client-slot-error', error?.error || 'Unsupported contribution'))
+  }
+}
+
+async function refreshClientUi() {
+  if (!clientEnabled) return
+  try {
+    const response = await fetch('/client-ui')
+    if (!response.ok) return
+    paintClient(await response.json())
+  } catch { /* the host page stays usable when the client projection is unavailable */ }
+}
+
 function completeFinish(finish) {
   return COMPLETE_FINISH.has(finish)
 }
@@ -738,6 +791,11 @@ source.addEventListener('hello', (event) => {
   message = ''
   scheduleTimeline()
   scheduleRender()
+  refreshClientUi()
+})
+source.addEventListener('client-ui', (event) => {
+  try { paintClient(JSON.parse(event.data)) }
+  catch { /* ignore a malformed client projection */ }
 })
 source.addEventListener('state', (event) => { status = JSON.parse(event.data); scheduleTimeline(); scheduleRender() })
 source.addEventListener('approval', (event) => { pending = JSON.parse(event.data).pending; scheduleRender() })
@@ -763,4 +821,5 @@ source.addEventListener('gap', (event) => {
   scheduleRender()
 })
 source.onerror = () => { connection = null; pending = null; scheduleRender() }
+refreshClientUi()
 render()

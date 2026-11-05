@@ -5,6 +5,7 @@ import { Service } from '@deepseek-ai/cordis'
 import { project } from './trajectory.js'
 import { installPlugin } from './install-plugin.js'
 import { BUILTIN_PLUGIN_NAMES, loadProfileEntries, readPluginProfile, uninstallPlugin } from './live-plugins.js'
+import { ClientHost, loadClientProfile } from './client-plugins.js'
 
 const HOST = '127.0.0.1'
 const MAX_BODY = 1024 * 1024
@@ -80,6 +81,8 @@ export class WebControl extends Service {
     if (config.host != null && config.host !== HOST) throw new Error('Web control listens on 127.0.0.1 only')
     this.port = config.port ?? 0
     this.pluginConfig = config.pluginConfig
+    this.clientPlugins = config.clientPlugins
+    this.client = null
     this.installing = false
     this.changing = false
     if (!Number.isInteger(this.port) || this.port < 0 || this.port > 65535) throw new Error('Web control port is invalid')
@@ -93,7 +96,23 @@ export class WebControl extends Service {
     this.ctx.effect(() => () => this.close(), 'web-control')
   }
 
+  broadcastClient() {
+    if (this.closed || !this.client || this.client.disposed) return
+    const data = JSON.stringify(this.client.view())
+    for (const res of this.clients.values()) this.emit(res, 'client-ui', data)
+  }
+
   async [Service.init]() {
+    this.client = new ClientHost()
+    this.ctx.effect(() => () => this.client?.dispose(), 'client-plugins')
+    await this.client.start()
+    const entries = await loadClientProfile({
+      pluginConfig: this.pluginConfig,
+      workspace: this.ctx.workspace.root,
+      clientPlugins: this.clientPlugins,
+    })
+    await this.client.mountAll(entries)
+    this.ctx.effect(() => this.client.slots.subscribe(() => this.broadcastClient()), 'client-ui')
     const files = await Promise.all(['index.html', 'style.css', 'app.js'].map((name) => readFile(new URL(`./web/${name}`, import.meta.url))))
     this.files = new Map([
       ['/', ['text/html; charset=utf-8', files[0]]],
@@ -187,6 +206,9 @@ export class WebControl extends Service {
         plugins.push({ name: entry.name, state: entry.enabled === false ? 'disabled' : 'not mounted', source: 'profile' })
       }
       return json(res, 200, { plugins })
+    }
+    if (req.method === 'GET' && url.pathname === '/client-ui') {
+      return json(res, 200, this.client.view())
     }
     if (req.method !== 'POST' || !['/turn', '/approval', '/plugins/install', '/plugins/uninstall'].includes(url.pathname)) {
       return send(res, 404, 'text/plain; charset=utf-8', 'Not found\n')

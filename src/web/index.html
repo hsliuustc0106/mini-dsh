@@ -9,7 +9,7 @@
 </head>
 <body>
   <main class="app">
-    <header class="header"><strong>mini-dsh</strong><span id="workspace"></span><button id="plugins-toggle" type="button" aria-expanded="false" aria-controls="plugins-panel">Plugins</button></header>
+    <header class="header"><strong>mini-dsh</strong><span id="workspace"></span><div id="client-slots" class="client-slots" hidden></div><button id="plugins-toggle" type="button" aria-expanded="false" aria-controls="plugins-panel">Plugins</button></header>
     <section id="plugins-panel" class="plugins-panel" aria-label="Install plugin" hidden>
       <h2>Plugins</h2>
       <ul id="plugin-list" class="plugin-list" aria-live="polite"></ul>
@@ -35,11 +35,13 @@
       <ol id="events" class="events"></ol>
     </section>
     <p id="notice" class="notice" role="status"></p>
+    <div id="client-dock" class="client-dock" hidden></div>
     <div class="composer">
       <label class="sr-only" for="prompt">Message mini-dsh</label>
       <textarea id="prompt" rows="2" placeholder="Message mini-dsh…" disabled></textarea>
       <div class="composer-footer">
         <span id="hint">Connecting…</span>
+        <div id="client-activity" class="client-activity" hidden></div>
         <button id="send" class="send" type="button" aria-label="Send prompt" disabled>↑</button>
       </div>
     </div>

@@ -18,7 +18,14 @@ body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 ui-s
 .header strong { font-size: 18px; }
 .header span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .header button, .plugins-panel button { border: 1px solid var(--border); border-radius: 7px; padding: 7px 12px; background: var(--card); color: var(--text); font: inherit; cursor: pointer; }
-.header button { margin-left: auto; }
+.header > button { margin-left: auto; }
+.client-slots, .client-dock, .client-activity { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.header > .client-slots:not([hidden]) { margin-left: auto; }
+.header > .client-slots:not([hidden]) + button { margin-left: 8px; }
+.client-slots button, .client-dock button, .client-activity button { border: 1px solid var(--border); border-radius: 7px; padding: 7px 12px; background: var(--card); color: var(--text); font: inherit; cursor: pointer; }
+.client-dock, .client-activity { margin: 0 20px 8px; }
+.client-activity { margin: 0; }
+.client-slot-error { color: var(--warning-text); font-size: 12px; }
 .plugins-panel { margin: 4px 20px 12px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); }
 .plugins-panel h2 { margin: 0; font-size: 15px; }
 .plugins-panel p { margin: 6px 0 10px; color: var(--muted); font-size: 12px; }
@@ -93,7 +100,7 @@ button:disabled { opacity: .4; cursor: default; }
   .header, .content { padding-left: 14px; padding-right: 14px; }
   .header { display: grid; gap: 0; }
   .tabs { padding: 0 14px; }
-  .composer { margin-left: 14px; margin-right: 14px; }
+  .composer, .client-dock { margin-left: 14px; margin-right: 14px; }
   .events summary { grid-template-columns: minmax(64px, max-content) 1fr; }
   .events summary span:last-child { grid-column: 2; }
   .actions button, .send, .activity-toggle { min-height: 40px; }
