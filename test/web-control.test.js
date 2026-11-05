@@ -423,8 +423,17 @@ test('web trajectory follows the session log for an open ask and a shortened log
     const approval = client.events.find((event) => event.type === 'approval' && event.data.pending).data.pending
     assert.equal((await request(run.url, '/approval', { method: 'POST', data: { connection, id: approval.id, decision: 'allow' } })).status, 200)
     await client.wait('session', (event) => event.type === 'message' && event.message.content === 'Wrote hello.txt.')
-    const saved = run.app.ctx.session.events.slice()
-    const followed = client.events.filter((event) => event.type === 'session').map((event) => event.data)
+    // turn/end is committed in the turn's finally, after this message is published.
+    // The in-memory log can already include it before that SSE frame is parsed.
+    const { saved, followed } = await until(() => {
+      if (run.app.ctx.agent.busy) return null
+      const events = run.app.ctx.session.events
+      const tip = events.at(-1)
+      if (tip?.type !== 'turn/end') return null
+      const streamed = client.events.filter((event) => event.type === 'session').map((event) => event.data)
+      if (streamed.length !== events.length || streamed.at(-1)?.seq !== tip.seq) return null
+      return { saved: events.slice(), followed: streamed.slice() }
+    })
     const disk = (await readFile(run.app.sessionPath, 'utf8')).trim().split('\n').map(JSON.parse)
     assert.deepEqual(followed, saved)
     assert.deepEqual(disk, saved)
