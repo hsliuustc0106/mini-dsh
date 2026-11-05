@@ -1,6 +1,7 @@
 import { Service } from '@deepseek-ai/cordis'
 import { readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { applyWorkspacePluginConfig } from './workspace-path.js'
 import { pathToFileURL } from 'node:url'
 import { acquireWriter } from './lock.js'
 
@@ -164,7 +165,7 @@ export async function uninstallPlugin(name, workspace, options = {}) {
 // Tracks profile/runtime plugins so install can mount and uninstall can dispose
 // without a process restart. Built-ins stay owned by boot().
 export class LivePlugins extends Service {
-  static inject = ['session', 'agent']
+  static inject = ['session', 'agent', 'workspace']
 
   constructor(ctx) {
     super(ctx, 'livePlugins')
@@ -239,9 +240,15 @@ export class LivePlugins extends Service {
     // list: disposing livePlugins runs the cleanup. Manual unmount calls the
     // same disposer (not fiber.dispose) so service teardown does not double-dispose.
     // Child plugins still start under root so injected services like tools resolve.
+    const workspaceRoot = this.ctx.workspace?.root
+    if (typeof workspaceRoot !== 'string' || !isAbsolute(workspaceRoot)) {
+      throw new Error('Workspace must be an absolute path')
+    }
+    const config = applyWorkspacePluginConfig(entry.config, workspaceRoot)
+
     let fiber
     const release = this.owner.effect(() => {
-      fiber = this.ctx.root.plugin(entry.plugin, entry.config)
+      fiber = this.ctx.root.plugin(entry.plugin, config)
       return () => fiber.dispose()
     }, `live-plugin:${entry.name}`)
 

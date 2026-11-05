@@ -3,6 +3,7 @@ import { deepFreeze, snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import Ajv from 'ajv'
 import { appendFile, mkdir, open, readFile, truncate } from 'node:fs/promises'
 import { dirname, isAbsolute } from 'node:path'
+import { resolveAgainstWorkspace } from './workspace-path.js'
 import { acquireWriter, lockPathFor } from './lock.js'
 import { assertEvent, createEvent, readSession, unknownOutcomes, unknownReason, unknownStreams } from './log.js'
 
@@ -135,6 +136,10 @@ export class Workspace extends Service {
     super(ctx, 'workspace')
     if (typeof config?.root !== 'string' || !isAbsolute(config.root)) throw new Error('Workspace must be an absolute path')
     this.root = config.root
+  }
+  // Relative paths join this.root; absolute paths pass through. Never process.cwd().
+  resolve(path, label = 'path') {
+    return resolveAgainstWorkspace(this.root, path, label)
   }
 }
 

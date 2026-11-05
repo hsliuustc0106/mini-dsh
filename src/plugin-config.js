@@ -1,5 +1,7 @@
 import { readFile } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
+import { BUILTIN_PLUGIN_NAMES } from './live-plugins.js'
+import { applyWorkspacePluginConfig } from './workspace-path.js'
 import { pathToFileURL } from 'node:url'
 
 const fields = new Set(['name', 'enabled', 'module', 'export', 'config', 'required', 'before'])
@@ -107,6 +109,21 @@ export async function configurePlugins(entries, file, workspace) {
         target.dshAgentLoopModule = item.path
       }
     }
+  }
+  // Installed/profile plugins get workDir from the boot workspace (never cwd).
+  // Built-ins keep their composition config unless they set workDir explicitly.
+  if (typeof workspace !== 'string' || !workspace || !isAbsolute(workspace)) {
+    throw new Error('Workspace must be an absolute path')
+  }
+  for (const entry of result) {
+    // The agent-loop bridge rejects any config object with keys; never force workDir onto it.
+    if (BUILTIN_PLUGIN_NAMES.has(entry.name) || entry.dshAgentLoopModule || entry.plugin?.name === 'AgentLoop') {
+      if (entry.config && Object.hasOwn(entry.config, 'workDir')) {
+        entry.config = applyWorkspacePluginConfig(entry.config, workspace)
+      }
+      continue
+    }
+    entry.config = applyWorkspacePluginConfig(entry.config, workspace)
   }
   return result
 }
