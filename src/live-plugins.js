@@ -91,6 +91,28 @@ export async function readPluginProfile(configPath) {
   return config
 }
 
+async function writePluginProfile(configPath, config) {
+  if (!object(config) || Object.keys(config).some((key) => key !== 'plugins') || !Array.isArray(config.plugins)) {
+    throw new Error(`Invalid plugin configuration: ${configPath}`)
+  }
+  const temp = join(dirname(configPath), `.plugins-update-${process.pid}-${randomUUID()}.json`)
+  await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx' })
+  try { await rename(temp, configPath) }
+  catch (error) { await rm(temp, { force: true }); throw error }
+}
+
+// Holds the same profile lock as install and uninstall. `action` may call
+// `commit` more than once (apply, then restore). The lock is released after
+// the action settles, including activation done inside the callback.
+export async function withPluginProfile(configPath, action) {
+  if (!isAbsolute(configPath)) throw new Error('Plugin config path must be absolute')
+  const lock = await lockProfile(configPath)
+  try {
+    const config = await readPluginProfile(configPath)
+    return await action(config, (next) => writePluginProfile(configPath, next))
+  } finally { lock.release() }
+}
+
 export function requireInspectedProfile(config, live) {
   for (const entry of config.plugins) {
     if (entry.enabled !== false && !BUILTIN_PLUGIN_NAMES.has(entry.name) && !live?.mounted.has(entry.name) && !live?.activeAgentLoops.has(entry.name)) {
@@ -265,6 +287,12 @@ export class LivePlugins extends Service {
     const ownToken = this.beginChange()
     try { return await action(ownToken) }
     finally { this.endChange(ownToken) }
+  }
+
+  // True when `fiber` is this plugin or a plugin it started.
+  ownsFiber(name, fiber) {
+    const info = this.mounted.get(name)
+    return Boolean(info?.fiber && fiber && fiberOwns(info.fiber, fiber))
   }
 
   // Services registered under this plugin's fiber (including nested Service plugins).

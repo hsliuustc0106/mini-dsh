@@ -33,6 +33,9 @@ export class Permissions extends Service {
     super(ctx, 'permissions')
     this.ask = config?.ask
     this.policies = new Map()
+    // User-facing overrides sit above plugin and default registrations. A
+    // missing policy is still a denial; an overlay never appears on its own.
+    this.overlays = new Map()
   }
 
   // Plugins own their registrations through ctx.effect. A missing policy is
@@ -46,14 +49,42 @@ export class Permissions extends Service {
     return () => { if (this.policies.get(name) === entry) this.policies.delete(name) }
   }
 
+  // A reversible user override. The caller disposes it with ctx.effect. It does
+  // not remove the plugin or default registration underneath.
+  overlay(name, decision) {
+    if (typeof name !== 'string' || !name) throw new Error('Permission tool name is required')
+    if (!['allow', 'ask', 'deny'].includes(decision)) throw new Error(`Invalid permission for ${name}`)
+    const stack = this.overlays.get(name) ?? []
+    if (!this.overlays.has(name)) this.overlays.set(name, stack)
+    const entry = { decision }
+    stack.push(entry)
+    return () => {
+      const current = this.overlays.get(name)
+      if (!current) return
+      const index = current.lastIndexOf(entry)
+      if (index >= 0) current.splice(index, 1)
+      if (!current.length) this.overlays.delete(name)
+    }
+  }
+
+  effective(name) {
+    const overlay = this.overlays.get(name)?.at(-1)?.decision
+    if (overlay) return { decision: overlay, source: 'overlay' }
+    const policy = this.policies.get(name)?.decision
+    if (policy) return { decision: policy, source: 'policy' }
+    return { decision: 'deny', source: 'default' }
+  }
+
   describe(toolNames) {
     const allowed = [], asked = [], denied = []
     const installed = toolNames ? new Set(toolNames) : undefined
-    for (const [name, entry] of this.policies) {
+    const known = new Set([...this.policies.keys(), ...this.overlays.keys()])
+    for (const name of known) {
       if (installed && !installed.has(name)) continue
-      if (entry.decision === 'allow') allowed.push(name)
-      if (entry.decision === 'ask') asked.push(name)
-      if (entry.decision === 'deny') denied.push(name)
+      const decision = this.effective(name).decision
+      if (decision === 'allow') allowed.push(name)
+      if (decision === 'ask') asked.push(name)
+      if (decision === 'deny') denied.push(name)
     }
     const parts = []
     if (allowed.length) parts.push(`${names(allowed)} ${allowed.length === 1 ? 'is' : 'are'} allowed`)
@@ -70,10 +101,11 @@ export class Permissions extends Service {
       arguments: structuredClone(call.arguments ?? null),
       workspace: this.ctx.workspace.root,
     }
-    const policy = this.policies.get(call.name)?.decision
-    if (policy === 'allow') return { ...detail, decision: 'allow' }
-    if (policy === 'deny') return { ...detail, decision: 'deny', reason: 'denied by policy' }
-    if (policy !== 'ask') return { ...detail, decision: 'deny', reason: 'unknown tool' }
+    const effective = this.effective(call.name)
+    const policy = effective.decision
+    if (policy === 'allow' && effective.source !== 'default') return { ...detail, decision: 'allow' }
+    if (policy === 'deny' && effective.source !== 'default') return { ...detail, decision: 'deny', reason: 'denied by policy' }
+    if (effective.source === 'default') return { ...detail, decision: 'deny', reason: 'unknown tool' }
     const answer = await answerFor(ask, structuredClone(detail), signal)
     if (signal?.aborted || answer !== true) {
       const reason = answer === false && !signal?.aborted ? 'denied' : 'approval unavailable'

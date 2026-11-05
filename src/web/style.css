@@ -107,8 +107,16 @@ button:disabled { opacity: .4; cursor: default; }
   .send { width: 40px; }
 }
 
-.plugin-list { list-style: none; margin: 0 0 1rem; padding: 0; display: grid; gap: 0.5rem; }
-.plugin-row { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; }
-.plugin-row button { flex: 0 0 auto; }
+.plugin-list { list-style: none; margin: 0 0 1rem; padding: 0; display: grid; gap: 0.75rem; }
+.plugin-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 0.35rem 0.75rem; padding-bottom: 0.75rem; border-bottom: 1px solid var(--border); }
+.plugin-row > button { justify-self: end; }
+.plugin-detail { grid-column: 1 / -1; display: grid; gap: 0.65rem; }
+.plugin-settings, .plugin-policies { display: grid; gap: 0.45rem; margin: 0; }
+.plugin-detail h3 { margin: 0; font-size: 13px; }
+.plugin-detail label { display: grid; gap: 4px; }
+.plugin-detail input, .plugin-detail select { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); font: inherit; }
+.plugin-detail input[type="checkbox"] { width: auto; justify-self: start; }
+.plugin-deps, .plugin-note { margin: 0; color: var(--muted); font-size: 12px; }
+.plugin-unsupported { color: var(--warning-text); }
 .plugin-empty { opacity: 0.7; }
 .plugins-panel h3 { margin: 0.75rem 0 0.35rem; font-size: 1rem; }

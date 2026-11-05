@@ -31,7 +31,7 @@ class Element {
   fire(type, event = {}) { this.listeners.get(type)?.(event) }
 }
 
-async function browser(installResponse, uninstallResponse, plugins = []) {
+async function browser(installResponse, uninstallResponse, plugins = [], extras = {}) {
   const elements = Object.fromEntries(['chat', 'trajectory', 'events', 'timeline', 'prompt', 'send', 'notice', 'hint', 'workspace', 'chat-tab', 'trajectory-tab', 'plugins-panel', 'plugins-toggle', 'plugins-form', 'plugin-spec', 'plugin-install', 'plugin-result', 'plugin-list'].map((id) => [id, new Element(id)]))
   elements.trajectory.hidden = true
   const find = (element, id) => element.id === id ? element : element.children.map((child) => child instanceof Element ? find(child, id) : null).find(Boolean)
@@ -59,6 +59,16 @@ async function browser(installResponse, uninstallResponse, plugins = []) {
     fetch: async (url, init) => {
       if (url === '/trajectory') return { ok: true, json: async () => snapshot }
       if (url === '/plugins') return { ok: true, json: async () => ({ plugins }) }
+      if (url === '/plugins/config') {
+        posts.push(JSON.parse(init.body))
+        const response = extras.configResponse ?? { ok: true, body: { active: true, message: 'Active now.' } }
+        return { ok: response.ok !== false, json: async () => response.body ?? response }
+      }
+      if (url === '/plugins/permissions') {
+        posts.push(JSON.parse(init.body))
+        const response = extras.policyResponse ?? { ok: true, body: { active: true, message: 'Active now. greet is ask.' } }
+        return { ok: response.ok !== false, json: async () => response.body ?? response }
+      }
       if (url === '/plugins/install' && installResponse) {
         posts.push(JSON.parse(init.body))
         return { ok: true, json: async () => installResponse }
@@ -124,6 +134,66 @@ test('plugin form submits the URL and reports live activation and permissions', 
   assert.equal(posts[0].spec, 'https://github.com/example/plugin')
   assert.match(elements['plugin-result'].textContent, /activated/)
   assert.match(elements['plugin-result'].textContent, /denied/)
+})
+
+test('plugin management edits settings and tool policies from the panel', async () => {
+  const plugin = {
+    name: 'greeting',
+    state: 'active',
+    dependencies: [
+      { service: 'tools', status: 'available' },
+      { service: 'dshFilesystem', status: 'unsupported', message: 'mini-dsh does not provide dshFilesystem. Installing a package does not make this service available.' },
+    ],
+    settings: [
+      { key: 'prefix', type: 'string', description: 'Greeting prefix', supported: true, value: 'Hello' },
+      { key: 'times', type: 'number', supported: true, value: 1 },
+      { key: 'loud', type: 'boolean', supported: true, value: false },
+      { key: 'nested', supported: false, reason: 'nested is not an editable string, boolean, number, or string choice' },
+    ],
+    tools: [{ name: 'greet', decision: 'deny', source: 'default' }],
+  }
+  const { elements, posts } = await browser(null, null, [plugin])
+  elements['plugins-panel'].hidden = true
+  elements['plugins-toggle'].fire('click')
+  await new Promise((resolve) => setImmediate(resolve))
+  const row = elements['plugin-list'].children[0]
+  assert.equal(row.children[1].textContent, 'Uninstall')
+  assert.match(row.textContent, /does not provide dshFilesystem/)
+  assert.match(row.textContent, /Installing a package does not make this service available/)
+  assert.match(row.textContent, /nested is not an editable/)
+  assert.match(row.textContent, /Denied by default/)
+  const settings = row.children[2].children[1]
+  const policies = row.children[2].children[2]
+  settings.children[1].children[0].value = 'Hi'
+  settings.children[2].children[0].value = '3'
+  settings.children[3].children[0].checked = true
+  await settings.listeners.get('submit')({ preventDefault() {} })
+  assert.deepEqual(posts[0], { name: 'greeting', config: { prefix: 'Hi', times: 3, loud: true } })
+  assert.match(elements['plugin-result'].textContent, /Active now/)
+  policies.children[2].children[0].value = 'ask'
+  await policies.listeners.get('submit')({ preventDefault() {} })
+  assert.deepEqual(posts[1], { name: 'greeting', policies: { greet: 'ask' } })
+  assert.match(elements['plugin-result'].textContent, /greet is ask/)
+})
+
+test('plugin management shows activation failures', async () => {
+  const plugin = {
+    name: 'greeting',
+    state: 'active',
+    settings: [{ key: 'prefix', type: 'string', supported: true, value: 'Hello' }],
+    tools: [],
+  }
+  const { elements } = await browser(null, null, [plugin], {
+    configResponse: { ok: false, body: { error: 'Change was not activated and the previous configuration was restored: prefix boom is refused' } },
+  })
+  elements['plugins-panel'].hidden = true
+  elements['plugins-toggle'].fire('click')
+  await new Promise((resolve) => setImmediate(resolve))
+  const settings = elements['plugin-list'].children[0].children[2].children[1]
+  settings.children[1].children[0].value = 'boom'
+  await settings.listeners.get('submit')({ preventDefault() {} })
+  assert.match(elements['plugin-result'].textContent, /previous configuration was restored/)
+  assert.match(elements['plugin-result'].textContent, /prefix boom is refused/)
 })
 
 test('plugin form does not claim disabled entries were activated', async () => {
