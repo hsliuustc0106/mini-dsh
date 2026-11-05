@@ -17,7 +17,7 @@ try {
   app = await boot({ workspace, pluginConfig: configPath, session: join(temp, 'session.jsonl') })
   if (!app.ctx.livePlugins) throw new Error('Profile does not provide the live plugin inspection service')
   const result = await uninstallPlugin(process.argv[2], workspace, {
-    configPath, livePlugins: app.ctx.livePlugins, expectedProfile, requireMounted: true,
+    configPath, livePlugins: app.ctx.livePlugins, expectedProfile, requireMounted: true, offline: true,
   })
   console.log(`Uninstalled ${result.name} from ${result.configPath}`)
 } catch (error) {

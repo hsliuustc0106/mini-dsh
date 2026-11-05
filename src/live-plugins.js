@@ -158,9 +158,12 @@ export async function uninstallPlugin(name, workspace, options = {}) {
     }
     const config = await readPluginProfile(configPath)
     if (!config.plugins.some((entry) => entry.name === name)) throw new Error(`Plugin is not in the profile: ${name}`)
+    if (live?.activeAgentLoops.has(name) && !options.offline) {
+      throw new Error(`The active DSH agent loop (${name}) cannot be uninstalled live; stop mini-dsh and use the offline uninstall command`)
+    }
     if (options.requireMounted) {
       for (const entry of config.plugins) {
-        if (entry.enabled !== false && !BUILTIN_PLUGIN_NAMES.has(entry.name) && !live?.mounted.has(entry.name)) {
+        if (entry.enabled !== false && !BUILTIN_PLUGIN_NAMES.has(entry.name) && !live?.mounted.has(entry.name) && !live?.activeAgentLoops.has(entry.name)) {
           throw new Error(`Cannot inspect ${entry.name} in the live graph; profile was not changed`)
         }
       }
@@ -214,9 +217,11 @@ export class LivePlugins extends Service {
     this.owner = ctx.fiber
     this.mounted = new Map()
     this.bootBuiltins = new Map()
+    this.activeAgentLoops = new Set()
   }
 
-  adopt(started = []) {
+  adopt(started = [], agentLoops = []) {
+    this.activeAgentLoops = new Set(agentLoops)
     for (const entry of started) {
       if (!entry?.name) continue
       if (BUILTIN_PLUGIN_NAMES.has(entry.name)) {

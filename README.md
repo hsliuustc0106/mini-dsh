@@ -93,6 +93,8 @@ When a dependency blocks removal, the web panel offers individual uninstall acti
 
 To remove an installed plugin when mini-dsh is stopped, run `npm run plugin:uninstall -- <name>` with `MINI_WORKSPACE` and, if needed, `MINI_CONFIG` set. The command starts the trusted profile in a separate Cordis context with a temporary session and checks the resulting dependency graph. Plugin startup and teardown can execute code and have side effects; use it only for trusted plugins. It refuses removal if the profile cannot boot or an enabled plugin cannot be inspected. It uses the standard composition and fake model provider, so profiles depending on a custom composition or provider may need to be managed through their running host instead. Stop all mini-dsh instances using the profile first: the offline command does not coordinate with their live graphs. It refuses a profile that changes between inspection and update. Package files are left on disk.
 
+The offline command also supports profiles using the DSH agent loop. The loop itself cannot be uninstalled from a running web session; stop mini-dsh and use the offline command to remove it.
+
 Install a trusted npm package, local package directory, or tarball into the current workspace:
 
 ```sh
