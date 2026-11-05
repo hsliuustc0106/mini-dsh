@@ -9,6 +9,7 @@ import { boot } from '../src/boot.js'
 import { fakeProvider } from '../src/provider.js'
 import { pluginInstallSpec } from '../src/web-control.js'
 import { acquireWriter } from '../src/lock.js'
+import { loadProfileEntries, uninstallPlugin } from '../src/live-plugins.js'
 
 test('web plugin inputs support GitHub repositories and npm package names', () => {
   assert.equal(pluginInstallSpec('https://github.com/owner/plugin#v1'), 'git+https://github.com/owner/plugin#v1')
@@ -16,6 +17,40 @@ test('web plugin inputs support GitHub repositories and npm package names', () =
   for (const value of ['https://github.com/owner/plugin/tree/main', 'https://user:secret@github.com/a/b', 'file:///tmp/plugin', '-evil']) {
     assert.throws(() => pluginInstallSpec(value))
   }
+})
+
+test('Archify skill adapter installs, activates and removes without a restart', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-archify-fixture-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const pkg = join(dir, 'package'), workspace = join(dir, 'workspace')
+  await mkdir(pkg); await mkdir(workspace)
+  await mkdir(join(pkg, 'skills', 'archify'), { recursive: true })
+  await writeFile(join(pkg, 'package.json'), JSON.stringify({ name: '@tt-a1i/archify-dsh', version: '1.0.0', dsh: { bundle: { patch: './cordis.patch.yml' } } }))
+  await writeFile(join(pkg, 'skills', 'archify', 'SKILL.md'), '---\nname: archify\ndescription: Make diagrams\n---\nFixture instructions.\n')
+  const expression = "process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@tt-a1i/archify-dsh/package.json')), 'skills')"
+  assert.throws(() => evaluateJsExpression(expression), /Unsupported !!js expression/)
+  const patch = `- insert:\n    - id: archify-skill-filesystem\n      name: '@deepseek-ai/dsh-skill-filesystem'\n      config:\n        providerName: archify-plugin\n        includeDefaultRoots: false\n        bundledSkillDir: !!js ${expression}\n`
+  await writeFile(join(pkg, 'cordis.patch.yml'), patch)
+  const pack = () => execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()
+  let archive = join(dir, pack())
+  const app = await boot({ workspace, skillOptions: { home: workspace, env: {} }, provider: fakeProvider([]) })
+  try {
+    assert.deepEqual(await app.ctx.prompt.resolveUserInput('/archify'), [])
+    const installed = await installPlugin(archive, workspace)
+    await app.ctx.livePlugins.mountAll(await loadProfileEntries(installed.configPath, installed.names))
+    const injected = await app.ctx.prompt.resolveUserInput('/archify')
+    assert.equal(injected[0].name, 'archify')
+    assert.match(injected[0].content, /Fixture instructions/)
+    await uninstallPlugin(installed.names[0], workspace, { configPath: installed.configPath, livePlugins: app.ctx.livePlugins })
+    assert.deepEqual(await app.ctx.prompt.resolveUserInput('/archify'), [])
+    const before = await readFile(installed.configPath, 'utf8')
+    await writeFile(join(pkg, 'cordis.patch.yml'), patch.replace(expression, "process.exit(1)"))
+    archive = join(dir, pack())
+    await assert.rejects(installPlugin(archive, workspace), /Unsupported Archify bundle/)
+    assert.equal(await readFile(installed.configPath, 'utf8'), before)
+  } finally { await app.dispose() }
+  const again = await boot({ workspace, pluginConfig: join(workspace, '.mini-dsh/plugins.json'), skillOptions: { home: workspace, env: {} }, provider: fakeProvider([]) })
+  try { assert.deepEqual(await again.ctx.prompt.resolveUserInput('/archify'), []) } finally { await again.dispose() }
 })
 
 test('install a DSH bundle and boot its tool with default deny', async (t) => {

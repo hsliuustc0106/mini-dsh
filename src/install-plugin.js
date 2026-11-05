@@ -15,6 +15,30 @@ const REPLACE_KEYS = new Set(['id', 'name', 'config', 'disabled'])
 const JS_TAG = 'tag:yaml.org,2002:js'
 // Teaching runtime id for engines.dsh / @deepseek-ai/dsh* peer checks (#75).
 export const MINI_DSH_RUNTIME = '0.1.0'
+// @tt-a1i/archify-dsh@1.0.0 only (#78). The published path expression is recognized
+// and never evaluated; it is not part of the teaching-scoped !!js grammar.
+const ARCHIFY = '@tt-a1i/archify-dsh'
+const ARCHIFY_EXPRESSION = "process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@tt-a1i/archify-dsh/package.json')), 'skills')"
+const jsExpression = Symbol('unsupported JavaScript expression')
+
+async function archifyEntry(root, data) {
+  const row = data?.[0]?.insert?.[0]
+  const config = row?.config
+  if (!Array.isArray(data) || data.length !== 1 || !object(data[0]) || Object.keys(data[0]).join() !== 'insert' ||
+      !Array.isArray(data[0].insert) || data[0].insert.length !== 1 || !object(row) ||
+      Object.keys(row).sort().join() !== 'config,id,name' || row.id !== 'archify-skill-filesystem' ||
+      row.name !== '@deepseek-ai/dsh-skill-filesystem' || !object(config) ||
+      Object.keys(config).sort().join() !== 'bundledSkillDir,includeDefaultRoots,providerName' ||
+      config.providerName !== 'archify-plugin' || config.includeDefaultRoots !== false ||
+      config.bundledSkillDir?.[jsExpression] !== ARCHIFY_EXPRESSION) {
+    throw new Error('Unsupported Archify bundle: expected the published 1.0.0 skill provider and path expression; profile unchanged')
+  }
+  const packageRoot = await realpath(root)
+  const skillRoot = await realpath(join(root, 'skills'))
+  if (skillRoot !== join(packageRoot, 'skills')) throw new Error('Archify skill directory must be inside the package')
+  await readFile(join(skillRoot, 'archify', 'SKILL.md'), 'utf8')
+  return { name: row.id, module: fileURLToPath(new URL('./dsh-skill-root.js', import.meta.url)), config: { bundledSkillDir: skillRoot } }
+}
 
 async function lockProfile(configPath) {
   // Resolving the directory makes different symlinked paths share one lock.
@@ -432,6 +456,22 @@ export async function installPlugin(spec, workspace, options = {}) {
         if (!patches.length || patches.some((item) => typeof item !== 'string' || !item)) throw new Error('Invalid dsh.bundle.patch')
         for (const file of patches) {
           const patchPath = resolve(root, file)
+          if (packageName === ARCHIFY && pkg.version === '1.0.0') {
+            if (patches.length !== 1 || file !== './cordis.patch.yml') {
+              throw new Error('Unsupported Archify bundle patch; profile unchanged')
+            }
+            // Capture !!js as data. Do not call evaluateJsExpression or any other JS evaluator.
+            const document = parseDocument(await readFile(patchPath, 'utf8'), {
+              customTags: [{ tag: JS_TAG, resolve: (value) => ({ [jsExpression]: value }) }],
+            })
+            if (document.errors.length || document.warnings.length) {
+              throw new Error(`Unsupported or invalid bundle YAML in ${file}: ${(document.errors[0] ?? document.warnings[0]).message}`)
+            }
+            const data = document.toJS()
+            if (!Array.isArray(data)) throw new Error('Bundle patch must be an array')
+            pushEntry(plugins, builtin, inserted, layerIds, await archifyEntry(root, data), workspace)
+            continue
+          }
           const data = parseBundlePatch(await readFile(patchPath, 'utf8'), file)
           for (const op of data) {
             if (!object(op)) throw new Error('Unsupported bundle patch operation')
