@@ -101,13 +101,29 @@ export class Agent extends Service {
         const calls = message.tool_calls ?? []
         if (message.content) report({ type: 'assistant', content: message.content })
         if (!calls.length) return
-        for (let index = 0; index < calls.length; index++) {
+        const contexts = []
+        let index = 0
+        while (index < calls.length) {
           if (this.stopping) {
             await this.denyUnstarted(calls.slice(index))
-            return
+            break
           }
-          await this.oneCall(calls[index], report, signal, approve)
+          // Consecutive calls whose classifier returns exactly true overlap
+          // their bodies. Policy and JSONL results stay in model order.
+          const group = [calls[index]]
+          index += 1
+          if (this.ctx.tools.executionMode(group[0]).kind === 'parallel') {
+            while (index < calls.length && this.ctx.tools.executionMode(calls[index]).kind === 'parallel') {
+              group.push(calls[index])
+              index += 1
+            }
+          }
+          const produced = group.length === 1
+            ? await this.oneCall(group[0], report, signal, approve)
+            : await this.parallelCalls(group, report, signal, approve)
+          contexts.push(...produced)
         }
+        for (const event of contexts) await checkpoint.commit(event)
       }
     } finally {
       // Durable turn/end for hooks such as dsh-message-datetime's idle-gap reading.
@@ -176,7 +192,54 @@ export class Agent extends Service {
   }
 
   async oneCall(call, report, signal, approve) {
-    const { tools, checkpoint, permissions, workspace } = this.ctx
+    const admitted = await this.admit(call, report, signal, approve)
+    if (!admitted) return []
+    const { checkpoint, workspace } = this.ctx
+    let raw
+    try {
+      raw = await checkpoint.guard(
+        { type: 'tool.started', callId: admitted.id, name: admitted.name, arguments: structuredClone(admitted.args), workspace: workspace.root },
+        () => this.ctx.tools.executeOnly(admitted.exec),
+      )
+    } catch (error) {
+      if (error.code === 'CHECKPOINT') throw error
+      await this.recordResult(admitted.id, `Error: ${error.message}`, report)
+      return []
+    }
+    const outcome = await this.ctx.tools.settle(admitted.exec, raw)
+    await this.recordResult(admitted.id, outcome.text, report)
+    return outcome.contexts
+  }
+
+  // Policy stays in model order. Bodies overlap only after each tool.started
+  // is durable. Post-execute and tool.finished are written back in model order.
+  async parallelCalls(calls, report, signal, approve) {
+    const admitted = []
+    let index = 0
+    for (; index < calls.length; index++) {
+      if (this.stopping) break
+      const item = await this.admit(calls[index], report, signal, approve)
+      if (item) admitted.push(item)
+    }
+    if (index < calls.length) await this.denyUnstarted(calls.slice(index))
+    const { checkpoint, tools, workspace } = this.ctx
+    await Promise.all(admitted.map(async (item) => {
+      await checkpoint.commit({
+        type: 'tool.started', callId: item.id, name: item.name, arguments: structuredClone(item.args), workspace: workspace.root,
+      })
+      item.raw = await tools.executeOnly(item.exec)
+    }))
+    const contexts = []
+    for (const item of admitted) {
+      const outcome = await tools.settle(item.exec, item.raw)
+      await this.recordResult(item.id, outcome.text, report)
+      contexts.push(...outcome.contexts)
+    }
+    return contexts
+  }
+
+  async admit(call, report, signal, approve) {
+    const { tools, checkpoint, permissions } = this.ctx
     const id = call.id
     const name = call.function.name
     report({ type: 'tool', content: `${name} ${call.function.arguments}` })
@@ -184,40 +247,47 @@ export class Agent extends Service {
     try { args = JSON.parse(call.function.arguments) }
     catch {
       await this.toolError(id, 'invalid arguments', report)
-      return
+      return null
     }
     if (!tools.items.has(name)) {
       await this.deny(id, name, args, 'unknown tool', report)
-      return
+      return null
     }
-    try { validateArguments(tools.items.get(name).parameters, args) }
+    const tool = tools.items.get(name)
+    try { validateArguments(tool.parameters, args) }
     catch (error) {
       await this.toolError(id, error.message, report)
-      return
+      return null
     }
     const decision = await permissions.decide({ callId: id, name, arguments: args }, signal, approve)
     await checkpoint.commit({ type: 'permission.decided', ...decision })
     if (decision.decision !== 'allow') {
       await this.toolError(id, decision.reason, report)
-      return
+      return null
     }
-    let result
+    const exec = tools.createExecution({ callId: id, name, args, tool })
     try {
-      result = await checkpoint.guard(
-        { type: 'tool.started', callId: id, name, arguments: structuredClone(args), workspace: workspace.root },
-        () => tools.run(name, args, { callId: id }),
-      )
+      const pre = await tools.preExecute(exec)
+      if (pre.kind === 'deny') {
+        await this.toolError(id, pre.reason, report)
+        return null
+      }
+      const guardReason = tools.checkGuards(exec)
+      if (guardReason) {
+        await this.toolError(id, guardReason, report)
+        return null
+      }
     } catch (error) {
       if (error.code === 'CHECKPOINT') throw error
-      const text = `Error: ${error.message}`
-      await checkpoint.commit({ type: 'tool.finished', callId: id, result: text })
-      await checkpoint.commit({ role: 'tool', tool_call_id: id, content: text })
-      report({ type: 'result', content: text })
-      return
+      await this.toolError(id, error.message, report)
+      return null
     }
-    const text = String(result)
-    await checkpoint.commit({ type: 'tool.finished', callId: id, result: text })
-    await checkpoint.commit({ role: 'tool', tool_call_id: id, content: text })
+    return { id, name, args: exec.args, exec }
+  }
+
+  async recordResult(id, text, report) {
+    await this.ctx.checkpoint.commit({ type: 'tool.finished', callId: id, result: text })
+    await this.ctx.checkpoint.commit({ role: 'tool', tool_call_id: id, content: text })
     report({ type: 'result', content: text })
   }
 
