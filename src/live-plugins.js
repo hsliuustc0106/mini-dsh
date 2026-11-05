@@ -90,6 +90,14 @@ export async function readPluginProfile(configPath) {
   return config
 }
 
+export function requireInspectedProfile(config, live) {
+  for (const entry of config.plugins) {
+    if (entry.enabled !== false && !BUILTIN_PLUGIN_NAMES.has(entry.name) && !live?.mounted.has(entry.name) && !live?.activeAgentLoops.has(entry.name)) {
+      throw new Error(`Cannot inspect ${entry.name} in the live graph; profile was not changed`)
+    }
+  }
+}
+
 export async function loadProfileEntries(configPath, names) {
   // Activation names must already be unique; dedupe defensively so a stale
   // duplicate list cannot trip rows.length !== names.length into a false miss.
@@ -154,11 +162,7 @@ export async function uninstallPlugin(name, workspace, options = {}) {
       throw new Error(`The active DSH agent loop (${name}) cannot be uninstalled live; stop mini-dsh and use the offline uninstall command`)
     }
     if (options.requireMounted) {
-      for (const entry of config.plugins) {
-        if (entry.enabled !== false && !BUILTIN_PLUGIN_NAMES.has(entry.name) && !live?.mounted.has(entry.name) && !live?.activeAgentLoops.has(entry.name)) {
-          throw new Error(`Cannot inspect ${entry.name} in the live graph; profile was not changed`)
-        }
-      }
+      requireInspectedProfile(config, live)
     }
     let names = [name]
     if (options.expectedNames) {

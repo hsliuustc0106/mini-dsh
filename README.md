@@ -101,6 +101,8 @@ To remove an installed plugin when mini-dsh is stopped, run `npm run plugin:unin
 
 The offline command also supports profiles using the DSH agent loop. The loop itself cannot be uninstalled from a running web session; stop mini-dsh and use the offline command to remove it.
 
+To remove a plugin together with its required dependents, run `npm run plugin:uninstall -- <name> --cascade`. The command previews the ordered list and requires you to type `yes` before making changes. It rechecks the profile and dependency plan after confirmation; cancelling or a failed check leaves the profile unchanged. Built-in dependents cannot be removed by the cascade.
+
 Install a trusted npm package, local package directory, or tarball into the current workspace:
 
 ```sh
