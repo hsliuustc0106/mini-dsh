@@ -10,7 +10,8 @@
     "replay": "node --test test/terminal.test.js",
     "smoke": "node src/smoke.js",
     "benchmark:prompts": "node benchmarks/coding/run.mjs",
-    "plugin:install": "node src/install.js"
+    "plugin:install": "node src/install.js",
+    "plugin:uninstall": "node src/uninstall.js"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "4.0.5",

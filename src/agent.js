@@ -51,6 +51,7 @@ export class Agent extends Service {
   turn(input, report = () => {}, { approve } = {}) {
     if (this.stopping) throw fail('Agent is shutting down', 'BUSY')
     if (this.busy) throw fail('Agent is busy', 'BUSY')
+    if (this.ctx.reflect.get('livePlugins', false)?.changing) throw fail('A plugin change is already in progress', 'BUSY')
     if (typeof input !== 'string' || !input.trim()) throw new Error('Turn input is required')
     this.busy = true
     const controller = new AbortController()

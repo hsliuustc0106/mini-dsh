@@ -1,5 +1,6 @@
 import { Service } from '@deepseek-ai/cordis'
 import { readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { applyWorkspacePluginConfig } from './workspace-path.js'
 import { pathToFileURL } from 'node:url'
@@ -7,7 +8,8 @@ import { acquireWriter } from './lock.js'
 
 // Cordis 4.0.5 keeps FiberState as a const enum, so the published build does not
 // export the names. live-plugins (like boot.js) pins these numeric values and
-// private fields (`_error`, `inertia`) against @deepseek-ai/cordis@4.0.5 only.
+// private fields (`_error`, `inertia`, reflect._getImpl) against
+// @deepseek-ai/cordis@4.0.5 only.
 // Bump Cordis only with a matching update to these constants and the pin test.
 const LOADING = 1
 const UNLOADING = 5
@@ -144,22 +146,60 @@ export async function uninstallPlugin(name, workspace, options = {}) {
   if (!isAbsolute(workspace)) throw new Error('Workspace must be an absolute path')
   const configPath = options.configPath ?? join(workspace, '.mini-dsh', 'plugins.json')
   if (!isAbsolute(configPath)) throw new Error('Plugin config path must be absolute')
-  const lock = await lockProfile(configPath)
+  const live = options.livePlugins
+  if (live?.changing) throw new Error('A plugin change is already in progress')
+  if (live?.busy()) throw new Error('Cannot uninstall plugins while a turn is in progress')
+  if (live) live.changing = true
+  let lock
   try {
+    lock = await lockProfile(configPath)
+    if (options.expectedProfile !== undefined && await readFile(configPath, 'utf8') !== options.expectedProfile) {
+      throw new Error('Plugin profile changed during inspection; retry uninstall')
+    }
     const config = await readPluginProfile(configPath)
-    const before = config.plugins.length
-    config.plugins = config.plugins.filter((entry) => entry.name !== name)
-    if (config.plugins.length === before) throw new Error(`Plugin is not in the profile: ${name}`)
-    const temp = join(dirname(configPath), `.plugins-uninstall-${process.pid}.json`)
+    if (!config.plugins.some((entry) => entry.name === name)) throw new Error(`Plugin is not in the profile: ${name}`)
+    if (options.requireMounted) {
+      for (const entry of config.plugins) {
+        if (entry.enabled !== false && !BUILTIN_PLUGIN_NAMES.has(entry.name) && !live?.mounted.has(entry.name)) {
+          throw new Error(`Cannot inspect ${entry.name} in the live graph; profile was not changed`)
+        }
+      }
+    }
+    let names = [name]
+    if (options.expectedNames) {
+      if (!live) throw new Error('Removing dependents requires a live dependency graph')
+      names = live.removalPlan(name)
+      if (JSON.stringify(names) !== JSON.stringify(options.expectedNames)) throw new Error('Dependencies changed; review the removal list again')
+      for (const item of names) if (!config.plugins.some((entry) => entry.name === item)) throw new Error(`Dependent ${item} is not in the profile`)
+    }
+    const remove = new Set(names)
+    config.plugins = config.plugins.filter((entry) => !remove.has(entry.name))
+    const temp = join(dirname(configPath), `.plugins-uninstall-${process.pid}-${randomUUID()}.json`)
+    const snapshots = []
     try {
       await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx' })
+      for (const item of names) {
+        if (!live?.mounted.has(item)) continue
+        const entry = live.mounted.get(item).entry
+        try { await live.unmount(item) }
+        finally { if (!live.mounted.has(item)) snapshots.push(entry) }
+      }
       await rename(temp, configPath)
     } catch (error) {
       await rm(temp, { force: true })
+      const failures = []
+      for (const entry of snapshots.reverse()) {
+        try { await live.mount(entry) }
+        catch (rollback) { failures.push(`${entry.name}: ${rollback.message}`) }
+      }
+      if (failures.length) throw new Error(`Uninstall failed: ${error.message}; restoration failed: ${failures.join('; ')}. Restart using the unchanged profile.`, { cause: error })
       throw error
     }
-    return { name, configPath }
-  } finally { lock.release() }
+    return { name, names, configPath }
+  } finally {
+    lock?.release()
+    if (live) live.changing = false
+  }
 }
 
 // Tracks profile/runtime plugins so install can mount and uninstall can dispose
@@ -185,7 +225,7 @@ export class LivePlugins extends Service {
       }
       if (this.mounted.has(entry.name)) continue
       // Boot-started fibers stay owned by boot(); live mounts use ctx.effect below.
-      this.mounted.set(entry.name, { fiber: entry.fiber, module: entry.module, source: 'boot', required: entry.required })
+      this.mounted.set(entry.name, { fiber: entry.fiber, module: entry.module, source: 'boot', required: entry.required, entry })
     }
   }
 
@@ -225,11 +265,33 @@ export class LivePlugins extends Service {
       const missing = []
       for (const [service, spec] of Object.entries(info.fiber?.inject ?? {})) {
         if (!requiredInject(spec)) continue
-        if (provided.has(service)) missing.push(service)
+        // A same-named service in another isolation scope does not satisfy
+        // this fiber. Only block if its actual visible provider is removed.
+        const impl = info.fiber.ctx.reflect._getImpl(service, false)
+        if (provided.has(service) && impl?.fiber && fiberOwns(this.mounted.get(name).fiber, impl.fiber)) missing.push(service)
       }
       if (missing.length) affected.push({ name: other, services: missing })
     }
     return affected
+  }
+
+  removalPlan(name) {
+    if (BUILTIN_PLUGIN_NAMES.has(name)) throw new Error(`Built-in plugin cannot be uninstalled: ${name}`)
+    const ordered = [], visiting = new Set(), visited = new Set()
+    const visit = (current) => {
+      if (visited.has(current)) return
+      if (visiting.has(current)) throw new Error(`Cannot remove cyclic plugin dependencies involving ${current}`)
+      visiting.add(current)
+      for (const dependent of this.dependentsBlockingRemoval(current)) {
+        if (BUILTIN_PLUGIN_NAMES.has(dependent.name)) throw new Error(`Cannot remove ${name}: built-in ${dependent.name} needs ${dependent.services.join(', ')}`)
+        visit(dependent.name)
+      }
+      visiting.delete(current)
+      visited.add(current)
+      ordered.push(current)
+    }
+    visit(name)
+    return ordered
   }
 
   async mount(entry) {
@@ -271,7 +333,7 @@ export class LivePlugins extends Service {
         const detail = report.error ? `: ${report.error}` : report.missing?.length ? `: waiting for ${report.missing.join(', ')}` : ''
         throw new Error(`Plugin ${entry.name} ${report.state === 'failed' ? 'failed' : `is ${report.state}`}${detail}`)
       }
-      this.mounted.set(entry.name, { fiber, release, module: entry.module, source: 'live', required: entry.required })
+      this.mounted.set(entry.name, { fiber, release, module: entry.module, source: 'live', required: entry.required, entry })
       await this.record('plugin.mounted', { name: entry.name, state: report.state })
       return report
     } catch (error) {
@@ -297,10 +359,13 @@ export class LivePlugins extends Service {
     const blockers = this.dependentsBlockingRemoval(name)
     if (blockers.length) {
       const detail = blockers.map((row) => `${row.name} (needs ${row.services.join(', ')})`).join('; ')
-      throw new Error(
+      const error = new Error(
         `Cannot uninstall ${name}: required by ${detail}. ` +
         'Remove or disable those plugins first so the saved profile can still boot.'
       )
+      error.code = 'PLUGIN_DEPENDENTS'
+      error.dependents = blockers
+      throw error
     }
     this.mounted.delete(name)
     if (info.release) await Promise.resolve(info.release())

@@ -365,6 +365,8 @@ export function apply(ctx) {
     assert.match(refusedBody.error, /Cannot uninstall demo-skills/)
     assert.match(refusedBody.error, /demo-ppt/)
     assert.match(refusedBody.error, /demoSkills/)
+    assert.equal(refusedBody.code, 'PLUGIN_DEPENDENTS')
+    assert.deepEqual(refusedBody.dependents, [{ name: 'demo-ppt', services: ['demoSkills'], removable: true }])
     assert.equal(JSON.parse(await readFile(profile, 'utf8')).plugins.some((row) => row.name === 'demo-skills'), true)
     assert.equal(app.ctx.livePlugins.list().find((row) => row.name === 'demo-ppt').state, 'active')
     assert.ok(app.ctx.tools.items.has('demo_themes'))
@@ -444,12 +446,162 @@ test('uninstall protects required built-in replacements that depend on a plugin 
     const response = await fetch(`${url}/plugins/uninstall`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'extra-provider' }) })
     assert.equal(response.status, 400)
     assert.match((await response.json()).error, /coding \(needs extraSvc\)/)
+    const preview = await fetch(`${url}/plugins/uninstall`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'extra-provider', preview: true }) })
+    assert.equal(preview.status, 400)
+    assert.match((await preview.json()).error, /built-in coding/)
     assert.ok(app.ctx.tools.items.has('replacement_tool'))
     assert.ok(JSON.parse(await readFile(profile, 'utf8')).plugins.some((entry) => entry.name === 'extra-provider'))
     assert.ok(!app.ctx.livePlugins.list().some((entry) => entry.name === 'coding'))
   } finally { await app.dispose() }
   const again = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]), composition: compose })
   try { assert.ok(again.ctx.tools.items.has('replacement_tool')) } finally { await again.dispose() }
+})
+
+test('same-named isolated service does not block removal of an unrelated provider', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-isolated-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const app = await boot({ workspace, provider: fakeProvider([]) })
+  try {
+    await app.ctx.livePlugins.mount({ name: 'root-provider', plugin: { apply(ctx) { ctx.provide('sharedScoped', {}) } } })
+    await app.ctx.livePlugins.mount({ name: 'consumer', plugin: { inject: ['sharedScoped'], apply() {} } })
+    await app.ctx.livePlugins.mount({ name: 'isolated-provider', plugin: {
+      apply(ctx) { ctx.isolate('sharedScoped').plugin({ apply(child) { child.provide('sharedScoped', {}) } }) },
+    } })
+    assert.deepEqual(app.ctx.livePlugins.dependentsBlockingRemoval('isolated-provider'), [])
+    assert.deepEqual(app.ctx.livePlugins.dependentsBlockingRemoval('root-provider'), [{ name: 'consumer', services: ['sharedScoped'] }])
+    await app.ctx.livePlugins.unmount('isolated-provider')
+    assert.equal(app.ctx.livePlugins.list().find((row) => row.name === 'consumer').state, 'active')
+  } finally { await app.dispose() }
+})
+
+test('profile replacement failure restores the live plugin and keeps the profile', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-rollback-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const profile = join(workspace, 'plugins.json')
+  await writeFile(join(workspace, 'plugin.mjs'), `
+import { readdir, rm } from 'node:fs/promises'
+import { join } from 'node:path'
+export const inject = ['tools']
+export function apply(ctx, config) {
+  ctx.effect(() => {
+    ctx.tools.register({ name: 'rollback_tool', description: 'rollback', parameters: { type: 'object' }, execute: () => 'ok' })
+    return async () => {
+      for (const name of await readdir(config.workDir)) {
+        if (name.startsWith('.plugins-uninstall-')) await rm(join(config.workDir, name))
+      }
+    }
+  })
+}
+`)
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'rollback', module: './plugin.mjs' }] }))
+  const app = await boot({ workspace, pluginConfig: profile, web: { port: 0 }, provider: fakeProvider([]) })
+  try {
+    const url = app.ctx.webControl.url
+    const response = await fetch(`${url}/plugins/uninstall`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'rollback' }) })
+    assert.equal(response.status, 400)
+    assert.ok(JSON.parse(await readFile(profile, 'utf8')).plugins.some((row) => row.name === 'rollback'))
+    assert.equal(app.ctx.livePlugins.list().find((row) => row.name === 'rollback').state, 'active')
+    assert.ok(app.ctx.tools.items.has('rollback_tool'))
+  } finally { await app.dispose() }
+})
+
+test('a turn cannot start while a live uninstall is disposing', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-uninstall-turn-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const profile = join(workspace, 'plugins.json')
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'slow', module: './slow.mjs' }] }))
+  const app = await boot({ workspace, provider: fakeProvider([]) })
+  let started, release
+  const disposing = new Promise((resolve) => { started = resolve })
+  const gate = new Promise((resolve) => { release = resolve })
+  try {
+    await app.ctx.livePlugins.mount({ name: 'slow', plugin: { apply(ctx) { ctx.effect(() => async () => { started(); await gate }) } } })
+    const removing = uninstallPlugin('slow', workspace, { configPath: profile, livePlugins: app.ctx.livePlugins })
+    await disposing
+    assert.throws(() => app.ctx.agent.turn('hello'), /plugin change is already in progress/)
+    release()
+    await removing
+  } finally { release(); await app.dispose() }
+})
+
+test('cascade preview removes transitive dependents in order and rejects stale confirmation', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-cascade-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const profile = join(workspace, 'plugins.json')
+  await writeFile(join(workspace, 'a.mjs'), "export function apply(ctx) { ctx.provide('cascadeA', {}) }\n")
+  await writeFile(join(workspace, 'b.mjs'), "export const inject = ['cascadeA']; export function apply(ctx) { ctx.provide('cascadeB', {}) }\n")
+  await writeFile(join(workspace, 'c.mjs'), "export const inject = ['cascadeB']; export function apply() {}\n")
+  await writeFile(profile, JSON.stringify({ plugins: ['a', 'b', 'c'].map((name) => ({ name, module: `./${name}.mjs` })) }))
+  const app = await boot({ workspace, pluginConfig: profile, web: { port: 0 }, provider: fakeProvider([]) })
+  try {
+    const url = app.ctx.webControl.url
+    const post = (data) => fetch(`${url}/plugins/uninstall`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify(data) })
+    const preview = await (await post({ name: 'a', preview: true })).json()
+    assert.deepEqual(preview.names, ['c', 'b', 'a'])
+    assert.equal((await post({ name: 'a', names: ['b', 'a'] })).status, 400)
+    assert.equal(JSON.parse(await readFile(profile, 'utf8')).plugins.length, 3)
+    const response = await post({ name: 'a', names: preview.names })
+    assert.equal(response.status, 200, JSON.stringify(await response.clone().json()))
+    assert.deepEqual((await response.json()).names, preview.names)
+    assert.equal(JSON.parse(await readFile(profile, 'utf8')).plugins.length, 0)
+  } finally { await app.dispose() }
+  const again = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try { assert.equal(again.ctx.livePlugins.list().length, 0) } finally { await again.dispose() }
+})
+
+test('offline uninstall inspects required dependents before changing the profile', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-offline-uninstall-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const profile = join(workspace, 'plugins.json')
+  await writeFile(join(workspace, 'provider.mjs'), "export function apply(ctx) { ctx.provide('offlineService', {}) }\n")
+  await writeFile(join(workspace, 'consumer.mjs'), "export const inject = ['offlineService']; export function apply() {}\n")
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'provider-x', module: './provider.mjs' }, { name: 'consumer-x', module: './consumer.mjs' }] }))
+  const cli = new URL('../src/uninstall.js', import.meta.url).pathname
+  const env = { ...process.env, MINI_WORKSPACE: workspace, MINI_CONFIG: profile }
+  assert.throws(() => execFileSync(process.execPath, [cli, 'provider-x'], { env, encoding: 'utf8', stdio: 'pipe' }), /required by consumer-x/)
+  assert.equal(JSON.parse(await readFile(profile, 'utf8')).plugins.length, 2)
+  execFileSync(process.execPath, [cli, 'consumer-x'], { env, encoding: 'utf8', stdio: 'pipe' })
+  execFileSync(process.execPath, [cli, 'provider-x'], { env, encoding: 'utf8', stdio: 'pipe' })
+  assert.equal(JSON.parse(await readFile(profile, 'utf8')).plugins.length, 0)
+})
+
+test('uninstall refuses a profile changed since offline inspection', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-offline-changed-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const profile = join(workspace, 'plugins.json')
+  const original = JSON.stringify({ plugins: [{ name: 'disabled', module: './unused.mjs', enabled: false }] })
+  await writeFile(profile, original)
+  const app = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try {
+    const changed = `${original}\n`
+    await writeFile(profile, changed)
+    await assert.rejects(uninstallPlugin('disabled', workspace, { configPath: profile, livePlugins: app.ctx.livePlugins, expectedProfile: original, requireMounted: true }), /changed during inspection/)
+    assert.equal(await readFile(profile, 'utf8'), changed)
+  } finally { await app.dispose() }
+})
+
+test('cascade commit failure remounts removed providers and dependents', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-cascade-rollback-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const profile = join(workspace, 'plugins.json')
+  await writeFile(join(workspace, 'provider.mjs'), `
+import { readdir, rm } from 'node:fs/promises'
+import { join } from 'node:path'
+export function apply(ctx, config) {
+  ctx.provide('cascadeRollback', {})
+  ctx.effect(() => async () => {
+    for (const name of await readdir(config.workDir)) if (name.startsWith('.plugins-uninstall-')) await rm(join(config.workDir, name))
+  })
+}
+`)
+  await writeFile(join(workspace, 'consumer.mjs'), "export const inject = ['cascadeRollback']; export function apply() {}\n")
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'provider-x', module: './provider.mjs' }, { name: 'consumer-x', module: './consumer.mjs' }] }))
+  const app = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try {
+    await assert.rejects(uninstallPlugin('provider-x', workspace, { configPath: profile, livePlugins: app.ctx.livePlugins, expectedNames: ['consumer-x', 'provider-x'] }))
+    assert.equal(JSON.parse(await readFile(profile, 'utf8')).plugins.length, 2)
+    assert.deepEqual(app.ctx.livePlugins.list().filter((row) => row.state === 'active').map((row) => row.name).sort(), ['consumer-x', 'provider-x'])
+  } finally { await app.dispose() }
 })
 
 test('disabled bundle entries remain visible and can be uninstalled through the web API', async (t) => {
