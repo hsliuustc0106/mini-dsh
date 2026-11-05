@@ -549,6 +549,45 @@ test('same-named isolated service does not block removal of an unrelated provide
   } finally { await app.dispose() }
 })
 
+test('same-scope duplicate providers are rejected and do not become an uninstall fallback', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-duplicate-provider-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const profile = join(workspace, 'plugins.json')
+  await writeFile(join(workspace, 'provider.mjs'), "export function apply(ctx) { ctx.provide('uniqueService', { name: 'original' }) }\n")
+  await writeFile(join(workspace, 'consumer.mjs'), "export const inject = ['uniqueService']; export function apply() {}\n")
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'first', module: './provider.mjs' }, { name: 'consumer', module: './consumer.mjs' }] }))
+  const app = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try {
+    await assert.rejects(app.ctx.livePlugins.mount({ name: 'second', plugin: { apply(ctx) { ctx.provide('uniqueService', { name: 'second' }) } } }), /already|registered/i)
+    assert.equal(app.ctx.reflect.get('uniqueService').name, 'original')
+    assert.deepEqual(app.ctx.livePlugins.dependentsBlockingRemoval('first'), [{ name: 'consumer', services: ['uniqueService'] }])
+    await assert.rejects(app.ctx.livePlugins.unmount('first'), /consumer.*uniqueService/)
+  } finally { await app.dispose() }
+  const again = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try { assert.equal(again.ctx.livePlugins.list().find((row) => row.name === 'consumer').state, 'active') }
+  finally { await again.dispose() }
+})
+
+test('Cordis inject metadata with required false still blocks provider removal', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-inject-config-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const profile = join(workspace, 'plugins.json')
+  await writeFile(join(workspace, 'provider.mjs'), "export function apply(ctx) { ctx.provide('configuredService', {}) }\n")
+  await writeFile(join(workspace, 'consumer.mjs'), "export const inject = { configuredService: { required: false } }; export function apply() {}\n")
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'provider-x', module: './provider.mjs' }, { name: 'consumer-x', module: './consumer.mjs' }] }))
+  const app = await boot({ workspace, pluginConfig: profile, web: { port: 0 }, provider: fakeProvider([]) })
+  try {
+    const url = app.ctx.webControl.url
+    const response = await fetch(`${url}/plugins/uninstall`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'provider-x' }) })
+    assert.equal(response.status, 400)
+    assert.deepEqual((await response.json()).dependents.map(({ name, services }) => ({ name, services })), [{ name: 'consumer-x', services: ['configuredService'] }])
+    assert.equal(JSON.parse(await readFile(profile, 'utf8')).plugins.length, 2)
+  } finally { await app.dispose() }
+  const again = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try { assert.equal(again.ctx.livePlugins.list().find((row) => row.name === 'consumer-x').state, 'active') }
+  finally { await again.dispose() }
+})
+
 test('profile replacement failure restores the live plugin and keeps the profile', async (t) => {
   const workspace = await mkdtemp(join(tmpdir(), 'mini-live-rollback-'))
   t.after(() => rm(workspace, { recursive: true, force: true }))

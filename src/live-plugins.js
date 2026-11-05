@@ -39,12 +39,6 @@ function fiberOwns(pluginFiber, candidateFiber) {
   return false
 }
 
-function requiredInject(spec) {
-  if (spec == null) return true
-  if (typeof spec === 'object' && spec.required === false) return false
-  return true
-}
-
 function statusOf(fiber) {
   if (fiber._error) return 'failed'
   return STATE_NAME[fiber.state] ?? 'unknown'
@@ -290,8 +284,9 @@ export class LivePlugins extends Service {
       if (other === name) continue
       if (info.required === false) continue
       const missing = []
-      for (const [service, spec] of Object.entries(info.fiber?.inject ?? {})) {
-        if (!requiredInject(spec)) continue
+      // In Cordis 4.0.5 every key in fiber.inject is required for activation;
+      // object values configure interception, not optional dependencies.
+      for (const service of Object.keys(info.fiber?.inject ?? {})) {
         // A same-named service in another isolation scope does not satisfy
         // this fiber. Only block if its actual visible provider is removed.
         const impl = info.fiber.ctx.reflect._getImpl(service, false)
