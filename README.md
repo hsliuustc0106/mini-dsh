@@ -129,6 +129,8 @@ The installer accepts a package exposing a plugin entry point, or a DSH bundle d
 
 `isolate` realms and Loader-context `!!js` stay unsupported and fail explicitly without changing the profile. npm installs pass `--no-force` and `--no-legacy-peer-deps` (and clear those npm config env overrides) so a user `.npmrc` cannot bypass peers; an `ERESOLVE` peer conflict leaves the profile unchanged and surfaces the conflicting peer rather than treating a forced install as compatibility. Packages such as `@mixian/dsh-desktop-plugin` that need a DSH desktop/client peer tree remain fail-closed here; a desktop-shaped patch with resolvable peers installs. Plugins still need the services and tool features supported by mini-dsh; a successful install does not guarantee a plugin can boot. For npm dependencies, install a built package whose peers resolve cleanly.
 
+One package-specific exception supports `@tt-a1i/archify-dsh@1.0.0`: mini-dsh checks the published bundle's exact skill-provider configuration and path expression, then registers its packaged skill directory through its own skills plugin. It does not evaluate the expression, add it to the teaching-scoped `!!js` grammar, or run the DSH filesystem provider. A different expression or bundle shape fails without changing the profile. The skill appears and disappears on live install and uninstall; the packaged instructions and any commands they request still need your usual tool permissions.
+
 Installed tools have no automatic permission grant and are denied by default. To allow a particular tool, add a policy to `.mini-dsh/plugins.json`, for example:
 
 ```json

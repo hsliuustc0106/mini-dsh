@@ -135,7 +135,15 @@ function renderSkill(skill) {
 export const skills = {
   inject: ['workspace', 'prompt', 'tools'],
   apply(ctx, options = {}) {
-    const discover = () => discoverSkills(ctx.workspace.root, options, (message) => ctx.logger.warn(message))
+    const pluginRoots = new Set()
+    ctx.provide('miniSkillRoots', {
+      add(path) {
+        if (typeof path !== 'string' || !path || pluginRoots.has(path)) throw new Error(`Invalid or duplicate skill root: ${path}`)
+        pluginRoots.add(path)
+        return () => pluginRoots.delete(path)
+      },
+    })
+    const discover = () => discoverSkills(ctx.workspace.root, { ...options, customSkillDirs: [...(options.customSkillDirs ?? []), ...pluginRoots] }, (message) => ctx.logger.warn(message))
     ctx.effect(() => ctx.prompt.contribute({
       order: 10,
       instructions: async () => catalog(await discover()),
