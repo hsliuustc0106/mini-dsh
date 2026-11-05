@@ -208,6 +208,9 @@ export class WebControl extends Service {
     try { spec = pluginInstallSpec(data.spec) }
     catch (error) { return json(res, 400, { error: error.message }) }
     if (this.installing || this.changing) return json(res, 409, { error: 'A plugin change is already in progress' })
+    let reservation
+    try { reservation = this.ctx.livePlugins.beginChange() }
+    catch (error) { return json(res, 409, { error: error.message }) }
     this.installing = true
     try {
       let result
@@ -218,7 +221,7 @@ export class WebControl extends Service {
       }
       try {
         const entries = await loadProfileEntries(result.configPath, result.names)
-        const plugins = await this.ctx.livePlugins.mountAll(entries)
+        const plugins = await this.ctx.livePlugins.mountAll(entries, reservation)
         return json(res, 200, {
           packageName: result.packageName,
           names: result.names,
@@ -239,7 +242,10 @@ export class WebControl extends Service {
           restartRequired: true,
         })
       }
-    } finally { this.installing = false }
+    } finally {
+      this.installing = false
+      this.ctx.livePlugins.endChange(reservation)
+    }
   }
 
   async uninstall(res, data) {

@@ -95,6 +95,7 @@ export default {
   try {
     const entries = await loadProfileEntries(profile, ['broken'])
     await assert.rejects(app.ctx.livePlugins.mountAll(entries), /activation boom/)
+    assert.equal(app.ctx.livePlugins.changing, false)
     assert.equal(app.ctx.tools.items.has('broken_tool'), false)
     assert.equal(app.ctx.livePlugins.list().some((row) => row.name === 'broken'), false)
     assert.ok(app.ctx.session.events.some((event) => event.type === 'plugin.failed' && event.name === 'broken'))
@@ -130,6 +131,80 @@ test('live changes refuse while a turn is in progress', async (t) => {
     release()
     await turn
   } finally { await app.dispose() }
+})
+
+test('direct mounts and unmounts reserve the agent until setup or disposal completes', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-reservation-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const app = await boot({ workspace, provider: fakeProvider([{ role: 'assistant', content: 'ok' }]) })
+  let startSetup, finishSetup, startDispose, finishDispose
+  const setupStarted = new Promise((resolve) => { startSetup = resolve })
+  const setupGate = new Promise((resolve) => { finishSetup = resolve })
+  const disposeStarted = new Promise((resolve) => { startDispose = resolve })
+  const disposeGate = new Promise((resolve) => { finishDispose = resolve })
+  const plugin = { async apply(ctx) {
+    startSetup()
+    await setupGate
+    ctx.effect(() => async () => { startDispose(); await disposeGate })
+  } }
+  try {
+    const mounting = app.ctx.livePlugins.mount({ name: 'slow', plugin })
+    await setupStarted
+    assert.throws(() => app.ctx.agent.turn('during mount'), /plugin change is already in progress/)
+    await assert.rejects(app.ctx.livePlugins.mount({ name: 'other', plugin: { apply() {} } }), /plugin change is already in progress/)
+    finishSetup()
+    await mounting
+    const unmounting = app.ctx.livePlugins.unmount('slow')
+    await disposeStarted
+    assert.throws(() => app.ctx.agent.turn('during unmount'), /plugin change is already in progress/)
+    finishDispose()
+    await unmounting
+    await app.ctx.agent.turn('afterwards')
+  } finally { finishSetup(); finishDispose(); await app.dispose() }
+})
+
+test('web installation reserves turns throughout package installation and activation', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-live-install-reservation-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const workspace = join(dir, 'workspace')
+  await mkdir(workspace)
+  const { archive } = await packToolPlugin(dir)
+  const app = await boot({ workspace, web: { port: 0 }, provider: fakeProvider([{ role: 'assistant', content: 'ok' }]) })
+  try {
+    const url = app.ctx.webControl.url
+    const installing = fetch(`${url}/plugins/install`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ spec: archive }) })
+    const deadline = Date.now() + 3000
+    while (!app.ctx.webControl.installing && Date.now() < deadline) await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(app.ctx.webControl.installing, true)
+    assert.throws(() => app.ctx.agent.turn('during install'), /plugin change is already in progress/)
+    const response = await installing
+    assert.equal(response.status, 200, JSON.stringify(await response.clone().json()))
+    await app.ctx.agent.turn('after install')
+  } finally { await app.dispose() }
+})
+
+test('web installation refuses before writing the profile when a turn is active', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-install-busy-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  let approveStarted, release
+  const started = new Promise((resolve) => { approveStarted = resolve })
+  const gate = new Promise((resolve) => { release = resolve })
+  const provider = fakeProvider([
+    { role: 'assistant', content: null, tool_calls: [{ id: 'a', type: 'function', function: { name: 'write', arguments: JSON.stringify({ path: 'x', content: 'ok' }) } }] },
+    { role: 'assistant', content: 'done' },
+  ])
+  const app = await boot({ workspace, web: { port: 0 }, provider, approve: async () => { approveStarted(); await gate; return false } })
+  try {
+    const turn = app.ctx.agent.turn('write')
+    await started
+    const url = app.ctx.webControl.url
+    const response = await fetch(`${url}/plugins/install`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ spec: 'example-plugin' }) })
+    assert.equal(response.status, 409)
+    assert.match((await response.json()).error, /turn is in progress/)
+    await assert.rejects(readFile(join(workspace, '.mini-dsh/plugins.json')), { code: 'ENOENT' })
+    release()
+    await turn
+  } finally { release(); await app.dispose() }
 })
 
 test('web install activates without restart and uninstall removes the tool', async (t) => {
