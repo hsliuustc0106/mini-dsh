@@ -28,6 +28,17 @@ function deltaFrom(stream, chunk) {
   return event
 }
 
+function abortWith(signal, exec) {
+  if (!signal || typeof exec?.abort !== 'function') return () => {}
+  const abort = () => exec.abort(signal.reason)
+  if (signal.aborted) {
+    abort()
+    return () => {}
+  }
+  signal.addEventListener('abort', abort, { once: true })
+  return () => signal.removeEventListener('abort', abort)
+}
+
 function assistantMessage(response, calls) {
   const message = { role: 'assistant', content: response.content ?? null, ...(calls.length ? { tool_calls: calls } : {}) }
   if (response.reasoning_content != null) message.reasoning_content = response.reasoning_content
@@ -54,6 +65,7 @@ export class Agent extends Service {
     if (this.ctx.reflect.get('livePlugins', false)?.changing) throw fail('A plugin change is already in progress', 'BUSY')
     if (typeof input !== 'string' || !input.trim()) throw new Error('Turn input is required')
     this.busy = true
+    this.approve = approve
     const controller = new AbortController()
     this.controller = controller
     let run
@@ -68,6 +80,7 @@ export class Agent extends Service {
     return run.finally(() => {
       if (this.controller === controller) this.controller = null
       if (this.current === run) this.current = null
+      if (this.approve === approve) this.approve = undefined
       this.busy = false
     })
   }
@@ -78,7 +91,10 @@ export class Agent extends Service {
   async shutdown() {
     this.stopping = true
     this.controller?.abort()
+    const jobs = this.ctx.get('jobs')
+    jobs?.cancelAll()
     try { await this.current } catch { /* the turn caller observes the failure */ }
+    try { await jobs?.settle() } catch { /* a failed job record stays in the log */ }
   }
 
   async runTurn(input, report, signal, approve) {
@@ -221,6 +237,7 @@ export class Agent extends Service {
     const admitted = await this.admit(call, report, signal, approve)
     if (!admitted) return []
     const { checkpoint, workspace } = this.ctx
+    const unlink = abortWith(signal, admitted.exec)
     let raw
     try {
       raw = await checkpoint.guard(
@@ -231,6 +248,8 @@ export class Agent extends Service {
       if (error.code === 'CHECKPOINT') throw error
       await this.recordResult(admitted.id, `Error: ${error.message}`, report)
       return []
+    } finally {
+      unlink()
     }
     const outcome = await this.ctx.tools.settle(admitted.exec, raw)
     await this.recordResult(admitted.id, outcome.text, report)
@@ -249,12 +268,17 @@ export class Agent extends Service {
     }
     if (index < calls.length) await this.denyUnstarted(calls.slice(index))
     const { checkpoint, tools, workspace } = this.ctx
-    await Promise.all(admitted.map(async (item) => {
-      await checkpoint.commit({
-        type: 'tool.started', callId: item.id, name: item.name, arguments: structuredClone(item.args), workspace: workspace.root,
-      })
-      item.raw = await tools.executeOnly(item.exec)
-    }))
+    const unlink = admitted.map((item) => abortWith(signal, item.exec))
+    try {
+      await Promise.all(admitted.map(async (item) => {
+        await checkpoint.commit({
+          type: 'tool.started', callId: item.id, name: item.name, arguments: structuredClone(item.args), workspace: workspace.root,
+        })
+        item.raw = await tools.executeOnly(item.exec)
+      }))
+    } finally {
+      for (const release of unlink) release()
+    }
     const contexts = []
     for (const item of admitted) {
       const outcome = await tools.settle(item.exec, item.raw)

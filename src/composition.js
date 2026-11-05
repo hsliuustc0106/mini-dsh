@@ -1,5 +1,6 @@
 import { Agent } from './agent.js'
 import { Agents } from './agents.js'
+import { Jobs, Subagents, SystemPrompt } from './subagent.js'
 import { coding } from './coding.js'
 import { instructions, Prompt, runtimeContext } from './prompt.js'
 import { defaultToolPermissions, Permissions } from './permissions.js'
@@ -40,6 +41,10 @@ export function composition({ workspace, sessionPath, writable = true, provider,
     // Tests and replay pass the fake provider. The terminal passes DeepSeek when a key is set.
     { name: 'provider', plugin: provider ?? fakeProvider(), config: model ?? {} },
     { name: 'agents', plugin: Agents },
+    // Disposed after the agent so a shutdown can still record child settlement.
+    { name: 'subagents', plugin: Subagents },
+    { name: 'jobs', plugin: Jobs },
+    { name: 'system-prompt', plugin: SystemPrompt },
     { name: 'session', plugin: Session, config: { path: sessionPath, writable, workspace, clock } },
     { name: 'workspace', plugin: Workspace, config: { root: workspace } },
   ]

@@ -91,7 +91,7 @@ export const defaultToolPermissions = {
       throw new Error('default-tool-permissions: policies must be an object')
     }
     const policies = new Map([
-      ...['read', 'glob', 'grep', 'skill'].map((name) => [name, 'allow']),
+      ...['read', 'glob', 'grep', 'skill', 'subagent'].map((name) => [name, 'allow']),
       ...['write', 'edit', 'shell'].map((name) => [name, 'ask']),
     ])
     for (const [name, decision] of Object.entries(configured)) {
