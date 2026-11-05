@@ -171,7 +171,7 @@ export class Agent extends Service {
   }
 
   async complete(signal) {
-    const { model, tools, session, checkpoint, prompt } = this.ctx
+    const { model, tools, session, checkpoint, prompt, agents } = this.ctx
     const snap = await prompt.snapshot()
     const prepared = model.prepare({
       instructions: snap.instructions,
@@ -182,7 +182,7 @@ export class Agent extends Service {
         delete copy.source
         return copy
       }),
-      tools: tools.schemas(),
+      tools: tools.schemas(agents.currentInitiator() ?? agents.primary),
     })
     await checkpoint.commit({ type: 'model.request', provider: prepared.provider, body: prepared.body })
     let started = null

@@ -482,7 +482,7 @@ test('presentAs, restrict, run_code, and deferContext fail closed', async () => 
   const tools = ctx.plugin(Tools)
   await tools.await()
   assert.throws(() => ctx.tools.presentAs('code'), /tools\.presentAs is not supported/)
-  assert.throws(() => ctx.tools.restrict({ deny: ['read'] }), /tools\.restrict is not supported/)
+  assert.throws(() => ctx.tools.restrict({ deny: ['read'] }), /tools\.restrict\(\) requires agent\.ctx/)
   assert.throws(() => ctx.tools.register({
     name: 'run_code', description: 'no', parameters: objectParameters, execute: () => 'x',
   }), /Code Mode is not supported/)

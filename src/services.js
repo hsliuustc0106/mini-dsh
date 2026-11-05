@@ -5,6 +5,7 @@ import { appendFile, mkdir, open, readFile, truncate } from 'node:fs/promises'
 import { dirname, isAbsolute } from 'node:path'
 import { resolveAgainstWorkspace } from './workspace-path.js'
 import { acquireWriter, lockPathFor } from './lock.js'
+import { AGENT_SCOPE } from './agents.js'
 import { currentDelegationAgent } from './delegation.js'
 import { assertEvent, createEvent, projectSessionMessages, readSession, unknownOutcomes, unknownReason, unknownStreams } from './log.js'
 import {
@@ -29,6 +30,43 @@ export function validateArguments(schema, value) {
   }
 }
 
+function taggedAgent(ctx) {
+  const agent = ctx[AGENT_SCOPE]
+  if (!agent || typeof agent !== 'object' || Array.isArray(agent) || typeof agent.id !== 'string' || !agent.id) return undefined
+  return agent
+}
+
+// A tagged caller selects that agent. Otherwise the bound mini-dsh agent is
+// the target: agent.ctx does not provide tools, so a normal plugin cannot
+// call through it. No tag and no bound agent fails closed.
+function resolveAgent(ctx, method) {
+  const tagged = taggedAgent(ctx)
+  if (tagged) return tagged
+  const agents = ctx.reflect.get('agents', false)
+  const agent = agents?.primary
+  if (agent && typeof agent.id === 'string' && agent.id) return agent
+  throw new Error(`${method} requires agent.ctx`)
+}
+
+function compileNameList(value, label) {
+  if (!Array.isArray(value) || value.some((name) => typeof name !== 'string' || !name)) {
+    throw new Error(`tools.restrict() ${label} must be an array of tool names`)
+  }
+  if (label === 'deny' && value.length === 0) throw new Error('tools.restrict() deny is empty')
+  const seen = new Set()
+  for (const name of value) {
+    if (seen.has(name)) throw new Error(`tools.restrict() ${label} lists ${JSON.stringify(name)} more than once`)
+    seen.add(name)
+  }
+  return value
+}
+
+function admits(mask, name) {
+  if (mask.allow && !mask.allow.has(name)) return false
+  if (mask.deny && mask.deny.has(name)) return false
+  return true
+}
+
 export class Tools extends Service {
   constructor(ctx) {
     super(ctx, 'tools')
@@ -36,6 +74,8 @@ export class Tools extends Service {
     this.outputs = new Map()
     this.owners = new Map()
     this.guards = []
+    this.masks = []
+    this.presentations = new Map()
   }
   register(tool, options) {
     if (typeof tool?.name !== 'string' || !tool.name) throw new Error('Tool name is required')
@@ -105,17 +145,92 @@ export class Tools extends Service {
       }
     })
   }
-  schemas() {
-    return [...this.items.values()].map(({ name, description, parameters }) => ({
-      type: 'function', function: { name, description, parameters },
-    }))
+  // No agent: the full registry. An agent: native schemas after that agent's masks.
+  // The mini-dsh loop passes the initiating agent, and that list is what JSONL records.
+  schemas(agent) {
+    if (agent === undefined) return this.project()
+    if (!agent || typeof agent !== 'object' || Array.isArray(agent) || typeof agent.id !== 'string' || !agent.id) {
+      throw new Error('tools.schemas() agent must have an id')
+    }
+    const mode = this.presentations.get(agent.id)
+    if (mode !== undefined && mode !== 'native') {
+      throw new Error(`tools.presentAs is not supported (${JSON.stringify(mode)}); only "native" presentation is available`)
+    }
+    return this.project(agent.id)
   }
-  // Process-wide presentation and per-agent masks are not this teaching slice.
-  presentAs() {
-    throw new Error('tools.presentAs is not supported')
+  project(agentId) {
+    return [...this.items.values()]
+      .filter((tool) => agentId === undefined || this.visibleTo(agentId, tool.name))
+      .map(({ name, description, parameters }) => ({
+        type: 'function', function: { name, description, parameters },
+      }))
   }
-  restrict() {
-    throw new Error('tools.restrict is not supported')
+  visibleTo(agentId, name) {
+    for (const mask of this.masks) {
+      if (mask.agentId === agentId && !admits(mask, name)) return false
+    }
+    return true
+  }
+  // Native presentation for the calling agent. One declaration per agent.
+  // Code Mode modes throw and do not register. The effect leaves with the caller fiber.
+  presentAs(mode) {
+    if (mode !== 'native') {
+      throw new Error(`tools.presentAs is not supported (${typeof mode === 'string' ? JSON.stringify(mode) : typeof mode}); only "native" presentation is available`)
+    }
+    const agent = resolveAgent(this.ctx, 'tools.presentAs()')
+    if (this.presentations.has(agent.id)) {
+      throw new Error('tools.presentAs("native") conflicts with a presentation already declared for this agent')
+    }
+    const agentId = agent.id
+    return this.ctx.effect(() => {
+      if (this.presentations.has(agentId)) {
+        throw new Error('tools.presentAs("native") conflicts with a presentation already declared for this agent')
+      }
+      this.presentations.set(agentId, 'native')
+      return () => {
+        if (this.presentations.get(agentId) === 'native') this.presentations.delete(agentId)
+      }
+    })
+  }
+  // Mask global tools for the calling agent. The denial is a tools.guard entry,
+  // so checkGuards rejects a hidden call and a later guard cannot allow it.
+  restrict(filter) {
+    if (!filter || typeof filter !== 'object' || Array.isArray(filter)) {
+      throw new Error('tools.restrict() requires { allow?: string[], deny?: string[] }')
+    }
+    for (const key of Object.keys(filter)) {
+      if (key !== 'allow' && key !== 'deny') throw new Error(`tools.restrict() field '${key}' is not supported`)
+    }
+    if (filter.allow === undefined && filter.deny === undefined) {
+      throw new Error('tools.restrict() requires allow and/or deny')
+    }
+    const allow = filter.allow === undefined ? undefined : compileNameList(filter.allow, 'allow')
+    const deny = filter.deny === undefined ? undefined : compileNameList(filter.deny, 'deny')
+    const agent = resolveAgent(this.ctx, 'tools.restrict()')
+    const named = [...(allow ?? []), ...(deny ?? [])]
+    if (named.includes('run_code')) {
+      throw new Error('tools.restrict() cannot name reserved run_code; Code Mode is not supported')
+    }
+    const unknown = named.filter((name) => !this.items.has(name))
+    if (unknown.length) {
+      throw new Error(`tools.restrict() names unknown tool ${unknown.map((name) => JSON.stringify(name)).join(', ')}`)
+    }
+    const mask = { agentId: agent.id }
+    if (allow !== undefined) mask.allow = new Set(allow)
+    if (deny !== undefined) mask.deny = new Set(deny)
+    return this.ctx.effect(() => {
+      this.masks.push(mask)
+      const removeGuard = this.guard((view) => {
+        if (view?.agent?.id !== mask.agentId) return undefined
+        if (typeof view.name !== 'string' || admits(mask, view.name)) return undefined
+        return `tool ${view.name} is restricted`
+      })
+      return () => {
+        const index = this.masks.indexOf(mask)
+        if (index >= 0) this.masks.splice(index, 1)
+        removeGuard()
+      }
+    })
   }
   // Monotonic denial after tools/pre-execute. A returned string cannot be
   // turned back into permission by a later waterfall listener. The registration
@@ -186,6 +301,13 @@ export class Tools extends Service {
     return normalizePreDecision(decision)
   }
   checkGuards(exec) {
+    const agentId = exec?.view?.agent?.id
+    if (typeof agentId === 'string') {
+      const mode = this.presentations.get(agentId)
+      if (mode !== undefined && mode !== 'native') {
+        throw new Error(`tools.presentAs is not supported (${JSON.stringify(mode)}); only "native" presentation is available`)
+      }
+    }
     for (const entry of this.guards) {
       let reason
       try { reason = entry.guard(exec.view) }
