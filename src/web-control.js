@@ -4,7 +4,7 @@ import { createServer } from 'node:http'
 import { Service } from '@deepseek-ai/cordis'
 import { project } from './trajectory.js'
 import { installPlugin } from './install-plugin.js'
-import { loadProfileEntries, uninstallPlugin } from './live-plugins.js'
+import { BUILTIN_PLUGIN_NAMES, loadProfileEntries, readPluginProfile, uninstallPlugin } from './live-plugins.js'
 
 const HOST = '127.0.0.1'
 const MAX_BODY = 1024 * 1024
@@ -179,7 +179,14 @@ export class WebControl extends Service {
     }
     if (req.method === 'GET' && url.pathname === '/events') return this.stream(req, res, url)
     if (req.method === 'GET' && url.pathname === '/plugins') {
-      return json(res, 200, { plugins: this.ctx.livePlugins.list() })
+      const plugins = this.ctx.livePlugins.list()
+      const mounted = new Set(plugins.map((entry) => entry.name))
+      const profile = await readPluginProfile(this.pluginConfig)
+      for (const entry of profile.plugins) {
+        if (!entry?.name || !entry.module || BUILTIN_PLUGIN_NAMES.has(entry.name) || mounted.has(entry.name)) continue
+        plugins.push({ name: entry.name, state: entry.enabled === false ? 'disabled' : 'not mounted', source: 'profile' })
+      }
+      return json(res, 200, { plugins })
     }
     if (req.method !== 'POST' || !['/turn', '/approval', '/plugins/install', '/plugins/uninstall'].includes(url.pathname)) {
       return send(res, 404, 'text/plain; charset=utf-8', 'Not found\n')
@@ -215,9 +222,10 @@ export class WebControl extends Service {
         return json(res, 200, {
           packageName: result.packageName,
           names: result.names,
+          installedNames: result.installedNames,
           configPath: result.configPath,
           restartRequired: false,
-          phase: 'active',
+          phase: result.names.length ? 'active' : 'installed',
           plugins,
         })
       } catch (error) {
@@ -226,6 +234,7 @@ export class WebControl extends Service {
           phase: 'activation',
           packageName: result.packageName,
           names: result.names,
+          installedNames: result.installedNames,
           configPath: result.configPath,
           restartRequired: true,
         })

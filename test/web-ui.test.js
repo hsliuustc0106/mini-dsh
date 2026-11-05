@@ -86,6 +86,14 @@ test('plugin form submits the URL and reports live activation and permissions', 
   assert.match(elements['plugin-result'].textContent, /denied/)
 })
 
+test('plugin form does not claim disabled entries were activated', async () => {
+  const { elements } = await browser({ packageName: 'example', names: [], installedNames: ['disabled-entry'], restartRequired: false })
+  elements['plugin-spec'].value = 'example'
+  await elements['plugins-form'].listeners.get('submit')({ preventDefault() {} })
+  assert.match(elements['plugin-result'].textContent, /all entries are disabled/)
+  assert.doesNotMatch(elements['plugin-result'].textContent, /activated/)
+})
+
 function descendants(element) {
   return element.children.flatMap((child) => child instanceof Element ? [child, ...descendants(child)] : [])
 }

@@ -173,11 +173,16 @@ export class LivePlugins extends Service {
     // fiber so live mounts' ctx.effect cleanups run when this service disposes.
     this.owner = ctx.fiber
     this.mounted = new Map()
+    this.bootBuiltins = new Map()
   }
 
   adopt(started = []) {
     for (const entry of started) {
-      if (!entry?.name || BUILTIN_PLUGIN_NAMES.has(entry.name)) continue
+      if (!entry?.name) continue
+      if (BUILTIN_PLUGIN_NAMES.has(entry.name)) {
+        this.bootBuiltins.set(entry.name, { fiber: entry.fiber, required: entry.required })
+        continue
+      }
       if (this.mounted.has(entry.name)) continue
       // Boot-started fibers stay owned by boot(); live mounts use ctx.effect below.
       this.mounted.set(entry.name, { fiber: entry.fiber, module: entry.module, source: 'boot', required: entry.required })
@@ -214,7 +219,7 @@ export class LivePlugins extends Service {
     const provided = new Set(this.servicesProvidedBy(name))
     if (!provided.size) return []
     const affected = []
-    for (const [other, info] of this.mounted) {
+    for (const [other, info] of [...this.bootBuiltins, ...this.mounted]) {
       if (other === name) continue
       if (info.required === false) continue
       const missing = []

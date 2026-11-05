@@ -22,7 +22,7 @@ async function refreshPlugins() {
     const data = await response.json()
     pluginList.replaceChildren()
     if (!data.plugins?.length) {
-      pluginList.append(node('li', 'plugin-empty', 'No runtime plugins mounted.'))
+      pluginList.append(node('li', 'plugin-empty', 'No plugins installed.'))
       return
     }
     for (const plugin of data.plugins) {
@@ -73,8 +73,11 @@ pluginForm.addEventListener('submit', async (event) => {
     }
     if (result.restartRequired) {
       pluginResult.textContent = `Installed ${result.packageName} (${result.names.join(', ')}). Restart mini-dsh to load it. New tools are denied until a permission policy is configured.`
+    } else if (!result.names.length) {
+      pluginResult.textContent = `Installed ${result.packageName}; all entries are disabled.`
     } else {
       pluginResult.textContent = `Installed and activated ${result.packageName} (${result.names.join(', ')}). New tools are denied until a permission policy is configured.`
+      if (result.installedNames?.length > result.names.length) pluginResult.textContent += ' Other entries are disabled.'
     }
     await refreshPlugins()
   } catch (error) { pluginResult.textContent = error.message || 'Installation failed' }
