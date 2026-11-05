@@ -1,5 +1,8 @@
 export default {
   inject: ['tools', 'permissions'],
+  settings: {
+    prefix: { type: 'string', description: 'Greeting prefix' },
+  },
   apply(ctx, config = {}) {
     ctx.effect(() => ctx.tools.register({
       name: 'greet',

@@ -131,13 +131,13 @@ The installer accepts a package exposing a plugin entry point, or a DSH bundle d
 
 One package-specific exception supports `@tt-a1i/archify-dsh@1.0.0`: mini-dsh checks the published bundle's exact skill-provider configuration and path expression, then registers its packaged skill directory through its own skills plugin. It does not evaluate the expression, add it to the teaching-scoped `!!js` grammar, or run the DSH filesystem provider. A different expression or bundle shape fails without changing the profile. The skill appears and disappears on live install and uninstall; the packaged instructions and any commands they request still need your usual tool permissions.
 
-Installed tools have no automatic permission grant and are denied by default. To allow a particular tool, add a policy to `.mini-dsh/plugins.json`, for example:
+Installed tools have no automatic permission grant and are denied by default. The web **Plugins** panel lists each installed plugin's status, missing dependencies, supported settings, and tool policies. Save a supported setting there, or choose `allow`, `ask`, or `deny` for a tool that plugin registered. The change is written to the profile and becomes active immediately when activation succeeds. A failed activation restores the previous configuration. A setting the plugin does not declare is rejected. A service mini-dsh does not provide is reported as unsupported — installing a package does not create that service. The same policy can be added to `.mini-dsh/plugins.json` directly, for example:
 
 ```json
 { "name": "default-tool-permissions", "config": { "policies": { "my_tool": "ask" } } }
 ```
 
-Add that object to the existing `plugins` array. Use `allow`, `ask`, or `deny` and restart the agent. Installed files can be removed manually after their profile rows have been removed.
+Add that object to the existing `plugins` array. Use `allow`, `ask`, or `deny`. A profile edited by hand applies on the next start; the web panel applies the same entry to the running process. Installed files can be removed manually after their profile rows have been removed.
 
 ### DSH tool compatibility (initial subset)
 

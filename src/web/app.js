@@ -14,6 +14,148 @@ const pluginInstall = get('plugin-install')
 const pluginResult = get('plugin-result')
 const pluginList = get('plugin-list')
 
+function dependencyLine(plugin) {
+  const dependencies = Array.isArray(plugin.dependencies) ? plugin.dependencies : []
+  if (!dependencies.length) return node('p', 'plugin-deps', 'No service dependencies.')
+  const text = dependencies.map((item) => item.status === 'available'
+    ? `${item.service} (available)`
+    : `${item.service} (${item.status}): ${item.message}`).join('; ')
+  const unsupported = dependencies.some((item) => item.status === 'unsupported' || item.status === 'unavailable')
+  return node('p', unsupported ? 'plugin-deps plugin-unsupported' : 'plugin-deps', `Dependencies: ${text}`)
+}
+
+function fieldInput(field) {
+  if (field.type === 'boolean') {
+    const input = node('input')
+    input.type = 'checkbox'
+    input.checked = field.value === true
+    return input
+  }
+  if (field.type === 'enum') {
+    const input = node('select')
+    for (const option of field.options ?? []) {
+      const item = node('option', '', option)
+      item.value = option
+      if (option === field.value) item.selected = true
+      input.append(item)
+    }
+    input.value = typeof field.value === 'string' ? field.value : ''
+    return input
+  }
+  const input = node('input')
+  input.type = field.type === 'number' ? 'number' : 'text'
+  input.value = field.value == null ? '' : String(field.value)
+  return input
+}
+
+function settingsForm(plugin) {
+  const fields = Array.isArray(plugin.settings) ? plugin.settings : []
+  const supported = fields.filter((field) => field.supported)
+  const form = node('form', 'plugin-settings')
+  form.append(node('h3', '', 'Settings'))
+  if (plugin.settingsError) form.append(node('p', 'plugin-unsupported', plugin.settingsError))
+  if (!supported.length) form.append(node('p', 'plugin-note', 'No supported settings. Existing configuration stays unchanged.'))
+  const inputs = new Map()
+  for (const field of supported) {
+    const label = node('label', '', field.description ? `${field.key} — ${field.description}` : field.key)
+    const input = fieldInput(field)
+    label.append(input)
+    form.append(label)
+    inputs.set(field.key, input)
+  }
+  for (const field of fields) {
+    if (field.supported) continue
+    form.append(node('p', 'plugin-unsupported', field.reason || `Unsupported setting ${field.key}`))
+  }
+  if (supported.length) {
+    const save = node('button', '', 'Save settings')
+    save.type = 'submit'
+    form.append(save)
+  }
+  form.addEventListener('submit', (event) => submitSettings(event, plugin.name, supported, inputs))
+  return form
+}
+
+function policyForm(plugin) {
+  const tools = Array.isArray(plugin.tools) ? plugin.tools : []
+  const form = node('form', 'plugin-policies')
+  form.append(node('h3', '', 'Tool permissions'))
+  form.append(node('p', 'plugin-note', 'Unknown tools stay denied. A policy is stored only for a tool this plugin registered.'))
+  if (!tools.length) {
+    form.append(node('p', 'plugin-note', 'No tools registered.'))
+    return form
+  }
+  const selects = new Map()
+  for (const tool of tools) {
+    const label = node('label', '', tool.name)
+    const select = node('select')
+    select.setAttribute('aria-label', `${tool.name} permission`)
+    for (const decision of ['allow', 'ask', 'deny']) {
+      const option = node('option', '', decision)
+      option.value = decision
+      select.append(option)
+    }
+    select.value = ['allow', 'ask', 'deny'].includes(tool.decision) ? tool.decision : 'deny'
+    const note = tool.source === 'default' ? 'Denied by default (no policy stored).' : `Current policy: ${tool.decision}.`
+    label.append(select, node('span', 'plugin-note', note))
+    form.append(label)
+    selects.set(tool.name, select)
+  }
+  const save = node('button', '', 'Save permissions')
+  save.type = 'submit'
+  form.append(save)
+  form.addEventListener('submit', (event) => submitPolicies(event, plugin.name, tools, selects))
+  return form
+}
+
+function pluginDetail(plugin) {
+  const detail = node('div', 'plugin-detail')
+  detail.append(dependencyLine(plugin), settingsForm(plugin), policyForm(plugin))
+  return detail
+}
+
+async function submitSettings(event, name, fields, inputs) {
+  event.preventDefault()
+  const config = {}
+  for (const field of fields) {
+    const input = inputs.get(field.key)
+    if (field.type === 'boolean') config[field.key] = input.checked === true
+    else if (field.type === 'number') {
+      if (input.value === '' || !Number.isFinite(Number(input.value))) {
+        pluginResult.textContent = `${field.key} must be a finite number`
+        return
+      }
+      config[field.key] = Number(input.value)
+    } else config[field.key] = input.value
+  }
+  pluginResult.textContent = `Saving settings for ${name}…`
+  try {
+    const response = await fetch('/plugins/config', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, config }),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.error || 'Settings were not saved')
+    pluginResult.textContent = result.message || (result.active ? 'Active now.' : 'Settings saved.')
+    await refreshPlugins()
+  } catch (error) { pluginResult.textContent = error.message || 'Settings were not saved' }
+}
+
+async function submitPolicies(event, name, tools, selects) {
+  event.preventDefault()
+  const policies = {}
+  for (const tool of tools) policies[tool.name] = selects.get(tool.name).value
+  pluginResult.textContent = `Saving permissions for ${name}…`
+  try {
+    const response = await fetch('/plugins/permissions', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, policies }),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.error || 'Permissions were not saved')
+    pluginResult.textContent = result.message || 'Active now.'
+    await refreshPlugins()
+  } catch (error) { pluginResult.textContent = error.message || 'Permissions were not saved' }
+}
+
 async function refreshPlugins() {
   if (!pluginList) return
   try {
@@ -31,7 +173,7 @@ async function refreshPlugins() {
       const remove = node('button', '', 'Uninstall')
       remove.type = 'button'
       remove.addEventListener('click', () => uninstallPlugin(plugin.name))
-      row.append(label, remove)
+      row.append(label, remove, pluginDetail(plugin))
       pluginList.append(row)
     }
   } catch (error) {

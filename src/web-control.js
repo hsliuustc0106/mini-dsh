@@ -5,6 +5,7 @@ import { Service } from '@deepseek-ai/cordis'
 import { project } from './trajectory.js'
 import { installPlugin } from './install-plugin.js'
 import { BUILTIN_PLUGIN_NAMES, loadProfileEntries, readPluginProfile, uninstallPlugin } from './live-plugins.js'
+import { installedPlugins, updatePluginSettings, updatePluginToolPolicies } from './plugin-admin.js'
 import { ClientHost, loadClientProfile } from './client-plugins.js'
 
 const HOST = '127.0.0.1'
@@ -74,7 +75,7 @@ function cursorOf(req, url) {
 // A web turn owns its approval channel. Disconnecting that channel never
 // transfers an approval to a later connection, even for the same call id.
 export class WebControl extends Service {
-  static inject = ['agent', 'session', 'workspace', 'livePlugins']
+  static inject = ['agent', 'session', 'workspace', 'livePlugins', 'permissions', 'tools']
 
   constructor(ctx, config = {}) {
     super(ctx, 'webControl')
@@ -85,6 +86,7 @@ export class WebControl extends Service {
     this.client = null
     this.installing = false
     this.changing = false
+    this.policyReleases = new Map()
     if (!Number.isInteger(this.port) || this.port < 0 || this.port > 65535) throw new Error('Web control port is invalid')
     this.clients = new Map()
     this.pending = null
@@ -197,20 +199,11 @@ export class WebControl extends Service {
       return json(res, 200, { cursor: projection.cursor, overview })
     }
     if (req.method === 'GET' && url.pathname === '/events') return this.stream(req, res, url)
-    if (req.method === 'GET' && url.pathname === '/plugins') {
-      const plugins = this.ctx.livePlugins.list()
-      const mounted = new Set(plugins.map((entry) => entry.name))
-      const profile = await readPluginProfile(this.pluginConfig)
-      for (const entry of profile.plugins) {
-        if (!entry?.name || !entry.module || BUILTIN_PLUGIN_NAMES.has(entry.name) || mounted.has(entry.name)) continue
-        plugins.push({ name: entry.name, state: entry.enabled === false ? 'disabled' : 'not mounted', source: 'profile' })
-      }
-      return json(res, 200, { plugins })
-    }
+    if (req.method === 'GET' && url.pathname === '/plugins') return this.plugins(res)
     if (req.method === 'GET' && url.pathname === '/client-ui') {
       return json(res, 200, this.client.view())
     }
-    if (req.method !== 'POST' || !['/turn', '/approval', '/plugins/install', '/plugins/uninstall'].includes(url.pathname)) {
+    if (req.method !== 'POST' || !['/turn', '/approval', '/plugins/install', '/plugins/uninstall', '/plugins/config', '/plugins/permissions'].includes(url.pathname)) {
       return send(res, 404, 'text/plain; charset=utf-8', 'Not found\n')
     }
     if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '')) return json(res, 415, { error: 'JSON required' })
@@ -222,7 +215,53 @@ export class WebControl extends Service {
     if (url.pathname === '/turn') return this.startTurn(res, data)
     if (url.pathname === '/plugins/install') return this.install(res, data)
     if (url.pathname === '/plugins/uninstall') return this.uninstall(res, data)
+    if (url.pathname === '/plugins/config') return this.configurePlugin(res, data)
+    if (url.pathname === '/plugins/permissions') return this.permitTools(res, data)
     return this.answer(res, data)
+  }
+
+  async plugins(res) {
+    try { return json(res, 200, await installedPlugins(this.ctx, this.pluginConfig)) }
+    catch (error) { return json(res, 400, { error: error.message }) }
+  }
+
+  // User policies are effects on this fiber. Disposing the web control server
+  // drops the override; the profile is what the next boot applies.
+  applyPolicyOverlay(policies) {
+    for (const [name, decision] of Object.entries(policies)) {
+      this.policyReleases.get(name)?.()
+      this.policyReleases.set(name, this.ctx.effect(() => this.ctx.permissions.overlay(name, decision), `tool-policy:${name}`))
+    }
+  }
+
+  async configurePlugin(res, data) {
+    if (typeof data.name !== 'string' || !data.name.trim()) return json(res, 400, { error: 'Plugin name is required' })
+    if (!data.config || typeof data.config !== 'object' || Array.isArray(data.config)) return json(res, 400, { error: 'Plugin settings must be an object' })
+    if (this.installing || this.changing || this.ctx.livePlugins.changing) return json(res, 409, { error: 'A plugin change is already in progress' })
+    if (this.ctx.agent.busy) return json(res, 409, { error: 'Cannot change plugins while a turn is in progress' })
+    this.changing = true
+    try {
+      const result = await updatePluginSettings(this.ctx, this.pluginConfig, data.name, data.config)
+      return json(res, 200, result)
+    } catch (error) {
+      return json(res, error.status === 409 ? 409 : 400, { error: error.message, active: false, restored: Boolean(error.restoreProfile) })
+    } finally { this.changing = false }
+  }
+
+  async permitTools(res, data) {
+    if (typeof data.name !== 'string' || !data.name.trim()) return json(res, 400, { error: 'Plugin name is required' })
+    if (!data.policies || typeof data.policies !== 'object' || Array.isArray(data.policies)) return json(res, 400, { error: 'Tool policies must be an object' })
+    if (this.installing || this.changing || this.ctx.livePlugins.changing) return json(res, 409, { error: 'A plugin change is already in progress' })
+    if (this.ctx.agent.busy) return json(res, 409, { error: 'Cannot change plugins while a turn is in progress' })
+    this.changing = true
+    try {
+      const policies = await updatePluginToolPolicies(this.ctx, this.pluginConfig, data.name, data.policies)
+      this.applyPolicyOverlay(policies)
+      const summary = Object.entries(policies).map(([tool, decision]) => `${tool} is ${decision}`).join('; ')
+      return json(res, 200, { name: data.name, active: true, policies, message: `Active now. ${summary}.` })
+    } catch (error) {
+      return json(res, 400, { error: error.message, active: false })
+    } finally { this.changing = false }
   }
 
   async install(res, data) {

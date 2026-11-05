@@ -820,7 +820,17 @@ test('disabled bundle entries remain visible and can be uninstalled through the 
     assert.deepEqual(installed.names, [])
     assert.deepEqual(installed.installedNames, ['disabled-entry'])
     const listed = await (await fetch(`${url}/plugins`)).json()
-    assert.deepEqual(listed.plugins, [{ name: 'disabled-entry', state: 'disabled', source: 'profile' }])
+    const profileModule = JSON.parse(await readFile(installed.configPath, 'utf8')).plugins[0].module
+    assert.deepEqual(listed.plugins, [{
+      name: 'disabled-entry',
+      state: 'disabled',
+      source: 'profile',
+      module: profileModule,
+      missing: [],
+      dependencies: [],
+      settings: [],
+      tools: [],
+    }])
     assert.equal((await post('/plugins/uninstall', { name: 'disabled-entry' })).status, 200)
     assert.deepEqual((await (await fetch(`${url}/plugins`)).json()).plugins, [])
     assert.deepEqual(JSON.parse(await readFile(installed.configPath, 'utf8')).plugins, [])

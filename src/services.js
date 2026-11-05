@@ -34,6 +34,7 @@ export class Tools extends Service {
     super(ctx, 'tools')
     this.items = new Map()
     this.outputs = new Map()
+    this.owners = new Map()
     this.guards = []
   }
   register(tool, options) {
@@ -88,12 +89,17 @@ export class Tools extends Service {
       if (validate.$async) throw new Error(`Tool ${tool.name}: asynchronous DSH output schemas are not supported`)
       output = { schema, validate, render: tool.output.render.bind(tool.output) }
     }
+    // The traceable service proxy makes this.ctx the caller, so the owner fiber
+    // is the plugin that registered the tool. Dispose drops that same identity.
+    const owner = this.ctx.fiber
     return this.ctx.effect(() => {
       this.items.set(tool.name, tool)
+      this.owners.set(tool.name, owner)
       if (output) this.outputs.set(tool.name, output)
       return () => {
         if (this.items.get(tool.name) !== tool) return
         this.items.delete(tool.name)
+        if (this.owners.get(tool.name) === owner) this.owners.delete(tool.name)
         this.outputs.delete(tool.name)
         if (output) this.outputSchemas.removeSchema(output.schema)
       }

@@ -10,8 +10,9 @@
 <body>
   <main class="app">
     <header class="header"><strong>mini-dsh</strong><span id="workspace"></span><div id="client-slots" class="client-slots" hidden></div><button id="plugins-toggle" type="button" aria-expanded="false" aria-controls="plugins-panel">Plugins</button></header>
-    <section id="plugins-panel" class="plugins-panel" aria-label="Install plugin" hidden>
+    <section id="plugins-panel" class="plugins-panel" aria-label="Plugins" hidden>
       <h2>Plugins</h2>
+      <p>Installed plugins show their status, dependencies, supported settings, and tool permissions. Unknown tools stay denied. Installing a package does not make an unsupported service available.</p>
       <ul id="plugin-list" class="plugin-list" aria-live="polite"></ul>
       <h3>Install a plugin</h3>
       <p>Enter an npm package or HTTPS GitHub repository URL. Installation can run package code; install only plugins you trust. Compatible plugins activate without a restart.</p>
