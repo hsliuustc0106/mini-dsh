@@ -147,9 +147,7 @@ export async function uninstallPlugin(name, workspace, options = {}) {
   const configPath = options.configPath ?? join(workspace, '.mini-dsh', 'plugins.json')
   if (!isAbsolute(configPath)) throw new Error('Plugin config path must be absolute')
   const live = options.livePlugins
-  if (live?.changing) throw new Error('A plugin change is already in progress')
-  if (live?.busy()) throw new Error('Cannot uninstall plugins while a turn is in progress')
-  if (live) live.changing = true
+  const token = live?.beginChange()
   let lock
   try {
     lock = await lockProfile(configPath)
@@ -184,7 +182,7 @@ export async function uninstallPlugin(name, workspace, options = {}) {
       for (const item of names) {
         if (!live?.mounted.has(item)) continue
         const entry = live.mounted.get(item).entry
-        try { await live.unmount(item) }
+        try { await live.unmount(item, token) }
         finally { if (!live.mounted.has(item)) snapshots.push(entry) }
       }
       await rename(temp, configPath)
@@ -192,7 +190,7 @@ export async function uninstallPlugin(name, workspace, options = {}) {
       await rm(temp, { force: true })
       const failures = []
       for (const entry of snapshots.reverse()) {
-        try { await live.mount(entry) }
+        try { await live.mount(entry, token) }
         catch (rollback) { failures.push(`${entry.name}: ${rollback.message}`) }
       }
       if (failures.length) throw new Error(`Uninstall failed: ${error.message}; restoration failed: ${failures.join('; ')}. Restart using the unchanged profile.`, { cause: error })
@@ -200,8 +198,8 @@ export async function uninstallPlugin(name, workspace, options = {}) {
     }
     return { name, names, configPath }
   } finally {
-    lock?.release()
-    if (live) live.changing = false
+    try { lock?.release() }
+    finally { if (live) live.endChange(token) }
   }
 }
 
@@ -218,6 +216,7 @@ export class LivePlugins extends Service {
     this.mounted = new Map()
     this.bootBuiltins = new Map()
     this.activeAgentLoops = new Set()
+    this.changeToken = null
   }
 
   adopt(started = [], agentLoops = []) {
@@ -244,6 +243,29 @@ export class LivePlugins extends Service {
 
   busy() {
     return Boolean(this.ctx.agent.busy)
+  }
+
+  get changing() { return this.changeToken !== null }
+
+  beginChange() {
+    if (this.changing) throw new Error('A plugin change is already in progress')
+    if (this.busy()) throw new Error('Cannot change plugins while a turn is in progress')
+    return (this.changeToken = Symbol('plugin change'))
+  }
+
+  endChange(token) {
+    if (this.changeToken !== token || token == null) throw new Error('Invalid plugin change reservation')
+    this.changeToken = null
+  }
+
+  async withChange(action, token) {
+    if (token !== undefined) {
+      if (!this.changing || this.changeToken !== token) throw new Error('Invalid plugin change reservation')
+      return action(token)
+    }
+    const ownToken = this.beginChange()
+    try { return await action(ownToken) }
+    finally { this.endChange(ownToken) }
   }
 
   // Services registered under this plugin's fiber (including nested Service plugins).
@@ -299,7 +321,12 @@ export class LivePlugins extends Service {
     return ordered
   }
 
-  async mount(entry) {
+  async mount(entry, token) {
+    return this.withChange((reservation) => this.mountReserved(entry, reservation), token)
+  }
+
+  async mountReserved(entry, token) {
+    if (!this.changing || this.changeToken !== token) throw new Error('Invalid plugin change reservation')
     if (!entry?.plugin || typeof entry.name !== 'string' || !entry.name) throw new Error('Mount needs a name and a plugin')
     if (BUILTIN_PLUGIN_NAMES.has(entry.name)) throw new Error(`Built-in plugin cannot be mounted at runtime: ${entry.name}`)
     if (this.mounted.has(entry.name)) throw new Error(`Plugin already mounted: ${entry.name}`)
@@ -349,13 +376,20 @@ export class LivePlugins extends Service {
     }
   }
 
-  async mountAll(entries) {
-    const reports = []
-    for (const entry of entries) reports.push(await this.mount(entry))
-    return reports
+  async mountAll(entries, token) {
+    return this.withChange(async (reservation) => {
+      const reports = []
+      for (const entry of entries) reports.push(await this.mount(entry, reservation))
+      return reports
+    }, token)
   }
 
-  async unmount(name) {
+  async unmount(name, token) {
+    return this.withChange((reservation) => this.unmountReserved(name, reservation), token)
+  }
+
+  async unmountReserved(name, token) {
+    if (!this.changing || this.changeToken !== token) throw new Error('Invalid plugin change reservation')
     if (typeof name !== 'string' || !name.trim()) throw new Error('Plugin name is required')
     if (BUILTIN_PLUGIN_NAMES.has(name)) throw new Error(`Built-in plugin cannot be unmounted: ${name}`)
     if (this.busy()) throw new Error('Cannot unmount plugins while a turn is in progress')
