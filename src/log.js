@@ -40,6 +40,9 @@ export function assertEvent(event, seq) {
   if ((event.type === 'tool.started' || event.type === 'tool.finished') && (typeof event.callId !== 'string' || !event.callId)) {
     throw corrupt('tool event requires callId')
   }
+  if (event.type === 'tools.context' && (typeof event.callId !== 'string' || !event.callId || typeof event.content !== 'string' || !event.content)) {
+    throw corrupt('tools.context requires callId and content')
+  }
   if ((event.type === 'stream.delta' || event.type === 'stream.ended') && (!Number.isInteger(event.stream) || event.stream < 1)) {
     throw corrupt('stream event requires stream')
   }

@@ -70,6 +70,7 @@ function summaryFor(event) {
   if (event.type === 'permission.decided') return clip(`${event.decision} ${event.name}`)
   if (event.type === 'tool.started') return toolLabel(event.name, event.arguments)
   if (event.type === 'tool.finished') return clip(event.result)
+  if (event.type === 'tools.context') return clip(event.content)
   if (event.type !== 'message') return event.type
   const message = event.message
   if (message.role === 'assistant' && !message.content && message.tool_calls?.length) {
