@@ -212,7 +212,7 @@ export async function installPlugin(spec, workspace, options = {}) {
         await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx' })
         await rename(temp, configPath)
       } catch (error) { await rm(temp, { force: true }); throw error }
-      return { packageName, configPath, names }
+      return { packageName, configPath, names, installedNames: [...inserted] }
     } finally { lock.release() }
   } catch (error) {
     await rm(stage, { recursive: true, force: true })

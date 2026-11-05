@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { boot } from '../src/boot.js'
+import { composition } from '../src/composition.js'
 import { installPlugin } from '../src/install-plugin.js'
 import { CORDIS_PIN, LivePlugins, loadProfileEntries, uninstallPlugin } from '../src/live-plugins.js'
 import { fakeProvider } from '../src/provider.js'
@@ -289,8 +290,12 @@ export function apply(ctx) {
     assert.equal(response.status, 200, body.error)
     assert.equal(body.phase, 'active')
     assert.deepEqual(body.names, ['example'])
+    assert.deepEqual(body.installedNames, ['example', 'extra'])
     assert.ok(app.ctx.tools.items.has('names_echo'))
     assert.equal(JSON.parse(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8')).plugins.find((row) => row.name === 'extra').enabled, false)
+    const listed = await (await fetch(`${url}/plugins`)).json()
+    assert.ok(listed.plugins.some((row) => row.name === 'example' && row.state === 'active'))
+    assert.ok(listed.plugins.some((row) => row.name === 'extra' && row.state === 'disabled'))
   } finally { await app.dispose() }
 })
 
@@ -416,4 +421,60 @@ export default { apply(ctx) { ctx.provide('sharedSvc', {}) } }
     assert.equal(again.report.find((row) => row.name === 'shared-provider'), undefined)
     assert.equal(again.report.find((row) => row.name === 'dep-optional')?.state, 'pending')
   } finally { await again.dispose() }
+})
+
+test('uninstall protects required built-in replacements that depend on a plugin service', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-builtin-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  await writeFile(join(workspace, 'provider.mjs'), "export function apply(ctx) { ctx.provide('extraSvc', {}) }\n")
+  const profile = join(workspace, 'plugins.json')
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'extra-provider', module: './provider.mjs' }] }))
+  const compose = (options) => {
+    const entries = composition(options)
+    entries.find((entry) => entry.name === 'coding').plugin = {
+      inject: ['tools', 'extraSvc'],
+      apply(ctx) { ctx.tools.register({ name: 'replacement_tool', description: 'replacement', parameters: { type: 'object' }, execute: () => 'ok' }) },
+    }
+    return entries
+  }
+  const app = await boot({ workspace, pluginConfig: profile, web: { port: 0 }, provider: fakeProvider([]), composition: compose })
+  try {
+    assert.ok(app.ctx.tools.items.has('replacement_tool'))
+    const url = app.ctx.webControl.url
+    const response = await fetch(`${url}/plugins/uninstall`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'extra-provider' }) })
+    assert.equal(response.status, 400)
+    assert.match((await response.json()).error, /coding \(needs extraSvc\)/)
+    assert.ok(app.ctx.tools.items.has('replacement_tool'))
+    assert.ok(JSON.parse(await readFile(profile, 'utf8')).plugins.some((entry) => entry.name === 'extra-provider'))
+    assert.ok(!app.ctx.livePlugins.list().some((entry) => entry.name === 'coding'))
+  } finally { await app.dispose() }
+  const again = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]), composition: compose })
+  try { assert.ok(again.ctx.tools.items.has('replacement_tool')) } finally { await again.dispose() }
+})
+
+test('disabled bundle entries remain visible and can be uninstalled through the web API', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-live-disabled-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const pkg = join(dir, 'package'), workspace = join(dir, 'workspace')
+  await mkdir(pkg); await mkdir(workspace)
+  await writeFile(join(pkg, 'package.json'), JSON.stringify({ name: 'disabled-bundle', version: '1.0.0', type: 'module', main: 'index.js', dsh: { bundle: { patch: 'patch.yml' } } }))
+  await writeFile(join(pkg, 'index.js'), 'export function apply() {}\n')
+  await writeFile(join(pkg, 'patch.yml'), '- insert:\n    - id: disabled-entry\n      name: disabled-bundle\n      disabled: true\n')
+  const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()
+  const app = await boot({ workspace, web: { port: 0 }, provider: fakeProvider([]) })
+  try {
+    const url = app.ctx.webControl.url
+    const post = (path, data) => fetch(`${url}${path}`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify(data) })
+    const response = await post('/plugins/install', { spec: join(dir, archive) })
+    const installed = await response.json()
+    assert.equal(response.status, 200, installed.error)
+    assert.equal(installed.phase, 'installed')
+    assert.deepEqual(installed.names, [])
+    assert.deepEqual(installed.installedNames, ['disabled-entry'])
+    const listed = await (await fetch(`${url}/plugins`)).json()
+    assert.deepEqual(listed.plugins, [{ name: 'disabled-entry', state: 'disabled', source: 'profile' }])
+    assert.equal((await post('/plugins/uninstall', { name: 'disabled-entry' })).status, 200)
+    assert.deepEqual((await (await fetch(`${url}/plugins`)).json()).plugins, [])
+    assert.deepEqual(JSON.parse(await readFile(installed.configPath, 'utf8')).plugins, [])
+  } finally { await app.dispose() }
 })
