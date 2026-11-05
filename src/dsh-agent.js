@@ -5,11 +5,13 @@ import { Agent } from './agent.js'
 // Run the DSH driver in a separate Cordis context: DSH's scoped `agent`
 // accessor cannot share a context with mini-dsh's `agent` service. The mini
 // session remains authoritative; the DSH session is an ephemeral driver state.
+// This override does not dispatch mini-dsh agent/* hooks. Those stay on Agent.runTurn.
 export class DshAgent extends Agent {
   constructor(ctx, config) {
     super(ctx)
     this.loopModule = config.loopModule
     this.loopPlugin = config.loopPlugin
+    this.ctx.agents.useOfficialLoop()
     this.fibers = []
     this.pendingCalls = []
   }

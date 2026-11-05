@@ -1,6 +1,6 @@
 import { Service } from '@deepseek-ai/cordis'
 import { completeFinish, observeStream, unknownReason } from './log.js'
-import { flattenHookMessage, miniAgentHandle, toPreStepMessages } from './agents.js'
+import { toPreStepMessages } from './agents.js'
 import { validateArguments } from './services.js'
 
 function fail(message, code) {
@@ -43,9 +43,9 @@ export class Agent extends Service {
     this.current = null
     this.controller = null
     this.ctx.effect(() => () => this.shutdown())
-    // Expose a DSH-shaped handle so agent/pre-step listeners can read turn/end
-    // facts from the mini-dsh JSONL session via session.snapshotEvents().
-    this.ctx.effect(() => this.ctx.agents.bind(miniAgentHandle(this.ctx.session)))
+    // The handle's session.snapshotEvents() reads this JSONL session.
+    // Official-loop turns override runTurn and do not dispatch these hooks.
+    this.ctx.effect(() => this.ctx.agents.bind(this.ctx.session))
   }
 
   turn(input, report = () => {}, { approve } = {}) {
@@ -56,7 +56,14 @@ export class Agent extends Service {
     this.busy = true
     const controller = new AbortController()
     this.controller = controller
-    const run = this.runTurn(input, report, controller.signal, approve)
+    let run
+    try {
+      run = this.ctx.agents.withInitiator(this.ctx.agents.primary, () => this.runTurn(input, report, controller.signal, approve))
+    } catch (error) {
+      this.controller = null
+      this.busy = false
+      throw error
+    }
     this.current = run
     return run.finally(() => {
       if (this.controller === controller) this.controller = null
@@ -76,31 +83,35 @@ export class Agent extends Service {
 
   async runTurn(input, report, signal, approve) {
     const { checkpoint, prompt, agents } = this.ctx
+    agents.ensureSessionStart()
     const skillInvocations = await prompt.resolveUserInput(input)
     await checkpoint.commit({ role: 'user', content: input, ...(skillInvocations.length ? { skillInvocations } : {}) })
     // One agent.turn() is one DSH-style turn; each model complete() is a step.
     const turn = this.ctx.session.events.filter((event) => event.type === 'turn/end').length + 1
     let step = 0
     try {
+      agents.setStatus('running')
       while (!this.stopping) {
         step += 1
-        const baseline = toPreStepMessages(this.ctx.session.messages)
-        const decision = await agents.runPreStep({ turn, step, signal, messages: baseline })
+        const history = toPreStepMessages(this.ctx.session.messages)
+        const decision = await agents.runPreStep({ turn, step, signal, messages: history })
         await checkpoint.commit({
           type: 'agent.pre-step',
           turn,
           step,
           kind: decision.kind,
-          added: decision.kind === 'enter' ? decision.messages.length - baseline.length : 0,
+          added: decision.recorded.length,
         })
         if (decision.kind === 'reject') return
-        for (const message of decision.messages.slice(baseline.length)) {
-          await checkpoint.commit(flattenHookMessage(message))
-        }
+        for (const message of decision.recorded) await checkpoint.commit(message)
         const message = await this.complete(signal)
         const calls = message.tool_calls ?? []
         if (message.content) report({ type: 'assistant', content: message.content })
-        if (!calls.length) return
+        if (!calls.length) {
+          if (this.stopping) return
+          if (await agents.settleStop({ turn, signal }) && !this.stopping) continue
+          return
+        }
         const contexts = []
         let index = 0
         while (index < calls.length) {
@@ -125,8 +136,18 @@ export class Agent extends Service {
         }
         for (const event of contexts) await checkpoint.commit(event)
       }
+    } catch (error) {
+      agents.emitError({ turn, step, error })
+      if (this.ctx.session.writable) {
+        try {
+          await checkpoint.commit({ type: 'agent.error', turn, step, message: error?.message ?? String(error) })
+        } catch { /* the original failure stays the turn result */ }
+      }
+      throw error
     } finally {
+      agents.setStatus('idle')
       // Durable turn/end for hooks such as dsh-message-datetime's idle-gap reading.
+      // turn/end means the turn ended, not that it succeeded.
       if (this.ctx.session.writable) {
         await checkpoint.commit({ type: 'turn/end', turn, steps: step })
       }
@@ -139,7 +160,12 @@ export class Agent extends Service {
     const prepared = model.prepare({
       instructions: snap.instructions,
       context: snap.context,
-      messages: session.messages,
+      messages: session.messages.map((message) => {
+        if (!message || message.source == null) return message
+        const copy = { ...message }
+        delete copy.source
+        return copy
+      }),
       tools: tools.schemas(),
     })
     await checkpoint.commit({ type: 'model.request', provider: prepared.provider, body: prepared.body })
