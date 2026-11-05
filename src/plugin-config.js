@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
+import { SUBAGENT_TOOL_VERSION } from './subagent.js'
 import { BUILTIN_PLUGIN_NAMES } from './live-plugins.js'
 import { applyWorkspacePluginConfig } from './workspace-path.js'
 import { pathToFileURL } from 'node:url'
@@ -30,6 +31,24 @@ function validate(config) {
       }
     }
     if (own(entry, 'export') && !own(entry, 'module')) throw new Error(`${entry.name}: export requires module`)
+  }
+}
+
+async function assertSubagentToolVersion(plugin, modulePath, entryName) {
+  if (plugin?.name !== 'tool-subagent') return
+  const candidates = [resolve(dirname(modulePath), 'package.json'), resolve(dirname(modulePath), '../package.json')]
+  for (const candidate of candidates) {
+    let manifest
+    try { manifest = JSON.parse(await readFile(candidate, 'utf8')) }
+    catch (error) {
+      if (error.code === 'ENOENT' || error instanceof SyntaxError) continue
+      throw error
+    }
+    if (manifest?.name !== '@deepseek-ai/dsh-tool-subagent') continue
+    if (manifest.version !== SUBAGENT_TOOL_VERSION) {
+      throw new Error(`Plugin ${entryName}: unsupported DSH subagent tool version ${manifest.version}; expected ${SUBAGENT_TOOL_VERSION}`)
+    }
+    return
   }
 }
 
@@ -100,6 +119,7 @@ export async function configurePlugins(entries, file, workspace) {
     }
     const target = result.find((entry) => entry.name === item.name)
     target.plugin = plugin
+    await assertSubagentToolVersion(plugin, item.path, item.name)
     if (plugin.name === 'AgentLoop') {
       let manifest
       try { manifest = JSON.parse(await readFile(resolve(dirname(item.path), '../package.json'), 'utf8')) }

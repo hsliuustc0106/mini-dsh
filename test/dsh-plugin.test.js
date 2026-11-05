@@ -67,8 +67,8 @@ test('a DSH-style tool without an explicit policy remains denied', async (t) => 
 
 test('missing DSH services are reported instead of starting a partial plugin', async (t) => {
   const dir = await workspace(t)
-  await writeFile(join(dir, 'dsh-tool.mjs'), "export const inject = ['systemPrompt']; export function apply() {}\n")
-  await assert.rejects(boot({ workspace: dir, pluginConfig: 'plugins.json', provider: provider() }), /waiting for systemPrompt/)
+  await writeFile(join(dir, 'dsh-tool.mjs'), "export const inject = ['sessionProjections']; export function apply() {}\n")
+  await assert.rejects(boot({ workspace: dir, pluginConfig: 'plugins.json', provider: provider() }), /waiting for sessionProjections/)
 })
 
 test('invalid configured tool policies fail at startup', async (t) => {

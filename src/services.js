@@ -5,7 +5,8 @@ import { appendFile, mkdir, open, readFile, truncate } from 'node:fs/promises'
 import { dirname, isAbsolute } from 'node:path'
 import { resolveAgainstWorkspace } from './workspace-path.js'
 import { acquireWriter, lockPathFor } from './lock.js'
-import { assertEvent, createEvent, readSession, unknownOutcomes, unknownReason, unknownStreams } from './log.js'
+import { currentDelegationAgent } from './delegation.js'
+import { assertEvent, createEvent, projectSessionMessages, readSession, unknownOutcomes, unknownReason, unknownStreams } from './log.js'
 import {
   applyPostDecision, coerceExecuteResult, errorText, fuseSignals, markOutcome, normalizePreDecision, textBlocks,
 } from './tool-pipeline.js'
@@ -153,7 +154,7 @@ export class Tools extends Service {
       callId: { value: callId, enumerable: true },
       name: { value: name, enumerable: true },
       arguments: { value: snapshot, enumerable: true },
-      agent: { value: Object.freeze({ id: 'mini-dsh' }), enumerable: true },
+      agent: { value: currentDelegationAgent(), enumerable: true },
       deferContext: { value() { throw new Error('deferContext is not supported') } },
     })
     let signal = caller.signal
@@ -168,7 +169,10 @@ export class Tools extends Service {
         signal = value
       },
     })
-    return { callId, name, args: snapshot, tool, callerSignal: caller.signal, view }
+    return {
+      callId, name, args: snapshot, tool, callerSignal: caller.signal, view,
+      abort(reason) { if (!caller.signal.aborted) caller.abort(reason) },
+    }
   }
   async preExecute(exec) {
     const decision = await this.ctx.waterfall('tools/pre-execute', exec.view, async () => ({ kind: 'allow' }))
@@ -208,7 +212,7 @@ export class Tools extends Service {
     try {
       const returned = await this.ctx.waterfall('tools/execute', exec.view, async () => {
         const signal = fuseSignals(exec.callerSignal, exec.view.signal)
-        return markOutcome(await this.invoke(exec.tool, exec.args, { callId: exec.callId, signal }))
+        return markOutcome(await this.invoke(exec.tool, exec.args, { callId: exec.callId, signal, agent: exec.view.agent }))
       })
       return coerceExecuteResult(returned, (value) => this.replaceValue(exec, value))
     } catch (error) {
@@ -257,7 +261,7 @@ export class Tools extends Service {
       callId: exec.callId,
       name: exec.name,
       arguments: exec.args,
-      agent: { id: 'mini-dsh' },
+      agent: { id: exec.view?.agent?.id ?? 'mini-dsh' },
     }
     try { this.ctx.emit('tools/result', identity, frozen) }
     catch { /* Listener failures are contained and do not change the recorded result. */ }
@@ -269,7 +273,7 @@ export class Tools extends Service {
     const outcome = await this.invoke(tool, args, options)
     return outcome.passthrough ? outcome.raw : outcome.text
   }
-  async invoke(tool, args, { callId, signal } = {}) {
+  async invoke(tool, args, { callId, signal, agent } = {}) {
     const output = this.outputs.get(tool.name)
     const controller = new AbortController()
     let unlink = () => {}
@@ -279,6 +283,13 @@ export class Tools extends Service {
       signal.addEventListener('abort', onAbort, { once: true })
       unlink = () => signal.removeEventListener('abort', onAbort)
     }
+    const execution = {
+      name: tool.name,
+      callId,
+      signal: controller.signal,
+      agent,
+      deferContext() { throw new Error('deferContext is not supported') },
+    }
     let timedOut = false
     const timer = output && tool.timeoutMs !== undefined ? setTimeout(() => {
       timedOut = true
@@ -287,16 +298,10 @@ export class Tools extends Service {
     try {
       let result
       if (output) {
-        try {
-          result = await tool.execute(args, {
-            name: tool.name,
-            callId,
-            signal: controller.signal,
-            deferContext() { throw new Error('deferContext is not supported') },
-          })
-        } catch (error) { if (!timedOut) throw error }
+        try { result = await tool.execute(args, execution) }
+        catch (error) { if (!timedOut) throw error }
         if (timedOut) throw new Error(`tool call timed out after ${tool.timeoutMs}ms`)
-      } else result = await tool.execute(args)
+      } else result = await tool.execute(args, execution)
       if (!output) {
         return {
           isError: false,
@@ -430,23 +435,7 @@ export class Session extends Service {
   // tool batch and before the next non-tool message, and it is not recomputed
   // by re-running hooks when the session is reopened.
   get messages() {
-    const out = []
-    const contexts = []
-    const flush = () => {
-      for (const content of contexts.splice(0)) out.push({ role: 'user', content })
-    }
-    for (const event of this.events) {
-      if (event.type === 'tools.context') {
-        contexts.push(event.content)
-        continue
-      }
-      if (event.type !== 'message') continue
-      if (event.message.role !== 'tool') flush()
-      const { skillInvocations, ...message } = event.message
-      out.push(message, ...(skillInvocations ?? []).map(({ content }) => ({ role: 'user', content })))
-    }
-    flush()
-    return out
+    return projectSessionMessages(this.events)
   }
 
   history(after = 0) {

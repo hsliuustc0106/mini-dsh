@@ -21,6 +21,7 @@ export const BUILTIN_PLUGIN_NAMES = new Set([
   'viewer', 'web-control', 'terminal', 'agent', 'agents', 'coding', 'skills', 'instructions',
   'runtime-context', 'default-tool-permissions', 'permissions', 'checkpoint', 'tools',
   'prompt', 'model', 'provider', 'session', 'workspace', 'live-plugins',
+  'subagents', 'jobs', 'system-prompt',
 ])
 
 export const CORDIS_PIN = '4.0.5'

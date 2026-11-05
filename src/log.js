@@ -49,6 +49,13 @@ export function assertEvent(event, seq) {
   if (event.type === 'stream.delta' && !deltaPayload(event)) throw corrupt('stream delta is empty')
   if (event.type === 'stream.delta' && event.tool_call != null && !toolPiece(event.tool_call)) throw corrupt('invalid tool call')
   if (event.type === 'stream.ended' && (typeof event.finish !== 'string' || !event.finish)) throw corrupt('stream end requires finish')
+  if (typeof event.type === 'string' && event.type.startsWith('subagent.')) {
+    if (typeof event.agent !== 'string' || !event.agent) throw corrupt(`${event.type} requires agent`)
+    if (event.type === 'subagent.notice' && (typeof event.content !== 'string' || !event.content)) {
+      throw corrupt('subagent.notice requires content')
+    }
+    if (event.type === 'subagent.message') assertMessage(event.message)
+  }
   if (event.time != null && typeof event.time !== 'string') throw corrupt('time must be a string')
 }
 
@@ -152,6 +159,8 @@ export function unknownStreams(events) {
   let awaiting = null
   const tools = new Map()
   for (const event of events) {
+    // Child transcripts are durable in the same file and must not close a parent stream.
+    if (typeof event.type === 'string' && event.type.startsWith('subagent.')) continue
     if (event.type === 'stream.started') {
       if (open != null || awaiting != null) throw corrupt('stream already open')
       open = event.seq
@@ -176,6 +185,64 @@ export function unknownStreams(events) {
   if (open != null) unknown.push(open)
   if (awaiting != null) unknown.push(awaiting)
   return unknown
+}
+
+// Parent conversation plus background completion notices. Child `subagent.message`
+// rows stay out of this projection. A notice that arrives during a parent stream
+// or an open tool batch is shown after that step, which is when the next request
+// can legally see it.
+export function projectSessionMessages(events) {
+  const out = []
+  const contexts = []
+  const deferred = []
+  const ready = []
+  let hold = false
+  let openTools = 0
+  const flushContexts = () => {
+    for (const content of contexts.splice(0)) out.push({ role: 'user', content })
+  }
+  const flushNotices = () => {
+    if (hold || openTools > 0) return
+    for (const event of ready.splice(0)) {
+      out.push({
+        role: 'user',
+        content: event.content,
+        ...(event.source ? { source: event.source } : {}),
+      })
+    }
+  }
+  const releaseDeferred = () => {
+    if (hold || openTools > 0) return
+    ready.push(...deferred.splice(0))
+    flushNotices()
+  }
+  for (const event of events) {
+    if (event.type === 'stream.started') hold = true
+    if (event.type === 'subagent.notice') {
+      if (hold || openTools > 0) deferred.push(event)
+      else ready.push(event)
+      flushNotices()
+      continue
+    }
+    if (event.type === 'tools.context') {
+      contexts.push(event.content)
+      continue
+    }
+    if (event.type !== 'message') continue
+    if (event.message.role !== 'tool') flushContexts()
+    if (hold && event.message.role === 'assistant') hold = false
+    const { skillInvocations, ...message } = event.message
+    out.push(message, ...(skillInvocations ?? []).map(({ content }) => ({ role: 'user', content })))
+    if (message.role === 'assistant' && message.tool_calls?.length) openTools += message.tool_calls.length
+    if (message.role === 'tool') openTools = Math.max(0, openTools - 1)
+    releaseDeferred()
+  }
+  flushContexts()
+  ready.push(...deferred.splice(0))
+  hold = false
+  openTools = 0
+  flushNotices()
+  return out
 }
 
 export function unknownReason(callIds, streams = []) {
