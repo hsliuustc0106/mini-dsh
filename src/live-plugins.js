@@ -8,7 +8,7 @@ import { acquireWriter } from './lock.js'
 
 // Cordis 4.0.5 keeps FiberState as a const enum, so the published build does not
 // export the names. live-plugins (like boot.js) pins these numeric values and
-// private fields (`_error`, `inertia`, reflect._getImpl) against
+// private fields (`_error`, `inertia`, reflect._getImpl, runtime.fibers) against
 // @deepseek-ai/cordis@4.0.5 only.
 // Bump Cordis only with a matching update to these constants and the pin test.
 const LOADING = 1
@@ -280,19 +280,22 @@ export class LivePlugins extends Service {
     const provided = new Set(this.servicesProvidedBy(name))
     if (!provided.size) return []
     const affected = []
+    const fibers = [...this.ctx.registry.values()].flatMap((runtime) => [...runtime.fibers])
     for (const [other, info] of [...this.bootBuiltins, ...this.mounted]) {
       if (other === name) continue
       if (info.required === false) continue
-      const missing = []
+      const missing = new Set()
       // In Cordis 4.0.5 every key in fiber.inject is required for activation;
       // object values configure interception, not optional dependencies.
-      for (const service of Object.keys(info.fiber?.inject ?? {})) {
-        // A same-named service in another isolation scope does not satisfy
-        // this fiber. Only block if its actual visible provider is removed.
-        const impl = info.fiber.ctx.reflect._getImpl(service, false)
-        if (provided.has(service) && impl?.fiber && fiberOwns(this.mounted.get(name).fiber, impl.fiber)) missing.push(service)
+      for (const fiber of fibers) {
+        if (!fiberOwns(info.fiber, fiber)) continue
+        for (const service of Object.keys(fiber.inject ?? {})) {
+          // Resolve in the consumer's own scope, including nested fibers.
+          const impl = fiber.ctx.reflect._getImpl(service, false)
+          if (provided.has(service) && impl?.fiber && fiberOwns(this.mounted.get(name).fiber, impl.fiber)) missing.add(service)
+        }
       }
-      if (missing.length) affected.push({ name: other, services: missing })
+      if (missing.size) affected.push({ name: other, services: [...missing] })
     }
     return affected
   }

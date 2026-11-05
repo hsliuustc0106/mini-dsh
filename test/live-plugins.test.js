@@ -549,6 +549,88 @@ test('same-named isolated service does not block removal of an unrelated provide
   } finally { await app.dispose() }
 })
 
+test('nested Service ownership protects dependents while isolated providers remain removable', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-nested-service-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const profile = join(workspace, 'plugins.json')
+  const nestedProvider = new URL('../fixtures/nested-service-provider.js', import.meta.url).pathname
+  await writeFile(join(workspace, 'consumer.mjs'), "export const inject = ['nestedFixture']; export function apply() {}\n")
+  await writeFile(profile, JSON.stringify({ plugins: [
+    { name: 'nested-provider', module: nestedProvider },
+    { name: 'isolated-provider', module: nestedProvider, config: { isolated: true } },
+    { name: 'nested-consumer', module: './consumer.mjs' },
+  ] }))
+  const app = await boot({ workspace, pluginConfig: profile, web: { port: 0 }, provider: fakeProvider([]) })
+  try {
+    const live = app.ctx.livePlugins
+    const countNested = () => Object.getOwnPropertySymbols(app.ctx.reflect.store).filter((key) => app.ctx.reflect.store[key]?.name === 'nestedFixture').length
+    assert.equal(countNested(), 2)
+    assert.deepEqual(live.servicesProvidedBy('nested-provider'), ['nestedFixture'])
+    assert.deepEqual(live.dependentsBlockingRemoval('nested-provider'), [{ name: 'nested-consumer', services: ['nestedFixture'] }])
+    assert.deepEqual(live.dependentsBlockingRemoval('isolated-provider'), [])
+    const url = app.ctx.webControl.url
+    const post = (name) => fetch(`${url}/plugins/uninstall`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ name }) })
+    assert.equal((await post('nested-provider')).status, 400)
+    assert.equal((await post('isolated-provider')).status, 200)
+    assert.equal(countNested(), 1)
+    assert.ok(app.ctx.reflect.get('nestedFixture'))
+    assert.equal(live.list().find((row) => row.name === 'nested-consumer').state, 'active')
+  } finally { await app.dispose() }
+  assert.equal(Object.getOwnPropertySymbols(app.ctx.reflect.store).filter((key) => app.ctx.reflect.store[key]?.name === 'nestedFixture').length, 0)
+  const again = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try {
+    assert.ok(again.ctx.reflect.get('nestedFixture'))
+    assert.equal(again.ctx.livePlugins.list().find((row) => row.name === 'nested-consumer').state, 'active')
+  } finally { await again.dispose() }
+})
+
+test('a nested required consumer prevents removing its provider', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-nested-consumer-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const profile = join(workspace, 'plugins.json')
+  const nestedProvider = new URL('../fixtures/nested-service-provider.js', import.meta.url).pathname
+  await writeFile(join(workspace, 'consumer.mjs'), "export function apply(ctx) { ctx.plugin({ inject: ['nestedFixture'], apply() {} }) }\n")
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'nested-provider', module: nestedProvider }, { name: 'parent-consumer', module: './consumer.mjs' }] }))
+  const app = await boot({ workspace, pluginConfig: profile, web: { port: 0 }, provider: fakeProvider([]) })
+  try {
+    const url = app.ctx.webControl.url
+    const response = await fetch(`${url}/plugins/uninstall`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'nested-provider' }) })
+    assert.equal(response.status, 400)
+    assert.match((await response.json()).error, /parent-consumer.*nestedFixture/)
+    assert.deepEqual(app.ctx.livePlugins.removalPlan('nested-provider'), ['parent-consumer', 'nested-provider'])
+    assert.equal(JSON.parse(await readFile(profile, 'utf8')).plugins.length, 2)
+  } finally { await app.dispose() }
+  const again = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try { assert.ok(again.ctx.reflect.get('nestedFixture')) } finally { await again.dispose() }
+})
+
+test('a nested consumer using an isolated provider does not block root provider removal', async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), 'mini-live-nested-scoped-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const profile = join(workspace, 'plugins.json')
+  const nestedProvider = new URL('../fixtures/nested-service-provider.js', import.meta.url).pathname
+  await writeFile(join(workspace, 'consumer.mjs'), `
+export function apply(ctx) {
+  const scope = ctx.isolate('nestedFixture')
+  scope.plugin({ apply(child) { child.provide('nestedFixture', {}) } })
+  scope.plugin({ inject: ['nestedFixture', 'tools'], apply(child) {
+    child.tools.register({ name: 'nested_isolated_tool', description: 'fixture', parameters: { type: 'object' }, execute: () => 'ok' })
+  } })
+}
+`)
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'nested-provider', module: nestedProvider }, { name: 'isolated-consumer', module: './consumer.mjs' }] }))
+  const app = await boot({ workspace, pluginConfig: profile, web: { port: 0 }, provider: fakeProvider([]) })
+  try {
+    assert.ok(app.ctx.tools.items.has('nested_isolated_tool'))
+    const url = app.ctx.webControl.url
+    const response = await fetch(`${url}/plugins/uninstall`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'nested-provider' }) })
+    assert.equal(response.status, 200)
+    assert.ok(app.ctx.tools.items.has('nested_isolated_tool'))
+  } finally { await app.dispose() }
+  const again = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try { assert.ok(again.ctx.tools.items.has('nested_isolated_tool')) } finally { await again.dispose() }
+})
+
 test('same-scope duplicate providers are rejected and do not become an uninstall fallback', async (t) => {
   const workspace = await mkdtemp(join(tmpdir(), 'mini-live-duplicate-provider-'))
   t.after(() => rm(workspace, { recursive: true, force: true }))
