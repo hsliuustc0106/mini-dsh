@@ -31,7 +31,7 @@ class Element {
   fire(type, event = {}) { this.listeners.get(type)?.(event) }
 }
 
-async function browser(installResponse) {
+async function browser(installResponse, uninstallResponse, plugins = []) {
   const elements = Object.fromEntries(['chat', 'trajectory', 'events', 'timeline', 'prompt', 'send', 'notice', 'hint', 'workspace', 'chat-tab', 'trajectory-tab', 'plugins-panel', 'plugins-toggle', 'plugins-form', 'plugin-spec', 'plugin-install', 'plugin-result', 'plugin-list'].map((id) => [id, new Element(id)]))
   elements.trajectory.hidden = true
   const find = (element, id) => element.id === id ? element : element.children.map((child) => child instanceof Element ? find(child, id) : null).find(Boolean)
@@ -58,10 +58,16 @@ async function browser(installResponse) {
     setTimeout: (callback) => { timers.push(callback); return timers.length },
     fetch: async (url, init) => {
       if (url === '/trajectory') return { ok: true, json: async () => snapshot }
-      if (url === '/plugins') return { ok: true, json: async () => ({ plugins: [] }) }
+      if (url === '/plugins') return { ok: true, json: async () => ({ plugins }) }
       if (url === '/plugins/install' && installResponse) {
         posts.push(JSON.parse(init.body))
         return { ok: true, json: async () => installResponse }
+      }
+      if (url === '/plugins/uninstall' && uninstallResponse) {
+        const body = JSON.parse(init.body)
+        posts.push(body)
+        const response = typeof uninstallResponse === 'function' ? uninstallResponse(body) : { ok: false, body: uninstallResponse }
+        return { ok: response.ok, json: async () => response.body }
       }
       if (url === '/approval') {
         posts.push(JSON.parse(init.body))
@@ -76,6 +82,40 @@ async function browser(installResponse) {
     async flush() { while (timers.length) await timers.shift()() },
   }
 }
+
+test('uninstall blocker offers actions for removable dependents', async () => {
+  const { elements, posts } = await browser(null, {
+    code: 'PLUGIN_DEPENDENTS', dependents: [
+      { name: 'slides', services: ['skills'], removable: true },
+      { name: 'coding', services: ['tools'], removable: false },
+    ],
+  }, [{ name: 'provider', state: 'active' }])
+  elements['plugins-panel'].hidden = true
+  elements['plugins-toggle'].fire('click')
+  await new Promise((resolve) => setImmediate(resolve))
+  await elements['plugin-list'].children[0].children[1].listeners.get('click')()
+  assert.deepEqual(posts[0], { name: 'provider' })
+  assert.match(elements['plugin-result'].textContent, /slides \(skills\)/)
+  assert.equal(elements['plugin-result'].children.length, 1)
+  assert.equal(elements['plugin-result'].children[0].textContent, 'Uninstall slides')
+})
+
+test('cascade requires an explicit confirmation of the previewed names', async () => {
+  const { elements, posts } = await browser(null, (body) => {
+    if (body.preview) return { ok: true, body: { names: ['consumer', 'provider'] } }
+    if (body.names) return { ok: true, body: { names: body.names } }
+    return { ok: false, body: { code: 'PLUGIN_DEPENDENTS', dependents: [{ name: 'consumer', services: ['svc'], removable: true }] } }
+  }, [{ name: 'provider', state: 'active' }])
+  elements['plugins-panel'].hidden = true
+  elements['plugins-toggle'].fire('click')
+  await new Promise((resolve) => setImmediate(resolve))
+  await elements['plugin-list'].children[0].children[1].listeners.get('click')()
+  await elements['plugin-result'].children[1].listeners.get('click')()
+  assert.match(elements['plugin-result'].textContent, /consumer, provider/)
+  assert.equal(posts.length, 2)
+  await elements['plugin-result'].children[0].listeners.get('click')()
+  assert.deepEqual(posts[2], { name: 'provider', names: ['consumer', 'provider'] })
+})
 
 test('plugin form submits the URL and reports live activation and permissions', async () => {
   const { elements, posts } = await browser({ packageName: 'example', names: ['example'], restartRequired: false })

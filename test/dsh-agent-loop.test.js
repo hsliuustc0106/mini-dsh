@@ -1,9 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
+import { execFileSync } from 'node:child_process'
 import { boot } from '../src/boot.js'
 import { fakeProvider } from '../src/provider.js'
 import { composition } from '../src/composition.js'
@@ -26,6 +27,27 @@ test('the real DSH loop drives the mini provider and persists its observed respo
   assert.equal(app.ctx.agent.nativeAgent.session.events.findLast((e) => e.type === 'turn/end').data.reason.kind, 'completed')
   assert.equal(app.ctx.session.events.findLast((e) => e.type === 'message').message.content, 'Hello from DSH.')
   assert.equal(provider.sent.length, 1)
+})
+
+test('offline uninstall inspects the bridged DSH loop and removes unrelated plugins', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-dsh-loop-offline-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const profile = join(dir, 'plugins.json')
+  await writeFile(join(dir, 'unrelated.mjs'), 'export function apply() {}\n')
+  await writeFile(profile, JSON.stringify({ plugins: [{ name: 'official-loop', module: modulePath }, { name: 'unrelated', module: './unrelated.mjs' }] }))
+  const cli = new URL('../src/uninstall.js', import.meta.url).pathname
+  const env = { ...process.env, MINI_WORKSPACE: dir, MINI_CONFIG: profile }
+  execFileSync(process.execPath, [cli, 'unrelated'], { env, encoding: 'utf8', stdio: 'pipe' })
+  assert.deepEqual(JSON.parse(await readFile(profile, 'utf8')).plugins.map((row) => row.name), ['official-loop'])
+  const app = await boot({ workspace: dir, pluginConfig: profile, web: { port: 0 }, provider: fakeProvider([]) })
+  try {
+    const url = app.ctx.webControl.url
+    const response = await fetch(`${url}/plugins/uninstall`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'official-loop' }) })
+    assert.equal(response.status, 400)
+    assert.match((await response.json()).error, /cannot be uninstalled live/)
+  } finally { await app.dispose() }
+  execFileSync(process.execPath, [cli, 'official-loop'], { env, encoding: 'utf8', stdio: 'pipe' })
+  assert.deepEqual(JSON.parse(await readFile(profile, 'utf8')).plugins, [])
 })
 
 test('the real DSH loop uses mini-dsh permissions and checkpoints for tool calls', async (t) => {

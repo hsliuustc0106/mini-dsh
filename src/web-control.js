@@ -244,18 +244,23 @@ export class WebControl extends Service {
 
   async uninstall(res, data) {
     if (typeof data.name !== 'string' || !data.name.trim()) return json(res, 400, { error: 'Plugin name is required' })
+    if (data.names !== undefined && (!Array.isArray(data.names) || data.names.some((name) => typeof name !== 'string'))) return json(res, 400, { error: 'Invalid removal list' })
     if (this.installing || this.changing) return json(res, 409, { error: 'A plugin change is already in progress' })
     this.changing = true
     try {
-      try { await this.ctx.livePlugins.unmount(data.name) }
-      catch (error) {
-        if (!/not mounted/.test(error.message)) return json(res, 400, { error: error.message, phase: 'dispose' })
-      }
       try {
-        const result = await uninstallPlugin(data.name, this.ctx.workspace.root, { configPath: this.pluginConfig })
-        return json(res, 200, { name: result.name, configPath: result.configPath, restartRequired: false, phase: 'removed' })
+        if (data.preview === true) {
+          const profile = await readPluginProfile(this.pluginConfig)
+          const names = this.ctx.livePlugins.removalPlan(data.name)
+          for (const name of names) if (!profile.plugins.some((entry) => entry.name === name)) throw new Error(`Plugin ${name} is not in the profile`)
+          return json(res, 200, { name: data.name, names, phase: 'preview' })
+        }
+        const result = await uninstallPlugin(data.name, this.ctx.workspace.root, { configPath: this.pluginConfig, livePlugins: this.ctx.livePlugins, expectedNames: data.names })
+        return json(res, 200, { name: result.name, names: result.names, configPath: result.configPath, restartRequired: false, phase: 'removed' })
       } catch (error) {
-        return json(res, 400, { error: error.message, phase: 'profile' })
+        return json(res, 400, { error: error.message, phase: error.code === 'PLUGIN_DEPENDENTS' ? 'dispose' : 'profile',
+          ...(error.code === 'PLUGIN_DEPENDENTS' ? { code: error.code, dependents: error.dependents.map((item) => ({ ...item, removable: !BUILTIN_PLUGIN_NAMES.has(item.name) })) } : {}),
+        })
       }
     } finally { this.changing = false }
   }
@@ -295,6 +300,7 @@ export class WebControl extends Service {
   }
 
   startTurn(res, data) {
+    if (this.installing || this.changing) return json(res, 409, { error: 'A plugin change is already in progress' })
     if (!this.clients.has(data.connection)) return json(res, 409, { error: 'Connect to the session first' })
     if (typeof data.input !== 'string' || !data.input.trim()) return json(res, 400, { error: 'Prompt is required' })
     if (!this.ctx.session.writable) return json(res, 409, { error: this.ctx.session.readonlyReason })

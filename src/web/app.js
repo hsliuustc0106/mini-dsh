@@ -46,10 +46,51 @@ async function uninstallPlugin(name) {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }),
     })
     const result = await response.json()
-    if (!response.ok) throw new Error(result.error || 'Uninstall failed')
+    if (!response.ok) {
+      if (result.code === 'PLUGIN_DEPENDENTS' && Array.isArray(result.dependents)) {
+        const affected = result.dependents.map((item) => `${item.name} (${item.services.join(', ')})`).join('; ')
+        pluginResult.textContent = `Cannot uninstall ${name}. Required by: ${affected}. Remove the dependent plugins first, then retry.`
+        for (const item of result.dependents) {
+          if (!item.removable) continue
+          const button = node('button', '', `Uninstall ${item.name}`)
+          button.type = 'button'
+          button.addEventListener('click', () => uninstallPlugin(item.name))
+          pluginResult.append(button)
+        }
+        if (result.dependents.every((item) => item.removable)) {
+          const preview = node('button', '', 'Preview removing dependents')
+          preview.type = 'button'
+          preview.addEventListener('click', () => previewRemoval(name))
+          pluginResult.append(preview)
+        }
+        return
+      }
+      throw new Error(result.error || 'Uninstall failed')
+    }
     pluginResult.textContent = `Uninstalled ${result.name}.`
     await refreshPlugins()
   } catch (error) { pluginResult.textContent = error.message || 'Uninstall failed' }
+}
+
+async function previewRemoval(name) {
+  try {
+    const response = await fetch('/plugins/uninstall', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, preview: true }) })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.error || 'Preview failed')
+    pluginResult.textContent = `Will uninstall: ${result.names.join(', ')}. `
+    const confirm = node('button', '', 'Confirm uninstall')
+    confirm.type = 'button'
+    confirm.addEventListener('click', async () => {
+      try {
+        const reply = await fetch('/plugins/uninstall', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, names: result.names }) })
+        const outcome = await reply.json()
+        if (!reply.ok) throw new Error(outcome.error || 'Uninstall failed')
+        pluginResult.textContent = `Uninstalled ${outcome.names.join(', ')}.`
+        await refreshPlugins()
+      } catch (error) { pluginResult.textContent = error.message || 'Uninstall failed' }
+    })
+    pluginResult.append(confirm)
+  } catch (error) { pluginResult.textContent = error.message || 'Preview failed' }
 }
 
 pluginToggle.addEventListener('click', () => {
