@@ -1,6 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { exec } from 'node:child_process'
-import { isAbsolute, join } from 'node:path'
+import { isAbsolute } from 'node:path'
+import { resolveAgainstWorkspace } from './workspace-path.js'
 import { promisify } from 'node:util'
 import { searchTools } from './search.js'
 
@@ -19,11 +20,10 @@ function workspaceRoot(ctx) {
   return root
 }
 
-// Relative paths and the shell working directory use the boot workspace.
-// Absolute paths are unchanged. The workspace is not a sandbox.
+// Relative paths and the shell working directory use the boot workspace
+// (never process.cwd()). Absolute paths are unchanged. The workspace is not a sandbox.
 function workspacePath(root, value, label) {
-  if (typeof value !== 'string' || !value) throw new Error(`${label} must be a string`)
-  return isAbsolute(value) ? value : join(root, value)
+  return resolveAgainstWorkspace(root, value, label)
 }
 
 export const coding = {
