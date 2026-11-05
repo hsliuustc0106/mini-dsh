@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { resolve as resolveImport } from 'import-meta-resolve'
 import { parseDocument } from 'yaml'
 import { composition } from './composition.js'
+import { applyWorkspacePluginConfig } from './workspace-path.js'
 import { acquireWriter } from './lock.js'
 
 const object = (value) => value && typeof value === 'object' && !Array.isArray(value)
@@ -171,6 +172,7 @@ export async function installPlugin(spec, workspace, options = {}) {
                 if (builtin.has(entry.name) || plugins.some((item) => item.name === entry.name)) {
                   throw new Error(`Invalid or duplicate plugin name: ${entry.name}`)
                 }
+                entry.config = applyWorkspacePluginConfig(entry.config, workspace)
                 plugins.push(entry)
                 inserted.add(entry.name)
               }
@@ -178,6 +180,8 @@ export async function installPlugin(spec, workspace, options = {}) {
             }
             if (Object.hasOwn(op, 'id') && !Object.hasOwn(op, 'insert')) {
               applyReplace(plugins, op, patchPath, inserted)
+              const row = plugins.find((entry) => entry.name === op.id)
+              if (row) row.config = applyWorkspacePluginConfig(row.config, workspace)
               continue
             }
             const key = Object.keys(op)[0] ?? 'unknown'
@@ -194,7 +198,11 @@ export async function installPlugin(spec, workspace, options = {}) {
         if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name) || builtin.has(name) || plugins.some((item) => item.name === name)) {
           throw new Error(`Invalid or duplicate plugin name: ${name}`)
         }
-        const entry = { name, module: resolveModule(packageName, join(stage, 'package.json')) }
+        const entry = {
+          name,
+          module: resolveModule(packageName, join(stage, 'package.json')),
+          config: applyWorkspacePluginConfig({}, workspace),
+        }
         plugins.push(entry)
         inserted.add(name)
       }
