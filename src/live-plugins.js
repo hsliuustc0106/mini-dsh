@@ -22,6 +22,26 @@ export const BUILTIN_PLUGIN_NAMES = new Set([
 
 export const CORDIS_PIN = '4.0.5'
 
+function fiberOwns(pluginFiber, candidateFiber) {
+  let fiber = candidateFiber
+  const seen = new Set()
+  while (fiber && !seen.has(fiber.uid)) {
+    seen.add(fiber.uid)
+    if (fiber.uid === pluginFiber.uid) return true
+    const parent = fiber.parent
+    if (!parent) return false
+    if (parent === pluginFiber.ctx) return true
+    fiber = parent.fiber
+  }
+  return false
+}
+
+function requiredInject(spec) {
+  if (spec == null) return true
+  if (typeof spec === 'object' && spec.required === false) return false
+  return true
+}
+
 function statusOf(fiber) {
   if (fiber._error) return 'failed'
   return STATE_NAME[fiber.state] ?? 'unknown'
@@ -74,12 +94,18 @@ export async function readPluginProfile(configPath) {
 }
 
 export async function loadProfileEntries(configPath, names) {
-  const wanted = new Set(names)
+  // Activation names must already be unique; dedupe defensively so a stale
+  // duplicate list cannot trip rows.length !== names.length into a false miss.
+  const unique = [...new Set(names)]
+  if (unique.length !== names.length) {
+    throw new Error(`Plugin activation names must be unique: ${names.join(', ')}`)
+  }
+  const wanted = new Set(unique)
   const config = await readPluginProfile(configPath)
   const rows = config.plugins.filter((entry) => wanted.has(entry.name))
-  if (rows.length !== names.length) {
+  if (rows.length !== unique.length) {
     const found = new Set(rows.map((entry) => entry.name))
-    const missing = names.filter((name) => !found.has(name))
+    const missing = unique.filter((name) => !found.has(name))
     throw new Error(`Profile is missing plugin entries: ${missing.join(', ')}`)
   }
   const entries = []
@@ -153,7 +179,7 @@ export class LivePlugins extends Service {
       if (!entry?.name || BUILTIN_PLUGIN_NAMES.has(entry.name)) continue
       if (this.mounted.has(entry.name)) continue
       // Boot-started fibers stay owned by boot(); live mounts use ctx.effect below.
-      this.mounted.set(entry.name, { fiber: entry.fiber, module: entry.module, source: 'boot' })
+      this.mounted.set(entry.name, { fiber: entry.fiber, module: entry.module, source: 'boot', required: entry.required })
     }
   }
 
@@ -167,6 +193,37 @@ export class LivePlugins extends Service {
 
   busy() {
     return Boolean(this.ctx.agent.busy)
+  }
+
+  // Services registered under this plugin's fiber (including nested Service plugins).
+  servicesProvidedBy(name) {
+    const info = this.mounted.get(name)
+    if (!info?.fiber) return []
+    const names = []
+    for (const key of Object.getOwnPropertySymbols(this.ctx.reflect.store)) {
+      const entry = this.ctx.reflect.store[key]
+      if (entry?.name && entry.fiber && fiberOwns(info.fiber, entry.fiber)) names.push(entry.name)
+    }
+    return names
+  }
+
+  // Required (non-optional) mounted plugins that would lose a required inject if
+  // `name` were disposed. Optional profile rows (`required: false`) do not block.
+  dependentsBlockingRemoval(name) {
+    const provided = new Set(this.servicesProvidedBy(name))
+    if (!provided.size) return []
+    const affected = []
+    for (const [other, info] of this.mounted) {
+      if (other === name) continue
+      if (info.required === false) continue
+      const missing = []
+      for (const [service, spec] of Object.entries(info.fiber?.inject ?? {})) {
+        if (!requiredInject(spec)) continue
+        if (provided.has(service)) missing.push(service)
+      }
+      if (missing.length) affected.push({ name: other, services: missing })
+    }
+    return affected
   }
 
   async mount(entry) {
@@ -202,7 +259,7 @@ export class LivePlugins extends Service {
         const detail = report.error ? `: ${report.error}` : report.missing?.length ? `: waiting for ${report.missing.join(', ')}` : ''
         throw new Error(`Plugin ${entry.name} ${report.state === 'failed' ? 'failed' : `is ${report.state}`}${detail}`)
       }
-      this.mounted.set(entry.name, { fiber, release, module: entry.module, source: 'live' })
+      this.mounted.set(entry.name, { fiber, release, module: entry.module, source: 'live', required: entry.required })
       await this.record('plugin.mounted', { name: entry.name, state: report.state })
       return report
     } catch (error) {
@@ -225,6 +282,14 @@ export class LivePlugins extends Service {
     if (this.busy()) throw new Error('Cannot unmount plugins while a turn is in progress')
     const info = this.mounted.get(name)
     if (!info) throw new Error(`Plugin is not mounted: ${name}`)
+    const blockers = this.dependentsBlockingRemoval(name)
+    if (blockers.length) {
+      const detail = blockers.map((row) => `${row.name} (needs ${row.services.join(', ')})`).join('; ')
+      throw new Error(
+        `Cannot uninstall ${name}: required by ${detail}. ` +
+        'Remove or disable those plugins first so the saved profile can still boot.'
+      )
+    }
     this.mounted.delete(name)
     if (info.release) await Promise.resolve(info.release())
     else await Promise.resolve(info.fiber.dispose())

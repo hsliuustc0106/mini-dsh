@@ -148,7 +148,6 @@ export async function installPlugin(spec, workspace, options = {}) {
       }
       const plugins = config.plugins.map((entry) => ({ ...entry }))
       const builtin = new Set(composition({ terminal: {}, view: true, web: true }).map((entry) => entry.name))
-      const touched = []
       const inserted = new Set()
       const patch = pkg.dsh?.bundle?.patch
       if (patch !== undefined) {
@@ -174,13 +173,11 @@ export async function installPlugin(spec, workspace, options = {}) {
                 }
                 plugins.push(entry)
                 inserted.add(entry.name)
-                touched.push(entry.name)
               }
               continue
             }
             if (Object.hasOwn(op, 'id') && !Object.hasOwn(op, 'insert')) {
               applyReplace(plugins, op, patchPath, inserted)
-              touched.push(op.id)
               continue
             }
             const key = Object.keys(op)[0] ?? 'unknown'
@@ -191,7 +188,7 @@ export async function installPlugin(spec, workspace, options = {}) {
             )
           }
         }
-        if (!touched.length) throw new Error('Bundle contains no plugin rows')
+        if (!inserted.size) throw new Error('Bundle contains no plugin rows')
       } else {
         const name = packageName.replace(/^@/, '').replaceAll('/', '-')
         if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name) || builtin.has(name) || plugins.some((item) => item.name === name)) {
@@ -199,8 +196,14 @@ export async function installPlugin(spec, workspace, options = {}) {
         }
         const entry = { name, module: resolveModule(packageName, join(stage, 'package.json')) }
         plugins.push(entry)
-        touched.push(name)
+        inserted.add(name)
       }
+      // Live activation names: unique ids from this install that should mount now.
+      // Omit disabled rows; do not re-list an id when a same-install replace touches it.
+      const names = [...inserted].filter((id) => {
+        const row = plugins.find((entry) => entry.name === id)
+        return row && row.enabled !== false
+      })
       // Keep the staging directory as the installed package: absolute paths in
       // the profile stay valid, including npm's local package links.
       config.plugins = plugins
@@ -209,7 +212,7 @@ export async function installPlugin(spec, workspace, options = {}) {
         await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx' })
         await rename(temp, configPath)
       } catch (error) { await rm(temp, { force: true }); throw error }
-      return { packageName, configPath, names: touched }
+      return { packageName, configPath, names }
     } finally { lock.release() }
   } catch (error) {
     await rm(stage, { recursive: true, force: true })

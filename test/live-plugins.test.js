@@ -245,3 +245,175 @@ test('pins Cordis 4.0.5 fiber internals used by live plugins and boot', async ()
     } finally { await app.dispose() }
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
+
+test('same-install replace + disabled insert activates only enabled unique names', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-live-names-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const pkg = join(dir, 'package'), workspace = join(dir, 'workspace')
+  await mkdir(pkg); await mkdir(workspace)
+  await writeFile(join(pkg, 'package.json'), JSON.stringify({
+    name: 'names-bundle', version: '1.0.0', type: 'module', main: 'index.js',
+    dsh: { bundle: { patch: 'patch.yml' } },
+  }))
+  await writeFile(join(pkg, 'patch.yml'), `- insert:
+    - id: example
+      name: names-bundle
+      config:
+        mode: initial
+- id: example
+  config:
+    mode: replaced
+- insert:
+    - id: extra
+      name: names-bundle
+      disabled: true
+`)
+  await writeFile(join(pkg, 'index.js'), `export const inject = ['tools']
+export function apply(ctx) {
+  ctx.effect(() => ctx.tools.register({
+    name: 'names_echo', description: 'n', parameters: { type: 'object', properties: {}, additionalProperties: false },
+    execute: () => 'ok',
+  }))
+}
+`)
+  const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()
+  const app = await boot({ workspace, web: { port: 0 }, provider: fakeProvider([]) })
+  try {
+    const url = app.ctx.webControl.url
+    const response = await fetch(`${url}/plugins/install`, {
+      method: 'POST',
+      headers: { origin: url, 'content-type': 'application/json' },
+      body: JSON.stringify({ spec: join(dir, archive) }),
+    })
+    const body = await response.json()
+    assert.equal(response.status, 200, body.error)
+    assert.equal(body.phase, 'active')
+    assert.deepEqual(body.names, ['example'])
+    assert.ok(app.ctx.tools.items.has('names_echo'))
+    assert.equal(JSON.parse(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8')).plugins.find((row) => row.name === 'extra').enabled, false)
+  } finally { await app.dispose() }
+})
+
+test('uninstall refuses when required dependents need a provided service; profile stays restartable', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-live-deps-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const workspace = join(dir, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(dir, 'provider.mjs'), `
+export default {
+  apply(ctx) { ctx.provide('demoSkills', { list: () => ['alpha'] }) },
+}
+`)
+  await writeFile(join(dir, 'consumer.mjs'), `
+export const inject = ['demoSkills', 'tools']
+export function apply(ctx) {
+  ctx.effect(() => ctx.tools.register({
+    name: 'demo_themes',
+    description: 'needs demoSkills',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    execute: () => ctx.demoSkills.list().join(','),
+  }))
+}
+`)
+  await writeFile(join(dir, 'unrelated.mjs'), `
+export const inject = ['tools']
+export function apply(ctx) {
+  ctx.effect(() => ctx.tools.register({
+    name: 'unrelated_tool',
+    description: 'independent',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    execute: () => 'solo',
+  }))
+}
+`)
+  const profile = join(workspace, '.mini-dsh', 'plugins.json')
+  await mkdir(join(workspace, '.mini-dsh'), { recursive: true })
+  await writeFile(profile, JSON.stringify({
+    plugins: [
+      { name: 'demo-skills', module: join(dir, 'provider.mjs') },
+      { name: 'demo-ppt', module: join(dir, 'consumer.mjs') },
+      { name: 'demo-qr', module: join(dir, 'unrelated.mjs') },
+      { name: 'default-tool-permissions', config: { policies: { demo_themes: 'allow', unrelated_tool: 'allow' } } },
+    ],
+  }, null, 2))
+
+  const model = fakeProvider([
+    { role: 'assistant', content: null, tool_calls: [{ id: 't1', type: 'function', function: { name: 'demo_themes', arguments: '{}' } }] },
+    { role: 'assistant', content: 'themes-done' },
+  ])
+  const app = await boot({ workspace, pluginConfig: profile, web: { port: 0 }, provider: model })
+  try {
+    assert.equal(app.report.find((row) => row.name === 'demo-ppt').state, 'active')
+    assert.ok(app.ctx.tools.items.has('demo_themes'))
+    assert.ok(app.ctx.tools.items.has('unrelated_tool'))
+    await app.ctx.agent.turn('themes')
+    assert.equal(app.ctx.session.events.find((event) => event.type === 'tool.finished').result, 'alpha')
+
+    const url = app.ctx.webControl.url
+    const refused = await fetch(`${url}/plugins/uninstall`, {
+      method: 'POST',
+      headers: { origin: url, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'demo-skills' }),
+    })
+    const refusedBody = await refused.json()
+    assert.equal(refused.status, 400, JSON.stringify(refusedBody))
+    assert.match(refusedBody.error, /Cannot uninstall demo-skills/)
+    assert.match(refusedBody.error, /demo-ppt/)
+    assert.match(refusedBody.error, /demoSkills/)
+    assert.equal(JSON.parse(await readFile(profile, 'utf8')).plugins.some((row) => row.name === 'demo-skills'), true)
+    assert.equal(app.ctx.livePlugins.list().find((row) => row.name === 'demo-ppt').state, 'active')
+    assert.ok(app.ctx.tools.items.has('demo_themes'))
+    assert.ok(app.ctx.tools.items.has('unrelated_tool'))
+  } finally { await app.dispose() }
+
+  const again = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try {
+    assert.equal(again.report.find((row) => row.name === 'demo-ppt').state, 'active')
+    assert.equal(again.report.find((row) => row.name === 'demo-skills').state, 'active')
+    assert.ok(again.ctx.tools.items.has('demo_themes'))
+  } finally { await again.dispose() }
+})
+
+test('uninstall lists every required dependent and allows removal after dependents are gone', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mini-live-multi-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const workspace = join(dir, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(dir, 'provider.mjs'), `
+export default { apply(ctx) { ctx.provide('sharedSvc', {}) } }
+`)
+  await writeFile(join(dir, 'one.mjs'), `export const inject = ['sharedSvc']\nexport function apply() {}\n`)
+  await writeFile(join(dir, 'two.mjs'), `export const inject = ['sharedSvc']\nexport function apply() {}\n`)
+  await writeFile(join(dir, 'optional.mjs'), `export const inject = ['sharedSvc']\nexport function apply() {}\n`)
+  const profile = join(workspace, '.mini-dsh', 'plugins.json')
+  await mkdir(join(workspace, '.mini-dsh'), { recursive: true })
+  await writeFile(profile, JSON.stringify({
+    plugins: [
+      { name: 'shared-provider', module: join(dir, 'provider.mjs') },
+      { name: 'dep-one', module: join(dir, 'one.mjs') },
+      { name: 'dep-two', module: join(dir, 'two.mjs') },
+      { name: 'dep-optional', module: join(dir, 'optional.mjs'), required: false },
+    ],
+  }, null, 2))
+  const app = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try {
+    const blockers = app.ctx.livePlugins.dependentsBlockingRemoval('shared-provider')
+    assert.deepEqual(blockers.map((row) => row.name).sort(), ['dep-one', 'dep-two'])
+    await assert.rejects(app.ctx.livePlugins.unmount('shared-provider'), /dep-one.*dep-two|dep-two.*dep-one/)
+
+    await app.ctx.livePlugins.unmount('dep-one')
+    await uninstallPlugin('dep-one', workspace, { configPath: profile })
+    await app.ctx.livePlugins.unmount('dep-two')
+    await uninstallPlugin('dep-two', workspace, { configPath: profile })
+    // optional dependent does not block
+    await app.ctx.livePlugins.unmount('shared-provider')
+    await uninstallPlugin('shared-provider', workspace, { configPath: profile })
+    assert.equal(JSON.parse(await readFile(profile, 'utf8')).plugins.some((row) => row.name === 'shared-provider'), false)
+  } finally { await app.dispose() }
+
+  const again = await boot({ workspace, pluginConfig: profile, provider: fakeProvider([]) })
+  try {
+    assert.equal(again.report.find((row) => row.name === 'shared-provider'), undefined)
+    assert.equal(again.report.find((row) => row.name === 'dep-optional')?.state, 'pending')
+  } finally { await again.dispose() }
+})

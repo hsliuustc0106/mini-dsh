@@ -159,10 +159,15 @@ test('id-targeted replace updates a row inserted earlier in the same install', a
   await writeFile(join(pkg, 'index.js'), 'export function apply() {}')
   const archive = execFileSync('npm', ['pack', '--silent', '--pack-destination', dir], { cwd: pkg, encoding: 'utf8' }).trim()
   const result = await installPlugin(join(dir, archive), workspace)
-  assert.deepEqual(result.names, ['example', 'example', 'extra'])
+  // Live activation names: unique, omit disabled; replace must not re-list the id.
+  assert.deepEqual(result.names, ['example'])
   const profile = JSON.parse(await readFile(join(workspace, '.mini-dsh/plugins.json'), 'utf8'))
   assert.equal(profile.plugins.find((row) => row.name === 'example').config.mode, 'replaced')
   assert.equal(profile.plugins.find((row) => row.name === 'extra').enabled, false)
+  // loadProfileEntries must accept the install names without hanging or throwing.
+  const { loadProfileEntries } = await import('../src/live-plugins.js')
+  const entries = await loadProfileEntries(result.configPath, result.names)
+  assert.deepEqual(entries.map((entry) => entry.name), ['example'])
   const app = await boot({ workspace, pluginConfig: result.configPath, provider: fakeProvider([]) })
   try {
     assert.equal(app.report.find((row) => row.name === 'example').state, 'active')
