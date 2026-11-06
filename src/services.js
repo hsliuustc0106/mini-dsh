@@ -67,6 +67,51 @@ function admits(mask, name) {
   return true
 }
 
+const RUN_CODE_NAME = 'run_code'
+
+const RUN_CODE_DESCRIPTION = 'Code Mode entry. Call this tool with a program in code and a short description. Nested tool dispatch is not supported.'
+
+const RUN_CODE_PARAMETERS = {
+  type: 'object',
+  properties: {
+    code: { type: 'string', description: 'Program text. It is recorded and is not executed.' },
+    description: { type: 'string', description: 'Short summary of what this program does.' },
+  },
+  required: ['code', 'description'],
+  additionalProperties: false,
+}
+
+const SUPPORTED_PRESENTATION = new Set(['native', 'code'])
+
+export function assertRunCodeArguments(args) {
+  if (typeof args?.code !== 'string' || args.code.trim() === '') throw new Error('code must be a non-empty string')
+  if (typeof args?.description !== 'string' || args.description.trim() === '') throw new Error('description must be a non-empty string')
+}
+
+function runCodeTool() {
+  return {
+    name: RUN_CODE_NAME,
+    description: RUN_CODE_DESCRIPTION,
+    parameters: RUN_CODE_PARAMETERS,
+    execute(args) {
+      assertRunCodeArguments(args)
+      throw new Error('run_code nested dispatch is not supported')
+    },
+  }
+}
+
+function runCodeSchema() {
+  return {
+    type: 'function',
+    function: { name: RUN_CODE_NAME, description: RUN_CODE_DESCRIPTION, parameters: RUN_CODE_PARAMETERS },
+  }
+}
+
+function unsupportedPresentation(mode) {
+  const shown = typeof mode === 'string' ? JSON.stringify(mode) : typeof mode
+  return new Error(`tools.presentAs is not supported (${shown}); only "native" and "code" presentation are available`)
+}
+
 export class Tools extends Service {
   constructor(ctx) {
     super(ctx, 'tools')
@@ -77,10 +122,11 @@ export class Tools extends Service {
     this.guards = []
     this.masks = []
     this.presentations = new Map()
+    this.runCode = runCodeTool()
   }
   register(tool, options) {
     if (typeof tool?.name !== 'string' || !tool.name) throw new Error('Tool name is required')
-    if (tool.name === 'run_code') throw new Error('Tool run_code is reserved; Code Mode is not supported')
+    if (tool.name === RUN_CODE_NAME) throw new Error('Tool run_code is reserved')
     if (typeof tool.description !== 'string') throw new Error(`Tool ${tool.name} needs a description`)
     if (!tool.parameters || tool.parameters.type !== 'object') throw new Error(`Tool ${tool.name} needs an object schema`)
     if (typeof tool.execute !== 'function') throw new Error(`Tool ${tool.name} needs execute`)
@@ -162,18 +208,31 @@ export class Tools extends Service {
       }
     })
   }
-  // No agent: the full registry. An agent: native schemas after that agent's masks.
+  // No agent: the full registry, which never includes reserved run_code.
+  // Code mode: only that reserved entry. Otherwise native schemas after masks.
   // The mini-dsh loop passes the initiating agent, and that list is what JSONL records.
   schemas(agent) {
     if (agent === undefined) return this.project()
     if (!agent || typeof agent !== 'object' || Array.isArray(agent) || typeof agent.id !== 'string' || !agent.id) {
       throw new Error('tools.schemas() agent must have an id')
     }
-    const mode = this.presentations.get(agent.id)
-    if (mode !== undefined && mode !== 'native') {
-      throw new Error(`tools.presentAs is not supported (${JSON.stringify(mode)}); only "native" presentation is available`)
-    }
+    if (this.presentationMode(agent.id) === 'code') return [runCodeSchema()]
     return this.project(agent.id)
+  }
+  presentationMode(agentId) {
+    const mode = this.presentations.get(agentId)
+    if (mode !== undefined && !SUPPORTED_PRESENTATION.has(mode)) throw unsupportedPresentation(mode)
+    return mode
+  }
+  // Direct model calls. Code mode resolves only reserved run_code; every other
+  // name is absent. run_code is absent unless this agent presented as code.
+  // This does not execute a program or dispatch nested tools.
+  callable(name, agent) {
+    const agentId = agent && typeof agent === 'object' && typeof agent.id === 'string' ? agent.id : undefined
+    const mode = agentId ? this.presentationMode(agentId) : undefined
+    if (name === RUN_CODE_NAME) return mode === 'code' ? this.runCode : undefined
+    if (mode === 'code') return undefined
+    return typeof name === 'string' ? this.items.get(name) : undefined
   }
   project(agentId) {
     return [...this.items.values()]
@@ -190,24 +249,22 @@ export class Tools extends Service {
     }
     return true
   }
-  // Native presentation for the calling agent. One declaration per agent.
-  // Code Mode modes throw and do not register. The effect leaves with the caller fiber.
+  // One presentation for the calling agent. native and code register through
+  // ctx.effect and leave with the caller fiber. Other modes do not register.
   presentAs(mode) {
-    if (mode !== 'native') {
-      throw new Error(`tools.presentAs is not supported (${typeof mode === 'string' ? JSON.stringify(mode) : typeof mode}); only "native" presentation is available`)
-    }
+    if (!SUPPORTED_PRESENTATION.has(mode)) throw unsupportedPresentation(mode)
     const agent = resolveAgent(this.ctx, 'tools.presentAs()')
     if (this.presentations.has(agent.id)) {
-      throw new Error('tools.presentAs("native") conflicts with a presentation already declared for this agent')
+      throw new Error(`tools.presentAs(${JSON.stringify(mode)}) conflicts with a presentation already declared for this agent`)
     }
     const agentId = agent.id
     return this.ctx.effect(() => {
       if (this.presentations.has(agentId)) {
-        throw new Error('tools.presentAs("native") conflicts with a presentation already declared for this agent')
+        throw new Error(`tools.presentAs(${JSON.stringify(mode)}) conflicts with a presentation already declared for this agent`)
       }
-      this.presentations.set(agentId, 'native')
+      this.presentations.set(agentId, mode)
       return () => {
-        if (this.presentations.get(agentId) === 'native') this.presentations.delete(agentId)
+        if (this.presentations.get(agentId) === mode) this.presentations.delete(agentId)
       }
     })
   }
@@ -227,8 +284,8 @@ export class Tools extends Service {
     const deny = filter.deny === undefined ? undefined : compileNameList(filter.deny, 'deny')
     const agent = resolveAgent(this.ctx, 'tools.restrict()')
     const named = [...(allow ?? []), ...(deny ?? [])]
-    if (named.includes('run_code')) {
-      throw new Error('tools.restrict() cannot name reserved run_code; Code Mode is not supported')
+    if (named.includes(RUN_CODE_NAME)) {
+      throw new Error('tools.restrict() cannot name reserved run_code')
     }
     const unknown = named.filter((name) => !this.items.has(name))
     if (unknown.length) {
@@ -241,6 +298,7 @@ export class Tools extends Service {
       this.masks.push(mask)
       const removeGuard = this.guard((view) => {
         if (view?.agent?.id !== mask.agentId) return undefined
+        if (view?.name === RUN_CODE_NAME) return undefined
         if (typeof view.name !== 'string' || admits(mask, view.name)) return undefined
         return `tool ${view.name} is restricted`
       })
@@ -329,12 +387,7 @@ export class Tools extends Service {
   }
   checkGuards(exec) {
     const agentId = exec?.view?.agent?.id
-    if (typeof agentId === 'string') {
-      const mode = this.presentations.get(agentId)
-      if (mode !== undefined && mode !== 'native') {
-        throw new Error(`tools.presentAs is not supported (${JSON.stringify(mode)}); only "native" presentation is available`)
-      }
-    }
+    if (typeof agentId === 'string') this.presentationMode(agentId)
     for (const entry of this.guards) {
       let reason
       try { reason = entry.guard(exec.view) }
