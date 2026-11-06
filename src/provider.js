@@ -201,6 +201,18 @@ function outgoingCall(call) {
   }
 }
 
+function outgoingTools(tools) {
+  return tools.map((tool) => {
+    if (!tool || tool.type !== 'function' || !tool.function || typeof tool.function !== 'object' || Array.isArray(tool.function)) {
+      return tool
+    }
+    const fn = { ...tool.function }
+    if (fn.deferLoading === true) fn.defer_loading = true
+    delete fn.deferLoading
+    return { ...tool, function: fn }
+  })
+}
+
 function outgoingMessage(message) {
   if (!message || typeof message.role !== 'string') throw new Error('Model message is invalid')
   if (message.role === 'system' || message.role === 'user') return { role: message.role, content: message.content ?? '' }
@@ -223,11 +235,18 @@ function chatBody(input, model, toolChoice) {
   for (const message of input.messages ?? []) messages.push(outgoingMessage(message))
   const body = { model, messages, stream: true, thinking: { type: 'disabled' } }
   if (input.tools?.length) {
-    body.tools = input.tools
+    const tools = outgoingTools(input.tools)
+    if (tools.every((tool) => tool?.function?.defer_loading === true)) {
+      throw new Error('DeepSeek rejects an all-deferred tool list; at least one offered tool must load immediately')
+    }
+    body.tools = tools
     const followUp = messages.some((message) => message.role === 'tool')
     if (toolChoice && !followUp) {
-      const known = input.tools.some((tool) => tool?.function?.name === toolChoice)
-      if (!known) throw new Error(`DEEPSEEK_TOOL_CHOICE is not a registered tool: ${toolChoice}`)
+      const chosen = tools.find((tool) => tool?.function?.name === toolChoice)
+      if (!chosen) throw new Error(`DEEPSEEK_TOOL_CHOICE is not a registered tool: ${toolChoice}`)
+      if (chosen.function.defer_loading === true) {
+        throw new Error(`DEEPSEEK_TOOL_CHOICE cannot name a deferred tool: ${toolChoice}`)
+      }
       body.tool_choice = { type: 'function', function: { name: toolChoice } }
     }
   }

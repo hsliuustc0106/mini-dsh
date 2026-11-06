@@ -9,7 +9,7 @@ import { AGENT_SCOPE } from './agents.js'
 import { currentDelegationAgent } from './delegation.js'
 import { assertEvent, createEvent, projectSessionMessages, readSession, unknownOutcomes, unknownReason, unknownStreams } from './log.js'
 import {
-  applyPostDecision, coerceExecuteResult, errorText, fuseSignals, markOutcome, normalizePreDecision, textBlocks,
+  applyContentCallback, applyPostDecision, coerceExecuteResult, errorOutcome, errorText, fuseSignals, markOutcome, normalizePreDecision, textBlocks,
 } from './tool-pipeline.js'
 
 export function validateArguments(schema, value) {
@@ -73,6 +73,7 @@ export class Tools extends Service {
     this.items = new Map()
     this.outputs = new Map()
     this.owners = new Map()
+    this.contracts = new Map()
     this.guards = []
     this.masks = []
     this.presentations = new Map()
@@ -85,13 +86,22 @@ export class Tools extends Service {
     if (typeof tool.execute !== 'function') throw new Error(`Tool ${tool.name} needs execute`)
     if (options != null && Object.keys(options).length) throw new Error(`Tool ${tool.name}: registration options are not supported`)
     if (this.items.has(tool.name)) throw new Error(`Duplicate tool: ${tool.name}`)
-    // Execution-affecting DSH extensions fail closed. Presentation / concurrency
-    // classifiers from defineTool are accepted and ignored (no UI; tools run sequentially).
-    if (['projectContent', 'finalizeContent', 'deferLoading'].some((key) => tool[key] !== undefined)) {
-      throw new Error(`Tool ${tool.name}: DSH execution extensions are not supported`)
+    // Presentation helpers from defineTool are accepted and ignored (no UI).
+    // projectContent / finalizeContent / deferLoading are registered below.
+    if (tool.projectContent !== undefined && typeof tool.projectContent !== 'function') {
+      throw new Error(`Tool ${tool.name}: projectContent must be a function when provided`)
+    }
+    if (tool.finalizeContent !== undefined && typeof tool.finalizeContent !== 'function') {
+      throw new Error(`Tool ${tool.name}: finalizeContent must be a function when provided`)
+    }
+    if (tool.deferLoading !== undefined && tool.deferLoading !== true) {
+      throw new Error(`Tool ${tool.name}: deferLoading must be true when provided`)
     }
     const ignoredToolFields = new Set(['presentCall', 'presentResult', 'isConcurrencySafe'])
-    const supportedToolFields = new Set(['name', 'description', 'parameters', 'execute', 'output', 'timeoutMs', ...ignoredToolFields])
+    const supportedToolFields = new Set([
+      'name', 'description', 'parameters', 'execute', 'output', 'timeoutMs',
+      'projectContent', 'finalizeContent', 'deferLoading', ...ignoredToolFields,
+    ])
     for (const key of Object.keys(tool)) {
       if (!supportedToolFields.has(key)) throw new Error(`Tool ${tool.name}: unsupported tool field '${key}'`)
     }
@@ -132,14 +142,21 @@ export class Tools extends Service {
     // The traceable service proxy makes this.ctx the caller, so the owner fiber
     // is the plugin that registered the tool. Dispose drops that same identity.
     const owner = this.ctx.fiber
+    const contract = {
+      projectContent: typeof tool.projectContent === 'function' ? tool.projectContent.bind(tool) : undefined,
+      finalizeContent: typeof tool.finalizeContent === 'function' ? tool.finalizeContent.bind(tool) : undefined,
+      deferLoading: tool.deferLoading === true,
+    }
     return this.ctx.effect(() => {
       this.items.set(tool.name, tool)
       this.owners.set(tool.name, owner)
+      this.contracts.set(tool.name, contract)
       if (output) this.outputs.set(tool.name, output)
       return () => {
         if (this.items.get(tool.name) !== tool) return
         this.items.delete(tool.name)
         if (this.owners.get(tool.name) === owner) this.owners.delete(tool.name)
+        if (this.contracts.get(tool.name) === contract) this.contracts.delete(tool.name)
         this.outputs.delete(tool.name)
         if (output) this.outputSchemas.removeSchema(output.schema)
       }
@@ -161,9 +178,11 @@ export class Tools extends Service {
   project(agentId) {
     return [...this.items.values()]
       .filter((tool) => agentId === undefined || this.visibleTo(agentId, tool.name))
-      .map(({ name, description, parameters }) => ({
-        type: 'function', function: { name, description, parameters },
-      }))
+      .map(({ name, description, parameters }) => {
+        const fn = { name, description, parameters }
+        if (this.contracts.get(name)?.deferLoading === true) fn.deferLoading = true
+        return { type: 'function', function: fn }
+      })
   }
   visibleTo(agentId, name) {
     for (const mask of this.masks) {
@@ -290,8 +309,11 @@ export class Tools extends Service {
         signal = value
       },
     })
+    const contract = this.contracts.get(name)
     return {
       callId, name, args: snapshot, tool, callerSignal: caller.signal, view,
+      projectContent: contract?.projectContent,
+      finalizeContent: contract?.finalizeContent,
       abort(reason) { if (!caller.signal.aborted) caller.abort(reason) },
     }
   }
@@ -348,27 +370,46 @@ export class Tools extends Service {
     }
   }
   async settle(exec, raw) {
-    let final
-    try {
-      const decision = await this.ctx.waterfall(
-        'tools/post-execute',
-        exec.view,
-        publishResult(raw),
-        async () => ({ kind: 'accept' }),
-      )
-      final = applyPostDecision(decision, raw, (value) => this.replaceValue(exec, value))
-    } catch (error) {
-      final = {
-        isError: true,
-        text: errorText(error.message),
-        content: [{ type: 'text', text: errorText(error.message) }],
-        contexts: [],
+    const viewed = executionView(exec)
+    const project = exec.projectContent
+    exec.projectContent = undefined
+    let stage = raw
+    let runPost = true
+    if (typeof project === 'function') {
+      try {
+        stage = applyContentCallback(stage, project, viewed, publishResult(stage), `Tool ${exec.name}: projectContent`)
+      } catch (error) {
+        stage = errorOutcome(error.message)
+        runPost = false
+      }
+    }
+    let final = stage
+    if (runPost) {
+      try {
+        const decision = await this.ctx.waterfall(
+          'tools/post-execute',
+          exec.view,
+          publishResult(stage),
+          async () => ({ kind: 'accept' }),
+        )
+        final = applyPostDecision(decision, stage, (value) => this.replaceValue(exec, value))
+      } catch (error) {
+        final = errorOutcome(error.message)
+      }
+    }
+    const finalize = exec.finalizeContent
+    exec.finalizeContent = undefined
+    if (typeof finalize === 'function') {
+      try {
+        final = applyContentCallback(final, finalize, viewed, publishResult(final), `Tool ${exec.name}: finalizeContent`)
+      } catch (error) {
+        final = errorOutcome(error.message)
       }
     }
     this.emitResult(exec, final)
     return {
       text: final.text,
-      contexts: final.contexts.map((content) => ({ type: 'tools.context', callId: exec.callId, content })),
+      contexts: (final.contexts ?? []).map((content) => ({ type: 'tools.context', callId: exec.callId, content })),
     }
   }
   emitResult(exec, final) {
@@ -447,6 +488,17 @@ export class Tools extends Service {
       unlink()
     }
   }
+}
+
+function executionView(exec) {
+  const view = { callId: exec.callId, name: exec.name, arguments: exec.args }
+  const agentId = exec.view?.agent?.id
+  if (typeof agentId === 'string' && agentId) view.agent = { id: agentId }
+  try {
+    const snapshot = snapshotJsonValue(view)
+    if (snapshot !== undefined) return deepFreeze(snapshot)
+  } catch { /* the callback still receives the call identity */ }
+  return deepFreeze({ callId: exec.callId, name: exec.name })
 }
 
 function publicResult(raw) {

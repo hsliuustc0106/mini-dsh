@@ -214,8 +214,10 @@ test('DSH activation and execution extensions are not silently ignored', async (
     output: { schema: { type: 'string' }, render: () => [{ type: 'text', text: 'value' }] },
   }
   assert.throws(() => ctx.tools.register(base, { when: () => false }), /registration options are not supported/)
-  for (const extension of [{ projectContent() {} }, { finalizeContent() {} }, { deferLoading: true }]) {
-    assert.throws(() => ctx.tools.register({ ...base, ...extension }), /DSH execution extensions are not supported/)
+  assert.throws(() => ctx.tools.register({ ...base, projectContent: true }), /projectContent must be a function/)
+  assert.throws(() => ctx.tools.register({ ...base, finalizeContent: 'no' }), /finalizeContent must be a function/)
+  for (const deferLoading of [false, 1, 'true']) {
+    assert.throws(() => ctx.tools.register({ ...base, name: 'bad_defer', deferLoading }), /deferLoading must be true/)
   }
   for (const timeoutMs of [0, -1, Infinity, 2147483648]) assert.throws(() => ctx.tools.register({ ...base, timeoutMs }), /timeoutMs/)
   await tools.dispose()
@@ -307,11 +309,158 @@ test('unknown tool or output fields fail closed at registration', async () => {
   assert.throws(() => ctx.tools.register({
     ...base, output: { ...base.output, presentationMeta: 'nope' },
   }), /presentationMeta must be a function/)
-  for (const extension of [{ projectContent() {} }, { finalizeContent() {} }, { deferLoading: true }]) {
-    assert.throws(() => ctx.tools.register({
-      name: 'legacy', description: 'no output', parameters: { type: 'object' }, execute: () => 'x', ...extension,
-    }), /DSH execution extensions are not supported/)
+  await tools.dispose()
+})
+
+test('projectContent, finalizeContent, and deferLoading register with the tool effect', async () => {
+  const ctx = new Context(), tools = ctx.plugin(Tools)
+  await tools.await()
+  const seen = []
+  let postedPicture = 0
+  ctx.on('tools/post-execute', async (exec, result, next) => {
+    const decision = await next()
+    if (exec.name === 'seen') seen.push(result.content.map((block) => block.text).join('\n'))
+    if (exec.name === 'picture') {
+      postedPicture += 1
+      return { kind: 'accept', content: [{ type: 'text', text: 'POSTED' }] }
+    }
+    if (exec.name === 'hooked') {
+      return {
+        kind: 'accept',
+        content: [{ type: 'text', text: 'hooked' }],
+        additionalContexts: [{ role: 'user', content: 'note' }],
+      }
+    }
+    return decision
+  })
+  const observed = []
+  ctx.on('tools/result', (_identity, result) => { observed.push(result) })
+  const sticky = {
+    name: 'sticky', description: 'Sticky registration', parameters: { type: 'object', properties: {}, additionalProperties: false },
+    deferLoading: true,
+    execute: () => 'raw',
+    projectContent(exec) {
+      assert.equal(Object.isFrozen(exec), true)
+      assert.equal(exec.agent.id, 'mini-dsh')
+      assert.equal(Object.isFrozen(exec.arguments), true)
+      return [{ type: 'text', text: 'registered' }]
+    },
   }
+  ctx.tools.register(sticky)
+  sticky.projectContent = () => [{ type: 'text', text: 'mutated' }]
+  sticky.deferLoading = false
+  const offered = ctx.tools.schemas().find((schema) => schema.function.name === 'sticky')
+  assert.equal(offered.function.deferLoading, true)
+  assert.equal(JSON.stringify(offered).includes('projectContent'), false)
+  assert.equal(offered.function.description, 'Sticky registration')
+
+  ctx.tools.register({
+    name: 'kept', description: 'Keep render', parameters: { type: 'object' },
+    output: { schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: 'n=' + value.n }] },
+    execute: () => ({ n: 1 }),
+    projectContent() { return undefined },
+    finalizeContent() { return undefined },
+  })
+  ctx.tools.register({
+    name: 'seen', description: 'Seen', parameters: { type: 'object' },
+    execute: () => 'raw',
+    projectContent() { return [{ type: 'text', text: 'projected' }] },
+  })
+  ctx.tools.register({
+    name: 'hooked', description: 'Hooked', parameters: { type: 'object' },
+    execute: () => 'raw',
+    projectContent() { return [{ type: 'text', text: 'projected' }] },
+    finalizeContent(_exec, result) {
+      return [{ type: 'text', text: result.content.map((block) => block.text).join('\n') + '|final' }]
+    },
+  })
+  ctx.tools.register({
+    name: 'picture', description: 'Picture', parameters: { type: 'object' },
+    execute: () => 'raw',
+    projectContent() { return [{ type: 'image', data: 'IMAGEPAYLOAD' }] },
+    finalizeContent() { return undefined },
+  })
+  ctx.tools.register({
+    name: 'async_block', description: 'Async block', parameters: { type: 'object' },
+    execute: () => 'raw',
+    async projectContent() { return [{ type: 'text', text: 'DELAYEDTEXT' }] },
+  })
+  ctx.tools.register({
+    name: 'boom', description: 'Boom', parameters: { type: 'object' },
+    execute: () => 'raw',
+    projectContent() { throw new Error('boom') },
+  })
+  ctx.tools.register({
+    name: 'final_image', description: 'Final image', parameters: { type: 'object' },
+    output: { schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'], additionalProperties: false }, render: (_a, value) => [{ type: 'text', text: 'n=' + value.n }] },
+    execute: () => ({ n: 4 }),
+    finalizeContent() { return [{ type: 'image', data: 'FINALSENTINEL' }] },
+  })
+  let directCalls = 0
+  ctx.tools.register({
+    name: 'direct', description: 'Direct', parameters: { type: 'object' },
+    execute: () => 'raw',
+    projectContent() { directCalls += 1; return [{ type: 'text', text: 'nope' }] },
+    finalizeContent() { directCalls += 1; return [{ type: 'text', text: 'nope' }] },
+  })
+
+  async function settle(name) {
+    const tool = ctx.tools.items.get(name)
+    const exec = ctx.tools.createExecution({ callId: name, name, args: {}, tool })
+    const raw = await ctx.tools.executeOnly(exec)
+    return ctx.tools.settle(exec, raw)
+  }
+
+  assert.equal((await settle('sticky')).text, 'registered')
+  assert.equal((await settle('kept')).text, 'n=1')
+  assert.deepEqual(seen, [])
+  assert.equal((await settle('seen')).text, 'projected')
+  assert.deepEqual(seen, ['projected'])
+  const hooked = await settle('hooked')
+  assert.equal(hooked.text, 'hooked|final')
+  assert.equal(hooked.contexts[0].content, 'note')
+  const picture = await settle('picture')
+  assert.match(picture.text, /only text output blocks are supported/)
+  assert.equal(picture.text.includes('IMAGEPAYLOAD'), false)
+  assert.equal(picture.text.includes('POSTED'), false)
+  assert.equal(postedPicture, 0)
+  const late = await settle('async_block')
+  assert.match(late.text, /projectContent must be synchronous/)
+  assert.equal(late.text.includes('DELAYEDTEXT'), false)
+  assert.match((await settle('boom')).text, /projectContent failed: boom/)
+  const finalImage = await settle('final_image')
+  assert.match(finalImage.text, /only text output blocks are supported/)
+  assert.equal(finalImage.text.includes('FINALSENTINEL'), false)
+  assert.equal(await ctx.tools.run('direct', {}), 'raw')
+  assert.equal(directCalls, 0)
+
+  const keptResult = observed.find((result) => result.value?.n === 1)
+  assert.equal(keptResult.isError, false)
+  assert.equal(keptResult.content[0].text, 'n=1')
+  const dropped = observed.find((result) => result.error && String(result.content[0].text).includes('finalizeContent'))
+  assert.equal(dropped.isError, true)
+  assert.equal(dropped.value, undefined)
+
+  let projected = 0
+  let finalized = 0
+  let release
+  const pending = new Promise((resolve) => { release = resolve })
+  const remove = ctx.tools.register({
+    name: 'slow', description: 'Slow', parameters: { type: 'object' }, deferLoading: true,
+    execute: () => pending,
+    projectContent() { projected += 1; return [{ type: 'text', text: 'projected' }] },
+    finalizeContent() { finalized += 1; return [{ type: 'text', text: 'final' }] },
+  })
+  assert.equal(ctx.tools.schemas().find((schema) => schema.function.name === 'slow').function.deferLoading, true)
+  const exec = ctx.tools.createExecution({ callId: 'slow-1', name: 'slow', args: {}, tool: ctx.tools.items.get('slow') })
+  const running = ctx.tools.executeOnly(exec)
+  remove()
+  assert.equal(ctx.tools.schemas().some((schema) => schema.function.name === 'slow'), false)
+  release('body')
+  const raw = await running
+  assert.equal((await ctx.tools.settle(exec, raw)).text, 'final')
+  assert.equal(projected, 1)
+  assert.equal(finalized, 1)
   await tools.dispose()
 })
 
