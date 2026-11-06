@@ -488,6 +488,65 @@ test('tool ownership is identity-scoped across plugins', async () => {
   await tools.dispose()
 })
 
+test('supported image blocks are model content and unsupported blocks are not stored', async () => {
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+  const ctx = new Context(), tools = ctx.plugin(Tools)
+  await tools.await()
+  const seen = []
+  ctx.on('tools/post-execute', async (exec, result, next) => {
+    const decision = await next()
+    seen.push([exec.name, result.content.map((block) => block.type)])
+    if (exec.name === 'hooked') return { kind: 'accept', content: [{ type: 'image', mediaType: 'image/png', data: png }] }
+    if (exec.name === 'noted') return { kind: 'accept', additionalContexts: [{ role: 'user', content: [{ type: 'image', mediaType: 'image/png', data: png }] }] }
+    return decision
+  })
+  const block = { type: 'image', mediaType: 'image/png', data: png }
+  ctx.tools.register({
+    name: 'shot', description: 'Shot', parameters: { type: 'object' },
+    output: { schema: { type: 'string' }, render: () => [{ type: 'text', text: 'frame' }, block] },
+    execute: () => 'bytes',
+  })
+  ctx.tools.register({
+    name: 'direct', description: 'Direct', parameters: { type: 'object' },
+    output: { schema: { type: 'string' }, render: () => [{ type: 'image', mediaType: 'image/png', data: png }] },
+    execute: () => 'bytes',
+  })
+  ctx.tools.register({
+    name: 'hooked', description: 'Hooked', parameters: { type: 'object' }, execute: () => 'raw',
+  })
+  ctx.tools.register({
+    name: 'noted', description: 'Noted', parameters: { type: 'object' }, execute: () => 'raw',
+  })
+  ctx.tools.register({
+    name: 'leaky', description: 'Leaky', parameters: { type: 'object' }, execute: () => 'raw',
+    projectContent() { return [{ type: 'image', mediaType: 'image/png', data: png, name: 'LEAKNAME' }] },
+  })
+  async function settle(name) {
+    const tool = ctx.tools.items.get(name)
+    const exec = ctx.tools.createExecution({ callId: name, name, args: {}, tool })
+    return ctx.tools.settle(exec, await ctx.tools.executeOnly(exec))
+  }
+  const shot = await settle('shot')
+  block.data = 'MUTATED'
+  assert.equal(shot.text, 'frame')
+  assert.equal(shot.model[0].text, 'frame')
+  assert.equal(shot.model[1].type, 'image')
+  assert.equal(shot.model[1].data, png)
+  assert.deepEqual(seen[0], ['shot', ['text', 'image']])
+  await assert.rejects(ctx.tools.run('direct', {}), /tools\.run\(\) does not return non-text content/)
+  const hooked = await settle('hooked')
+  assert.equal(hooked.text, '')
+  assert.equal(hooked.model[0].data, png)
+  const noted = await settle('noted')
+  assert.match(noted.text, /only text output blocks are supported/)
+  assert.equal(noted.model.includes(png), false)
+  const leaky = await settle('leaky')
+  assert.match(leaky.text, /only text output blocks are supported/)
+  assert.equal(leaky.text.includes('LEAKNAME'), false)
+  assert.equal(String(leaky.model).includes('LEAKNAME'), false)
+  await tools.dispose()
+})
+
 test('array DSH output validates and renders as text', async () => {
   const ctx = new Context(), tools = ctx.plugin(Tools)
   await tools.await()

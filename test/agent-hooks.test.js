@@ -513,6 +513,83 @@ test('agent-scoped listeners do not see another scope and leave with their fiber
   } finally { await app.dispose() }
 })
 
+test('a supported image injected before the step is stored and sent from JSONL', async (t) => {
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+  const dir = await workspace(t)
+  const session = join(dir, 'session.jsonl')
+  await writeFile(join(dir, 'entry.mjs'), `
+export const inject = ['agents']
+export function apply(ctx) {
+  const png = ${JSON.stringify(png)}
+  ctx.on('agent/session-start', ({ agent }) => {
+    agent.inject({
+      role: 'user',
+      content: [{ type: 'text', text: 'see' }, { type: 'image', mediaType: 'image/png', data: png }],
+      source: { kind: 'plugin', form: 'picture' },
+    })
+  })
+}
+`)
+  await writeFile(join(dir, 'plugins.json'), JSON.stringify({ plugins: [{ name: 'entry-hook', module: './entry.mjs' }] }))
+  const model = fakeProvider([{ role: 'assistant', content: 'ok' }])
+  const app = await boot({ workspace: dir, session, pluginConfig: 'plugins.json', web: false, provider: model })
+  try {
+    await app.ctx.agent.turn('hello')
+    const image = app.ctx.session.messages.find((message) => Array.isArray(message.content))
+    assert.equal(image.source.form, 'picture')
+    assert.deepEqual(image.content, [
+      { type: 'text', text: 'see' },
+      { type: 'image', mediaType: 'image/png', data: png },
+    ])
+    const imageEvent = app.ctx.session.events.find((event) => event.type === 'message' && event.message?.content?.[1]?.data === png)
+    const request = app.ctx.session.events.find((event) => event.type === 'model.request')
+    assert.ok(imageEvent.seq < request.seq)
+    const sent = model.sent[0].messages.find((message) => Array.isArray(message.content))
+    assert.deepEqual(sent.content, image.content)
+    assert.equal(sent.source, undefined)
+    assert.equal(JSON.stringify(request.body).includes(png), true)
+    assert.equal(JSON.stringify(request.body).includes('"form":"picture"'), false)
+  } finally { await app.dispose() }
+
+  await writeFile(join(dir, 'later.mjs'), `
+export const inject = ['agents']
+export function apply(ctx) {
+  ctx.on('agent/session-start', ({ agent }) => {
+    agent.inject({ role: 'user', content: 'later', source: { kind: 'plugin', form: 'later' } })
+  })
+}
+`)
+  await writeFile(join(dir, 'plugins.json'), JSON.stringify({ plugins: [{ name: 'later-hook', module: './later.mjs' }] }))
+  const again = fakeProvider([{ role: 'assistant', content: 'next' }])
+  const resumed = await boot({ workspace: dir, session, pluginConfig: 'plugins.json', web: false, provider: again })
+  try {
+    await resumed.ctx.agent.turn('next')
+    const encoded = JSON.stringify(again.sent[0].messages)
+    assert.equal(encoded.includes(png), true)
+    assert.equal(again.sent[0].messages.some((message) => message.content === 'later'), true)
+    assert.equal(resumed.ctx.session.messages.filter((message) => Array.isArray(message.content)).length, 1)
+  } finally { await resumed.dispose() }
+
+  await writeFile(join(dir, 'bad.mjs'), `
+export function apply(ctx) {
+  ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next()
+    return { kind: 'enter', messages: [...decision.messages, { role: 'user', content: [{ type: 'file', name: 'FILESECRET' }] }] }
+  }, { prepend: true })
+}
+`)
+  await writeFile(join(dir, 'plugins.json'), JSON.stringify({ plugins: [{ name: 'bad-hook', module: './bad.mjs' }] }))
+  const blocked = await boot({
+    workspace: dir, session: join(dir, 'blocked.jsonl'), pluginConfig: 'plugins.json', web: false,
+    provider: fakeProvider([{ role: 'assistant', content: 'no' }]),
+  })
+  try {
+    await assert.rejects(blocked.ctx.agent.turn('hello'), /Unsupported hook message content: file/)
+    assert.equal(JSON.stringify(blocked.ctx.session.events).includes('FILESECRET'), false)
+    assert.equal(blocked.ctx.session.events.some((event) => event.type === 'model.request'), false)
+  } finally { await blocked.dispose() }
+})
+
 test('the official agent-loop bridge does not dispatch mini-dsh agent hooks', async (t) => {
   const dir = await workspace(t)
   await writeFile(join(dir, 'plugins.json'), JSON.stringify({

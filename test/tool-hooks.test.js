@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { boot } from '../src/boot.js'
+import { project } from '../src/trajectory.js'
 import { loadProfileEntries } from '../src/live-plugins.js'
 import { fakeProvider } from '../src/provider.js'
 import { Tools } from '../src/services.js'
@@ -533,6 +534,98 @@ export function apply(ctx) {
     assert.equal(encoded.includes('IMAGEPAYLOAD'), false)
     assert.equal(encoded.includes('POSTED'), false)
   } finally { await app.dispose() }
+})
+
+test('supported image blocks are the JSONL model input and unsupported blocks are not stored', async (t) => {
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+  const dir = await workspace(t)
+  const session = join(dir, 'session.jsonl')
+  await writeFile(join(dir, 'hook.mjs'), `
+export const inject = ['tools', 'permissions']
+export function apply(ctx) {
+  const png = ${JSON.stringify(png)}
+  const parameters = { type: 'object', properties: {}, additionalProperties: false }
+  ctx.effect(() => ctx.tools.register({
+    name: 'shot', description: 'Shot.', parameters,
+    output: { schema: { type: 'string' }, render: () => [{ type: 'text', text: 'frame' }, { type: 'image', mediaType: 'image/png', data: png }] },
+    execute: () => 'bytes',
+  }))
+  ctx.effect(() => ctx.tools.register({
+    name: 'only', description: 'Only.', parameters, execute: () => 'raw',
+    finalizeContent() { return [{ type: 'image', mediaType: 'image/png', data: png }] },
+  }))
+  ctx.effect(() => ctx.tools.register({
+    name: 'leak', description: 'Leak.', parameters, execute: () => 'raw',
+    projectContent() { return [{ type: 'file', name: 'FILESECRET' }] },
+  }))
+  for (const name of ['shot', 'only', 'leak']) ctx.effect(() => ctx.permissions.register(name, 'allow'))
+}
+`)
+  await writeFile(join(dir, 'plugins.json'), JSON.stringify({ plugins: [{ name: 'hook', module: './hook.mjs' }] }))
+  const model = fakeProvider([
+    calls([['shot', 'shot'], ['only', 'only'], ['leak', 'leak']]),
+    { role: 'assistant', content: 'done' },
+  ])
+  const app = await boot({ workspace: dir, session, pluginConfig: 'plugins.json', web: false, provider: model })
+  try {
+    await app.ctx.agent.turn('go')
+    const shot = [{ type: 'text', text: 'frame' }, { type: 'image', mediaType: 'image/png', data: png }]
+    const only = [{ type: 'image', mediaType: 'image/png', data: png }]
+    const finished = app.ctx.session.events.filter((event) => event.type === 'tool.finished')
+    assert.equal(finished[0].result, 'frame')
+    assert.deepEqual(finished[0].content, shot)
+    assert.equal(finished[1].result, '')
+    assert.deepEqual(finished[1].content, only)
+    assert.match(finished[2].result, /only text output blocks are supported/)
+    assert.equal(finished[2].content, undefined)
+    const tools = app.ctx.session.messages.filter((message) => message.role === 'tool').map((message) => message.content)
+    assert.deepEqual(tools[0], shot)
+    assert.deepEqual(tools[1], only)
+    assert.match(tools[2], /only text output blocks are supported/)
+    const sent = model.sent[1].messages.filter((message) => message.role === 'tool').map((message) => message.content)
+    assert.deepEqual(sent, tools)
+    const recorded = app.ctx.session.events.filter((event) => event.type === 'model.request')
+    assert.deepEqual(recorded[1].body.messages.filter((message) => message.role === 'tool').map((message) => message.content), sent)
+    assert.equal(JSON.stringify(app.ctx.session.events).includes('FILESECRET'), false)
+    const view = project(app.ctx.session.events)
+    const card = view.turns[0].cards.find((item) => item.name === 'shot')
+    assert.deepEqual(card.result, shot)
+    const summary = view.turns[0].rows.find((row) => row.detail?.tool_call_id === 'shot').summary
+    assert.match(summary, /frame/)
+    assert.match(summary, /\[image\]/)
+  } finally { await app.dispose() }
+
+  await writeFile(join(dir, 'next.mjs'), `
+export const inject = ['tools', 'permissions']
+export function apply(ctx) {
+  const parameters = { type: 'object', properties: {}, additionalProperties: false }
+  ctx.effect(() => ctx.tools.register({
+    name: 'shot', description: 'Shot.', parameters,
+    output: { schema: { type: 'string' }, render: () => [{ type: 'text', text: 'FILESECRET' }] },
+    execute: () => 'bytes',
+  }))
+  ctx.effect(() => ctx.permissions.register('shot', 'allow'))
+}
+`)
+  await writeFile(join(dir, 'plugins.json'), JSON.stringify({ plugins: [{ name: 'next', module: './next.mjs' }] }))
+  const again = fakeProvider([
+    call('shot', {}, 'again'),
+    { role: 'assistant', content: 'later' },
+  ])
+  const resumed = await boot({ workspace: dir, session, pluginConfig: 'plugins.json', web: false, provider: again })
+  try {
+    await resumed.ctx.agent.turn('next')
+    const request = again.sent[1]
+    const encoded = JSON.stringify(request.messages)
+    assert.equal(encoded.includes(png), true)
+    assert.equal(request.messages.some((message) => message.role === 'tool' && message.content?.[1]?.data === png), true)
+    assert.equal(request.messages.some((message) => message.role === 'tool' && message.content === 'FILESECRET'), true)
+    const stored = resumed.ctx.session.events.find((event) => event.type === 'tool.finished' && event.callId === 'shot')
+    assert.equal(stored.content[1].data, png)
+    const fresh = resumed.ctx.session.events.find((event) => event.type === 'tool.finished' && event.callId === 'again')
+    assert.equal(fresh.result, 'FILESECRET')
+    assert.equal(fresh.content, undefined)
+  } finally { await resumed.dispose() }
 })
 
 test('presentAs, restrict, run_code, and deferContext fail closed', async () => {

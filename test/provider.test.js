@@ -387,6 +387,51 @@ test('DeepSeek records defer_loading and rejects an all-deferred offer', async (
   }
 })
 
+test('DeepSeek sends stored image blocks and rejects unsupported ones', async () => {
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+  const image = { type: 'image', mediaType: 'image/png', data: png }
+  const part = { type: 'image_url', image_url: { url: `data:image/png;base64,${png}` } }
+  const ctx = new Context()
+  const model = ctx.plugin(Model)
+  const fiber = ctx.plugin(deepseekProvider({ apiKey: 'sk-test', fetch: async () => { throw new Error('network') } }))
+  try {
+    await ready([model, fiber])
+    const prepared = ctx.model.prepare({
+      instructions: [],
+      context: [],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'look' }, image] },
+        { role: 'assistant', content: null, tool_calls: [{ id: 'a', type: 'function', function: { name: 'shot', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'a', content: [{ type: 'text', text: 'frame' }, image] },
+        { role: 'tool', tool_call_id: 'b', content: [image] },
+        { role: 'user', content: 'after' },
+      ],
+      tools: [],
+    })
+    assert.deepEqual(prepared.body.messages[0], {
+      role: 'user',
+      content: [{ type: 'text', text: 'look' }, part],
+    })
+    assert.deepEqual(prepared.body.messages[2], { role: 'tool', tool_call_id: 'a', content: 'frame' })
+    assert.deepEqual(prepared.body.messages[3], { role: 'tool', tool_call_id: 'b', content: '(no output)' })
+    assert.deepEqual(prepared.body.messages[4], {
+      role: 'user',
+      content: [{ type: 'text', text: 'Attached image(s) from tool result:' }, part, part],
+    })
+    assert.deepEqual(prepared.body.messages[5], { role: 'user', content: 'after' })
+    assert.equal(JSON.stringify(prepared.body).includes('FILESECRET'), false)
+    assert.throws(() => ctx.model.prepare({
+      instructions: [],
+      context: [],
+      messages: [{ role: 'user', content: [{ type: 'file', name: 'FILESECRET' }] }],
+      tools: [],
+    }), /cannot represent content block file/)
+  } finally {
+    await fiber.dispose()
+    await model.dispose()
+  }
+})
+
 test('disposing the deepseek plugin removes its registration', async () => {
   const ctx = new Context()
   const model = ctx.plugin(Model)

@@ -415,3 +415,52 @@ test('unsupported subagent options fail closed', async (t) => {
     /unsupported DSH subagent tool version 9\.9\.9/,
   )
 })
+
+test('a child tool image is stored on the child model request', async (t) => {
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+  const dir = await directory(t)
+  await writeFile(join(dir, 'picture.mjs'), `
+export const inject = ['tools', 'permissions']
+export function apply(ctx) {
+  const png = ${JSON.stringify(png)}
+  ctx.effect(() => ctx.tools.register({
+    name: 'picture', description: 'Picture.', parameters: { type: 'object', properties: {}, additionalProperties: false },
+    output: {
+      schema: { type: 'string' },
+      render: () => [{ type: 'text', text: 'frame' }, { type: 'image', mediaType: 'image/png', data: png }],
+    },
+    execute: () => 'bytes',
+  }))
+  ctx.effect(() => ctx.permissions.register('picture', 'allow'))
+}
+`)
+  await writeFile(join(dir, 'plugins.json'), JSON.stringify({ plugins: [
+    { name: 'subagent-tool', module: toolModule, config: { provider: 'spawn', maxDepth: 2 } },
+    { name: 'picture-plugin', module: './picture.mjs' },
+  ] }))
+  const model = fakeProvider(replies((body) => {
+    const blob = JSON.stringify(body.messages)
+    const child = !blob.includes('PARENT-SECRET')
+    if (child && blob.includes('CHILD-TASK') && !blob.includes(png)) {
+      return assistant(null, [call('e1', 'picture', {})])
+    }
+    if (child) return assistant('child-final')
+    if (blob.includes('child-final')) return assistant('parent-final')
+    return assistant(null, [call('p1', 'subagent', { description: 'picture', prompt: 'CHILD-TASK' })])
+  }))
+  const app = await boot({ workspace: dir, pluginConfig: 'plugins.json', provider: model })
+  try {
+    await app.ctx.agent.turn('PARENT-SECRET')
+    const events = app.ctx.session.events
+    const finished = events.find((event) => event.type === 'subagent.tool.finished' && event.name === 'picture')
+    assert.equal(finished.result, 'frame')
+    assert.equal(finished.content[1].data, png)
+    const follow = events.find((event) => event.type === 'subagent.model.request' && JSON.stringify(event.body).includes(png))
+    const toolMessage = follow.body.messages.find((message) => message.role === 'tool')
+    assert.deepEqual(toolMessage.content, [
+      { type: 'text', text: 'frame' },
+      { type: 'image', mediaType: 'image/png', data: png },
+    ])
+    assert.deepEqual(projectChildMessages(events, 'agent-1').find((message) => message.role === 'tool').content, toolMessage.content)
+  } finally { await app.dispose() }
+})
