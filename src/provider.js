@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import { classifyModelContent } from './tool-pipeline.js'
 
 // Prepared providers. prepare() returns the JSON body; dispatch() sends it once
 // and yields text and tool-call chunks. The fake provider replays prepared
@@ -213,14 +214,65 @@ function outgoingTools(tools) {
   })
 }
 
+const TOOL_IMAGE_TEXT = 'Attached image(s) from tool result:'
+
+function wireImage(block) {
+  return { type: 'image_url', image_url: { url: `data:${block.mediaType};base64,${block.data}` } }
+}
+
+function wireParts(blocks) {
+  const parts = []
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      if (block.text) parts.push({ type: 'text', text: block.text })
+    } else parts.push(wireImage(block))
+  }
+  return parts
+}
+
+function offeredContent(content) {
+  if (typeof content === 'string') return { kind: 'text', text: content, images: [] }
+  const facing = classifyModelContent(content)
+  if (!facing.ok) throw new Error(`DeepSeek cannot represent content block ${facing.type}`)
+  if (facing.kind === 'text') return { kind: 'text', text: facing.text, images: [] }
+  return {
+    kind: 'blocks',
+    text: facing.text,
+    images: facing.blocks.filter((block) => block.type === 'image'),
+    parts: wireParts(facing.blocks),
+  }
+}
+
+// Tool messages stay strings. Their images are returned so the caller can
+// attach them once after the consecutive tool results. User images stay on
+// that user message, in block order.
 function outgoingMessage(message) {
   if (!message || typeof message.role !== 'string') throw new Error('Model message is invalid')
-  if (message.role === 'system' || message.role === 'user') return { role: message.role, content: message.content ?? '' }
-  if (message.role === 'tool') return { role: 'tool', tool_call_id: message.tool_call_id, content: message.content ?? '' }
+  if (message.role === 'system') {
+    if (message.content != null && typeof message.content !== 'string') throw new Error('DeepSeek cannot represent content block invalid')
+    return { wire: { role: message.role, content: message.content ?? '' }, images: [] }
+  }
+  if (message.role === 'user') {
+    if (message.content == null || typeof message.content === 'string') {
+      return { wire: { role: 'user', content: message.content ?? '' }, images: [] }
+    }
+    const offered = offeredContent(message.content)
+    if (offered.kind === 'text') return { wire: { role: 'user', content: offered.text }, images: [] }
+    return { wire: { role: 'user', content: offered.parts }, images: [] }
+  }
+  if (message.role === 'tool') {
+    if (message.content == null || typeof message.content === 'string') {
+      return { wire: { role: 'tool', tool_call_id: message.tool_call_id, content: message.content ?? '' }, images: [] }
+    }
+    const offered = offeredContent(message.content)
+    const text = offered.kind === 'text' ? offered.text : (offered.text || '(no output)')
+    return { wire: { role: 'tool', tool_call_id: message.tool_call_id, content: text }, images: offered.images }
+  }
   if (message.role === 'assistant') {
+    if (message.content != null && typeof message.content !== 'string') throw new Error('DeepSeek cannot represent assistant content blocks')
     const out = { role: 'assistant', content: message.content ?? null }
     if (message.tool_calls?.length) out.tool_calls = message.tool_calls.map(outgoingCall)
-    return out
+    return { wire: out, images: [] }
   }
   throw new Error(`Model message role is invalid: ${message.role}`)
 }
@@ -232,7 +284,24 @@ function chatBody(input, model, toolChoice) {
   const messages = []
   const system = systemText(input)
   if (system) messages.push({ role: 'system', content: system })
-  for (const message of input.messages ?? []) messages.push(outgoingMessage(message))
+  const pendingImages = []
+  const flushImages = () => {
+    if (!pendingImages.length) return
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'text', text: TOOL_IMAGE_TEXT },
+        ...pendingImages.splice(0, pendingImages.length).map(wireImage),
+      ],
+    })
+  }
+  for (const message of input.messages ?? []) {
+    if (message?.role !== 'tool') flushImages()
+    const projected = outgoingMessage(message)
+    messages.push(projected.wire)
+    if (projected.images.length) pendingImages.push(...projected.images)
+  }
+  flushImages()
   const body = { model, messages, stream: true, thinking: { type: 'disabled' } }
   if (input.tools?.length) {
     const tools = outgoingTools(input.tools)

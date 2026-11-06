@@ -360,8 +360,24 @@ function isErrorText(value) {
   return typeof value === 'string' && (value.startsWith('Error:') || value.startsWith('Command failed:'))
 }
 
+function visibleText(value) {
+  if (typeof value === 'string') return value
+  if (value == null) return ''
+  if (!Array.isArray(value)) return JSON.stringify(value) ?? ''
+  const texts = []
+  let images = 0
+  for (const block of value) {
+    if (block && block.type === 'text' && typeof block.text === 'string') texts.push(block.text)
+    else if (block && block.type === 'image') images += 1
+  }
+  const text = texts.join('\n')
+  if (!images) return text
+  const note = images === 1 ? '[image]' : `[${images} images]`
+  return text ? `${text}\n${note}` : note
+}
+
 function clip(value, max = 72) {
-  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  const text = visibleText(value ?? '').replace(/\s+/g, ' ').trim()
   if (text.length <= max) return text
   return `${text.slice(0, max - 1)}…`
 }
@@ -455,7 +471,7 @@ function projectChat(events, live, writable) {
       activity = null
       stream = null
       answer = null
-      if (event.message.content) blocks.push({ type: 'user', text: event.message.content })
+      if (event.message.content) blocks.push({ type: 'user', text: visibleText(event.message.content) })
     } else if (event.type === 'stream.started') {
       stream = { id: event.seq, text: '', tool: false, folded: false, ended: false, finish: null, interrupted: false }
     } else if (event.type === 'stream.delta' && stream && event.stream === stream.id) {
@@ -511,7 +527,10 @@ function projectChat(events, live, writable) {
       const tool = ensureTool(event.callId, event.name)
       if (tool.state !== 'denied') tool.state = 'running'
     } else if (event.type === 'tool.finished') {
-      startActivity(stream?.id ?? event.seq).lines.push({ kind: 'progress', text: String(event.result) })
+      startActivity(stream?.id ?? event.seq).lines.push({
+        kind: 'progress',
+        text: event.result || (Array.isArray(event.content) ? visibleText(event.content) : ''),
+      })
       const tool = ensureTool(event.callId)
       tool.state = isErrorText(event.result) ? 'failed' : 'ok'
     }
@@ -714,10 +733,10 @@ function approvalCard() {
 }
 
 function summary(event) {
-  if (event.type === 'message') return String(event.message.content ?? event.message.tool_calls?.map((call) => call.function.name).join(', ') ?? '')
+  if (event.type === 'message') return visibleText(event.message.content ?? event.message.tool_calls?.map((call) => call.function.name).join(', ') ?? '')
   if (event.type === 'permission.decided') return `${event.decision} ${event.name}`
   if (event.type === 'tool.started') return event.name
-  if (event.type === 'tool.finished') return String(event.result)
+  if (event.type === 'tool.finished') return event.result || (Array.isArray(event.content) ? visibleText(event.content) : '')
   return String(event.workspace ?? event.provider ?? event.finish ?? '')
 }
 

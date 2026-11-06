@@ -9,7 +9,7 @@ import { AGENT_SCOPE } from './agents.js'
 import { currentDelegationAgent } from './delegation.js'
 import { assertEvent, createEvent, projectSessionMessages, readSession, unknownOutcomes, unknownReason, unknownStreams } from './log.js'
 import {
-  applyContentCallback, applyPostDecision, coerceExecuteResult, errorOutcome, errorText, fuseSignals, markOutcome, normalizePreDecision, textBlocks,
+  applyContentCallback, applyPostDecision, coerceExecuteResult, errorOutcome, fuseSignals, markOutcome, modelFacingContent, normalizePreDecision,
 } from './tool-pipeline.js'
 
 export function validateArguments(schema, value) {
@@ -353,8 +353,9 @@ export class Tools extends Service {
     if (snapshot === undefined) throw new Error(`Tool ${name}: expected a lossless JSON result`)
     if (!output.validate(snapshot)) throw new Error(`Tool ${name}: output does not match schema: ${this.outputSchemas.errorsText(output.validate.errors)}`)
     const blocks = output.render(args, deepFreeze(snapshot))
-    const text = textBlocks(blocks, `Tool ${name}`)
-    return { text, value: snapshot, content: blocks }
+    const facing = modelFacingContent(blocks, `Tool ${name}`)
+    if (facing.kind === 'text') return { text: facing.text, value: snapshot, content: blocks, model: facing.text }
+    return { text: facing.text, value: snapshot, content: facing.blocks, model: facing.blocks }
   }
   // Around-dispatch waterfall. Tool failures become outcomes so post-execute
   // still runs; they do not skip the body checkpoint the agent already wrote.
@@ -366,7 +367,7 @@ export class Tools extends Service {
       })
       return coerceExecuteResult(returned, (value) => this.replaceValue(exec, value))
     } catch (error) {
-      return { isError: true, text: errorText(error.message), content: [{ type: 'text', text: errorText(error.message) }], contexts: [] }
+      return errorOutcome(error.message)
     }
   }
   async settle(exec, raw) {
@@ -409,6 +410,7 @@ export class Tools extends Service {
     this.emitResult(exec, final)
     return {
       text: final.text,
+      model: final.model ?? final.text,
       contexts: (final.contexts ?? []).map((content) => ({ type: 'tools.context', callId: exec.callId, content })),
     }
   }
@@ -417,7 +419,7 @@ export class Tools extends Service {
       callId: exec.callId,
       name: exec.name,
       isError: Boolean(final.isError),
-      content: [{ type: 'text', text: final.text }],
+      content: Array.isArray(final.model) ? final.model : [{ type: 'text', text: final.text }],
       ...(final.isError ? { error: { message: final.text.replace(/^Error:\s?/, '') } } : {}),
       ...(final.value !== undefined && !final.isError ? { value: final.value } : {}),
     }
@@ -440,7 +442,9 @@ export class Tools extends Service {
     if (!tool) throw new Error(`Unknown tool: ${name}`)
     validateArguments(tool.parameters, args)
     const outcome = await this.invoke(tool, args, options)
-    return outcome.passthrough ? outcome.raw : outcome.text
+    if (outcome.passthrough) return outcome.raw
+    if (Array.isArray(outcome.model)) throw new Error(`Tool ${name}: tools.run() does not return non-text content`)
+    return outcome.text
   }
   async invoke(tool, args, { callId, signal, agent } = {}) {
     const output = this.outputs.get(tool.name)
@@ -477,12 +481,13 @@ export class Tools extends Service {
           passthrough: true,
           raw: result,
           text: String(result),
+          model: String(result),
           content: [{ type: 'text', text: String(result) }],
           contexts: [],
         }
       }
       const rendered = this.renderOutput(tool.name, args, result, output)
-      return { isError: false, text: rendered.text, value: rendered.value, content: rendered.content, contexts: [] }
+      return { isError: false, text: rendered.text, model: rendered.model, value: rendered.value, content: rendered.content, contexts: [] }
     } finally {
       clearTimeout(timer)
       unlink()

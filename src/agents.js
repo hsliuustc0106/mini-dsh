@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { Context, Service } from '@deepseek-ai/cordis'
+import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
+import { classifyModelContent } from './tool-pipeline.js'
 
 /** Cordis context tag for listeners that should see only one agent. */
 export const AGENT_SCOPE = Symbol('mini-dsh.agent-scope')
@@ -85,17 +87,17 @@ function textFromContent(content) {
     if (!content) throw new Error('pre-step message has no text content')
     return content
   }
-  if (!Array.isArray(content)) throw new Error('Unsupported hook message content: invalid')
-  const parts = []
-  for (const block of content) {
-    if (!block || block.type !== 'text' || typeof block.text !== 'string') {
-      throw new Error(`Unsupported hook message content: ${block?.type ?? 'invalid'}`)
-    }
-    parts.push(block.text)
+  const facing = classifyModelContent(content)
+  if (!facing.ok) throw new Error(`Unsupported hook message content: ${facing.type}`)
+  if (facing.kind === 'text') {
+    if (!facing.text) throw new Error('pre-step message has no text content')
+    return facing.text
   }
-  const text = parts.join('\n')
-  if (!text) throw new Error('pre-step message has no text content')
-  return text
+  let blocks
+  try { blocks = snapshotJsonValue(facing.blocks) }
+  catch { blocks = undefined }
+  if (!Array.isArray(blocks) || !blocks.length) throw new Error('pre-step message has no text content')
+  return blocks
 }
 
 function hookSource(source) {
@@ -340,7 +342,8 @@ export class Agents extends Service {
   /**
    * Cooperative `agent/pre-step` waterfall for one proposed model step.
    * Committed history stays the prefix. The uncommitted inbox tail may be
-   * replaced or extended with user text; non-text content fails closed.
+   * replaced or extended with user text or a supported image. Other non-text
+   * content fails closed and is not stored.
    */
   async runPreStep({ turn, step, signal, messages } = {}) {
     if (!this._handle || !this._carrier) throw new Error('mini-dsh agent is not bound')

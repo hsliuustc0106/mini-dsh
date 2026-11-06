@@ -19,8 +19,23 @@ function assertContiguous(events) {
   }
 }
 
+function visibleText(value) {
+  if (typeof value === 'string') return value
+  if (!Array.isArray(value)) return JSON.stringify(value) ?? ''
+  const texts = []
+  let images = 0
+  for (const block of value) {
+    if (block && block.type === 'text' && typeof block.text === 'string') texts.push(block.text)
+    else if (block && block.type === 'image') images += 1
+  }
+  const text = texts.join('\n')
+  if (!images) return text
+  const note = images === 1 ? '[image]' : `[${images} images]`
+  return text ? `${text}\n${note}` : note
+}
+
 function clip(value, max = 72) {
-  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  const text = visibleText(value ?? '').replace(/\s+/g, ' ').trim()
   if (text.length <= max) return text
   return `${text.slice(0, max - 1)}…`
 }

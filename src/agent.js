@@ -252,7 +252,7 @@ export class Agent extends Service {
       unlink()
     }
     const outcome = await this.ctx.tools.settle(admitted.exec, raw)
-    await this.recordResult(admitted.id, outcome.text, report)
+    await this.recordResult(admitted.id, outcome, report)
     return outcome.contexts
   }
 
@@ -282,7 +282,7 @@ export class Agent extends Service {
     const contexts = []
     for (const item of admitted) {
       const outcome = await tools.settle(item.exec, item.raw)
-      await this.recordResult(item.id, outcome.text, report)
+      await this.recordResult(item.id, outcome, report)
       contexts.push(...outcome.contexts)
     }
     return contexts
@@ -335,9 +335,13 @@ export class Agent extends Service {
     return { id, name, args: exec.args, exec }
   }
 
-  async recordResult(id, text, report) {
-    await this.ctx.checkpoint.commit({ type: 'tool.finished', callId: id, result: text })
-    await this.ctx.checkpoint.commit({ role: 'tool', tool_call_id: id, content: text })
+  async recordResult(id, outcome, report) {
+    const text = outcome.text
+    const model = outcome.model ?? text
+    const finished = { type: 'tool.finished', callId: id, result: text }
+    if (Array.isArray(model)) finished.content = model
+    await this.ctx.checkpoint.commit(finished)
+    await this.ctx.checkpoint.commit({ role: 'tool', tool_call_id: id, content: model })
     report({ type: 'result', content: text })
   }
 

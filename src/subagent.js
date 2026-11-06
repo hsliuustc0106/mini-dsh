@@ -370,8 +370,11 @@ export class Subagents extends Service {
       })
       const raw = await this.ctx.tools.executeOnly(exec)
       const outcome = await this.ctx.tools.settle(exec, raw)
-      await this.record({ type: 'subagent.tool.finished', agent: child.id, callId: id, name, result: outcome.text })
-      return outcome.text
+      const model = outcome.model ?? outcome.text
+      const finished = { type: 'subagent.tool.finished', agent: child.id, callId: id, name, result: outcome.text }
+      if (Array.isArray(model)) finished.content = model
+      await this.record(finished)
+      return model
     } finally {
       signal.removeEventListener('abort', abort)
     }
