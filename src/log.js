@@ -30,6 +30,10 @@ function assertMessage(message) {
   if (message.role === 'tool' && (typeof message.tool_call_id !== 'string' || !message.tool_call_id)) {
     throw corrupt('tool result requires tool_call_id')
   }
+  // A nested run_code child is on the log and is not a model tool result.
+  if (message.role === 'tool' && Object.hasOwn(message, 'parent') && (typeof message.parent !== 'string' || !message.parent)) {
+    throw corrupt('tool parent must be a call id')
+  }
 }
 
 export function assertEvent(event, seq) {
@@ -98,6 +102,8 @@ export function unknownOutcomes(events) {
           conversation.add(call.id)
         }
       } else if (message.role === 'tool') {
+        // Nested children keep a parent id so they do not close the model's run_code call.
+        if (typeof message.parent === 'string' && message.parent) continue
         if (!conversation.delete(message.tool_call_id)) throw corrupt('unexpected tool result')
       } else if (conversation.size || execution.size) throw corrupt('unresolved tool calls')
     }
@@ -229,6 +235,8 @@ export function projectSessionMessages(events) {
       continue
     }
     if (event.type !== 'message') continue
+    // Nested tool results stay on the log. The model sees the parent run_code result.
+    if (event.message.role === 'tool' && typeof event.message.parent === 'string' && event.message.parent) continue
     if (event.message.role !== 'tool') flushContexts()
     if (hold && event.message.role === 'assistant') hold = false
     const { skillInvocations, ...message } = event.message

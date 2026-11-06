@@ -128,28 +128,7 @@ export class Agent extends Service {
           if (await agents.settleStop({ turn, signal }) && !this.stopping) continue
           return
         }
-        const contexts = []
-        let index = 0
-        while (index < calls.length) {
-          if (this.stopping) {
-            await this.denyUnstarted(calls.slice(index))
-            break
-          }
-          // Consecutive calls whose classifier returns exactly true overlap
-          // their bodies. Policy and JSONL results stay in model order.
-          const group = [calls[index]]
-          index += 1
-          if (this.ctx.tools.executionMode(group[0]).kind === 'parallel') {
-            while (index < calls.length && this.ctx.tools.executionMode(calls[index]).kind === 'parallel') {
-              group.push(calls[index])
-              index += 1
-            }
-          }
-          const produced = group.length === 1
-            ? await this.oneCall(group[0], report, signal, approve)
-            : await this.parallelCalls(group, report, signal, approve)
-          contexts.push(...produced)
-        }
+        const contexts = await this.dispatchCalls(calls, report, signal, approve)
         for (const event of contexts) await checkpoint.commit(event)
       }
     } catch (error) {
@@ -233,47 +212,109 @@ export class Agent extends Service {
     session.readonlyReason = unknownReason([], [seq])
   }
 
-  async oneCall(call, report, signal, approve) {
-    const admitted = await this.admit(call, report, signal, approve)
+  // Model calls and nested run_code children share this grouping. A parallel
+  // group is consecutive calls whose classifier returns exactly true. There
+  // is no separate subcall pool and no maxParallelToolCalls cap.
+  async dispatchCalls(calls, report, signal, approve, options) {
+    const contexts = []
+    let index = 0
+    while (index < calls.length) {
+      if (this.stopping) {
+        await this.denyUnstarted(calls.slice(index), options)
+        break
+      }
+      const group = [calls[index]]
+      index += 1
+      if (this.ctx.tools.executionMode(group[0]).kind === 'parallel') {
+        while (index < calls.length && this.ctx.tools.executionMode(calls[index]).kind === 'parallel') {
+          group.push(calls[index])
+          index += 1
+        }
+      }
+      const produced = group.length === 1
+        ? await this.oneCall(group[0], report, signal, approve, options)
+        : await this.parallelCalls(group, report, signal, approve, options)
+      contexts.push(...produced)
+      if (typeof options?.deferContext === 'function') {
+        for (const event of produced) options.deferContext({ role: 'user', content: event.content })
+      }
+    }
+    return contexts
+  }
+
+  // Admitted run_code only. The program text is already on tool.started.
+  // Children use the same permission, hook, and JSONL path as model calls.
+  async dispatchNested({ parentId, calls, signal, deferContext }) {
+    if (typeof parentId !== 'string' || !parentId || !Array.isArray(calls)) {
+      throw new Error('run_code nested dispatch requires an open run_code call')
+    }
+    const events = this.ctx.session.events
+    const open = events.some((event) => event.type === 'tool.started' && event.callId === parentId && event.name === 'run_code')
+      && !events.some((event) => event.type === 'tool.finished' && event.callId === parentId)
+    if (!open) throw new Error('run_code nested dispatch requires an open run_code call')
+    const shaped = calls.map((call, index) => ({
+      id: `${parentId}:code:${index + 1}`,
+      type: 'function',
+      function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+    }))
+    await this.dispatchCalls(shaped, () => {}, signal, this.approve, { nested: true, parentId, deferContext })
+    const rows = shaped.map((call) => {
+      const message = this.ctx.session.events.find((event) => event.type === 'message'
+        && event.message?.role === 'tool'
+        && event.message.tool_call_id === call.id
+        && event.message.parent === parentId)
+      const result = message ? message.message.content : 'Error: nested dispatch did not finish'
+      return { callId: call.id, name: call.function.name, result }
+    })
+    return JSON.stringify(rows)
+  }
+
+  async oneCall(call, report, signal, approve, options) {
+    const admitted = await this.admit(call, report, signal, approve, options)
     if (!admitted) return []
     const { checkpoint, workspace } = this.ctx
     const unlink = abortWith(signal, admitted.exec)
     let raw
     try {
-      raw = await checkpoint.guard(
-        { type: 'tool.started', callId: admitted.id, name: admitted.name, arguments: structuredClone(admitted.args), workspace: workspace.root },
-        () => this.ctx.tools.executeOnly(admitted.exec),
-      )
+      const started = {
+        type: 'tool.started', callId: admitted.id, name: admitted.name, arguments: structuredClone(admitted.args), workspace: workspace.root,
+      }
+      const parent = callParent(options)
+      if (parent) started.parent = parent
+      raw = await checkpoint.guard(started, () => this.ctx.tools.executeOnly(admitted.exec))
     } catch (error) {
       if (error.code === 'CHECKPOINT') throw error
-      await this.recordResult(admitted.id, `Error: ${error.message}`, report)
+      await this.recordResult(admitted.id, `Error: ${error.message}`, report, options)
       return []
     } finally {
       unlink()
     }
     const outcome = await this.ctx.tools.settle(admitted.exec, raw)
-    await this.recordResult(admitted.id, outcome, report)
+    await this.recordResult(admitted.id, outcome, report, options)
     return outcome.contexts
   }
 
   // Policy stays in model order. Bodies overlap only after each tool.started
   // is durable. Post-execute and tool.finished are written back in model order.
-  async parallelCalls(calls, report, signal, approve) {
+  async parallelCalls(calls, report, signal, approve, options) {
     const admitted = []
     let index = 0
     for (; index < calls.length; index++) {
       if (this.stopping) break
-      const item = await this.admit(calls[index], report, signal, approve)
+      const item = await this.admit(calls[index], report, signal, approve, options)
       if (item) admitted.push(item)
     }
-    if (index < calls.length) await this.denyUnstarted(calls.slice(index))
+    if (index < calls.length) await this.denyUnstarted(calls.slice(index), options)
     const { checkpoint, tools, workspace } = this.ctx
     const unlink = admitted.map((item) => abortWith(signal, item.exec))
+    const parent = callParent(options)
     try {
       await Promise.all(admitted.map(async (item) => {
-        await checkpoint.commit({
+        const started = {
           type: 'tool.started', callId: item.id, name: item.name, arguments: structuredClone(item.args), workspace: workspace.root,
-        })
+        }
+        if (parent) started.parent = parent
+        await checkpoint.commit(started)
         item.raw = await tools.executeOnly(item.exec)
       }))
     } finally {
@@ -282,13 +323,13 @@ export class Agent extends Service {
     const contexts = []
     for (const item of admitted) {
       const outcome = await tools.settle(item.exec, item.raw)
-      await this.recordResult(item.id, outcome, report)
+      await this.recordResult(item.id, outcome, report, options)
       contexts.push(...outcome.contexts)
     }
     return contexts
   }
 
-  async admit(call, report, signal, approve) {
+  async admit(call, report, signal, approve, options) {
     const { tools, checkpoint, permissions } = this.ctx
     const id = call.id
     const name = call.function.name
@@ -296,15 +337,20 @@ export class Agent extends Service {
     let args
     try { args = JSON.parse(call.function.arguments) }
     catch {
-      await this.toolError(id, 'invalid arguments', report)
+      if (options?.nested === true) {
+        await this.deny(id, name, null, 'invalid arguments', report, options)
+        return null
+      }
+      await this.toolError(id, 'invalid arguments', report, options)
       return null
     }
     // Code mode's only direct call is reserved run_code. Other names are
-    // unknown before policy. The reserved body does not dispatch nested tools.
+    // unknown before policy. Nested children resolve registered tools instead.
     const agent = this.ctx.agents.currentInitiator() ?? this.ctx.agents.primary
-    const tool = tools.callable(name, agent)
+    const nested = options?.nested === true
+    const tool = nested ? tools.dispatchable(name, agent) : tools.callable(name, agent)
     if (!tool) {
-      await this.deny(id, name, args, 'unknown tool', report)
+      await this.deny(id, name, args, 'unknown tool', report, options)
       return null
     }
     try {
@@ -312,47 +358,58 @@ export class Agent extends Service {
       if (tool.name === 'run_code') assertRunCodeArguments(args)
     }
     catch (error) {
+      if (nested) {
+        await this.deny(id, name, args, error.message, report, options)
+        return null
+      }
       await this.toolError(id, error.message, report)
       return null
     }
     const decision = await permissions.decide({ callId: id, name, arguments: args }, signal, approve)
-    await checkpoint.commit({ type: 'permission.decided', ...decision })
+    const recorded = { type: 'permission.decided', ...decision }
+    const parent = callParent(options)
+    if (parent) recorded.parent = parent
+    await checkpoint.commit(recorded)
     if (decision.decision !== 'allow') {
-      await this.toolError(id, decision.reason, report)
+      await this.toolError(id, decision.reason, report, options)
       return null
     }
     const exec = tools.createExecution({ callId: id, name, args, tool })
     try {
       const pre = await tools.preExecute(exec)
       if (pre.kind === 'deny') {
-        await this.toolError(id, pre.reason, report)
+        await this.toolError(id, pre.reason, report, options)
         return null
       }
       const guardReason = tools.checkGuards(exec)
       if (guardReason) {
-        await this.toolError(id, guardReason, report)
+        await this.toolError(id, guardReason, report, options)
         return null
       }
     } catch (error) {
       if (error.code === 'CHECKPOINT') throw error
-      await this.toolError(id, error.message, report)
+      await this.toolError(id, error.message, report, options)
       return null
     }
     return { id, name, args: exec.args, exec }
   }
 
-  async recordResult(id, outcome, report) {
-    const text = outcome.text
-    const model = outcome.model ?? text
+  async recordResult(id, outcome, report, options) {
+    const text = typeof outcome === 'string' ? outcome : outcome.text
+    const model = typeof outcome === 'string' ? outcome : (outcome.model ?? text)
     const finished = { type: 'tool.finished', callId: id, result: text }
     if (Array.isArray(model)) finished.content = model
+    const parent = callParent(options)
+    if (parent) finished.parent = parent
     await this.ctx.checkpoint.commit(finished)
-    await this.ctx.checkpoint.commit({ role: 'tool', tool_call_id: id, content: model })
-    report({ type: 'result', content: text })
+    const message = { role: 'tool', tool_call_id: id, content: model }
+    if (parent) message.parent = parent
+    await this.ctx.checkpoint.commit(message)
+    report?.({ type: 'result', content: text })
   }
 
-  async deny(id, name, args, reason, report) {
-    await this.ctx.checkpoint.commit({
+  async deny(id, name, args, reason, report, options) {
+    const recorded = {
       type: 'permission.decided',
       callId: id,
       name,
@@ -360,22 +417,32 @@ export class Agent extends Service {
       workspace: this.ctx.workspace.root,
       decision: 'deny',
       reason,
-    })
-    await this.toolError(id, reason, report)
+    }
+    const parent = callParent(options)
+    if (parent) recorded.parent = parent
+    await this.ctx.checkpoint.commit(recorded)
+    await this.toolError(id, reason, report, options)
   }
 
   // Calls that have not started. This records a denial, not an execution result.
-  async denyUnstarted(calls) {
+  async denyUnstarted(calls, options) {
     for (const call of calls) {
       let args = null
       try { args = JSON.parse(call.function.arguments) } catch { /* the id and name still identify the call */ }
-      await this.deny(call.id, call.function.name, args, 'approval unavailable')
+      await this.deny(call.id, call.function.name, args, 'approval unavailable', undefined, options)
     }
   }
 
-  async toolError(id, reason, report) {
+  async toolError(id, reason, report, options) {
     const content = `Error: ${reason}`
-    await this.ctx.checkpoint.commit({ role: 'tool', tool_call_id: id, content })
+    const message = { role: 'tool', tool_call_id: id, content }
+    const parent = callParent(options)
+    if (parent) message.parent = parent
+    await this.ctx.checkpoint.commit(message)
     report?.({ type: 'result', content })
   }
+}
+
+function callParent(options) {
+  return typeof options?.parentId === 'string' && options.parentId ? options.parentId : undefined
 }
