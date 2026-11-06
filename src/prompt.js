@@ -52,11 +52,15 @@ export const runtimeContext = {
   apply(ctx) {
     ctx.effect(() => ctx.prompt.contribute({
       order: 0,
-      context: () => ({
-        workspace: ctx.workspace.root,
-        permissions: ctx.permissions.describe(ctx.tools.schemas().map((tool) => tool.function.name)),
-        sandbox: false,
-      }),
+      context: () => {
+        const agents = ctx.reflect.get('agents', false)
+        const view = agents?.currentInitiator?.() ?? undefined
+        return {
+          workspace: ctx.workspace.root,
+          permissions: ctx.permissions.describe(ctx.tools.schemas(view).map((tool) => tool.function.name)),
+          sandbox: false,
+        }
+      },
     }))
   },
 }
