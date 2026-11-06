@@ -9,7 +9,7 @@ import { AGENT_SCOPE } from './agents.js'
 import { currentDelegationAgent } from './delegation.js'
 import { assertEvent, createEvent, projectSessionMessages, readSession, unknownOutcomes, unknownReason, unknownStreams } from './log.js'
 import {
-  applyContentCallback, applyPostDecision, coerceExecuteResult, errorOutcome, fuseSignals, markOutcome, modelFacingContent, normalizePreDecision,
+  applyContentCallback, applyPostDecision, coerceExecuteResult, deferredContextText, errorOutcome, fuseSignals, markOutcome, modelFacingContent, normalizePreDecision,
 } from './tool-pipeline.js'
 
 export function validateArguments(schema, value) {
@@ -290,12 +290,16 @@ export class Tools extends Service {
     deepFreeze(snapshot)
     const caller = new AbortController()
     const view = {}
+    // Text deferred during this call. executeOnly attaches it to the outcome;
+    // the agent commits those strings as tools.context after the tool batch.
+    const deferred = []
+    const canDefer = this.outputs.has(name)
     Object.defineProperties(view, {
       callId: { value: callId, enumerable: true },
       name: { value: name, enumerable: true },
       arguments: { value: snapshot, enumerable: true },
       agent: { value: currentDelegationAgent(), enumerable: true },
-      deferContext: { value() { throw new Error('deferContext is not supported') } },
+      deferContext: { value(context) { pushDeferred(canDefer, deferred, context) } },
     })
     let signal = caller.signal
     Object.defineProperty(view, 'signal', {
@@ -315,6 +319,7 @@ export class Tools extends Service {
       projectContent: contract?.projectContent,
       finalizeContent: contract?.finalizeContent,
       abort(reason) { if (!caller.signal.aborted) caller.abort(reason) },
+      deferred,
     }
   }
   async preExecute(exec) {
@@ -363,11 +368,16 @@ export class Tools extends Service {
     try {
       const returned = await this.ctx.waterfall('tools/execute', exec.view, async () => {
         const signal = fuseSignals(exec.callerSignal, exec.view.signal)
-        return markOutcome(await this.invoke(exec.tool, exec.args, { callId: exec.callId, signal, agent: exec.view.agent }))
+        return markOutcome(await this.invoke(exec.tool, exec.args, {
+          callId: exec.callId,
+          signal,
+          agent: exec.view.agent,
+          deferred: exec.deferred,
+        }))
       })
-      return coerceExecuteResult(returned, (value) => this.replaceValue(exec, value))
+      return attachDeferred(coerceExecuteResult(returned, (value) => this.replaceValue(exec, value)), exec.deferred)
     } catch (error) {
-      return errorOutcome(error.message)
+      return attachDeferred(errorOutcome(error.message), exec.deferred)
     }
   }
   async settle(exec, raw) {
@@ -446,7 +456,7 @@ export class Tools extends Service {
     if (Array.isArray(outcome.model)) throw new Error(`Tool ${name}: tools.run() does not return non-text content`)
     return outcome.text
   }
-  async invoke(tool, args, { callId, signal, agent } = {}) {
+  async invoke(tool, args, { callId, signal, agent, deferred } = {}) {
     const output = this.outputs.get(tool.name)
     const controller = new AbortController()
     let unlink = () => {}
@@ -456,12 +466,18 @@ export class Tools extends Service {
       signal.addEventListener('abort', onAbort, { once: true })
       unlink = () => signal.removeEventListener('abort', onAbort)
     }
+    // The agent passes the call's deferred list. tools.run() has no log, so a
+    // deferred message there fails closed instead of being dropped.
     const execution = {
       name: tool.name,
       callId,
       signal: controller.signal,
       agent,
-      deferContext() { throw new Error('deferContext is not supported') },
+      deferContext(context) {
+        if (!output) throw new Error('deferContext requires an output schema')
+        if (!deferred) throw new Error('tools.run() does not store deferContext')
+        pushDeferred(true, deferred, context)
+      },
     }
     let timedOut = false
     const timer = output && tool.timeoutMs !== undefined ? setTimeout(() => {
@@ -493,6 +509,16 @@ export class Tools extends Service {
       unlink()
     }
   }
+}
+
+function pushDeferred(enabled, bucket, context) {
+  if (!enabled) throw new Error('deferContext requires an output schema')
+  bucket.push(deferredContextText(context))
+}
+
+function attachDeferred(outcome, deferred) {
+  if (!deferred?.length) return outcome
+  return { ...outcome, contexts: [...deferred, ...(outcome.contexts ?? [])] }
 }
 
 function executionView(exec) {
@@ -616,9 +642,10 @@ export class Session extends Service {
     this.readonlyReason = unknown.length || streams.length ? unknownReason(unknown, streams) : 'Session opened read-only'
   }
 
-  // tools.context is hook output stored on the log. It is projected after the
-  // tool batch and before the next non-tool message, and it is not recomputed
-  // by re-running hooks when the session is reopened.
+  // tools.context is deferred tool text or hook output stored on the log. It
+  // is projected after the tool batch and before the next non-tool message,
+  // and it is not recomputed by re-running the tool or hooks when the session
+  // is reopened.
   get messages() {
     return projectSessionMessages(this.events)
   }
