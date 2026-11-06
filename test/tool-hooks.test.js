@@ -477,6 +477,64 @@ export function apply(ctx) {
   } finally { await app.dispose() }
 })
 
+test('projectContent, finalizeContent, and deferLoading are the JSONL model input', async (t) => {
+  const dir = await workspace(t)
+  await writeFile(join(dir, 'hook.mjs'), `
+export const inject = ['tools', 'permissions']
+export function apply(ctx) {
+  const parameters = { type: 'object', properties: {}, additionalProperties: false }
+  ctx.effect(() => ctx.tools.register({
+    name: 'shown', description: 'Shown.', parameters, deferLoading: true, execute: () => 'raw',
+    projectContent() { return [{ type: 'text', text: 'projected' }] },
+    finalizeContent() { return [{ type: 'text', text: 'final-text' }] },
+  }))
+  ctx.effect(() => ctx.tools.register({
+    name: 'hooked', description: 'Hooked.', parameters, execute: () => 'raw',
+    projectContent() { return [{ type: 'text', text: 'projected' }] },
+    finalizeContent(_exec, result) {
+      return [{ type: 'text', text: result.content.map((block) => block.text).join('\\n') + '|final' }]
+    },
+  }))
+  ctx.effect(() => ctx.tools.register({
+    name: 'picture', description: 'Picture.', parameters, execute: () => 'raw',
+    projectContent() { return [{ type: 'image', data: 'IMAGEPAYLOAD' }] },
+    finalizeContent() { return [{ type: 'text', text: 'sealed' }] },
+  }))
+  for (const name of ['shown', 'hooked', 'picture']) ctx.effect(() => ctx.permissions.register(name, 'allow'))
+  ctx.on('tools/post-execute', async (exec, _result, next) => {
+    const decision = await next()
+    if (exec.name === 'hooked') return { kind: 'accept', content: [{ type: 'text', text: 'hooked' }] }
+    if (exec.name === 'picture') return { kind: 'accept', content: [{ type: 'text', text: 'POSTED' }] }
+    return decision
+  })
+}
+`)
+  await writeFile(join(dir, 'plugins.json'), JSON.stringify({ plugins: [{ name: 'hook', module: './hook.mjs' }] }))
+  const model = fakeProvider([
+    calls([['show', 'shown'], ['hook', 'hooked'], ['pic', 'picture']]),
+    { role: 'assistant', content: 'done' },
+  ])
+  const app = await boot({ workspace: dir, pluginConfig: 'plugins.json', web: false, provider: model })
+  try {
+    await app.ctx.agent.turn('go')
+    const offered = model.sent[0].tools.find((tool) => tool.function.name === 'shown')
+    const recorded = app.ctx.session.events.find((event) => event.type === 'model.request')
+    const recordedTool = recorded.body.tools.find((tool) => tool.function.name === 'shown')
+    assert.equal(offered.function.deferLoading, true)
+    assert.deepEqual(recordedTool, offered)
+    assert.equal(JSON.stringify(recordedTool).includes('projectContent'), false)
+    assert.equal(recorded.body.tools.find((tool) => tool.function.name === 'read').function.deferLoading, undefined)
+    assert.equal(recorded.body.tools.find((tool) => tool.function.name === 'hooked').function.deferLoading, undefined)
+    const finished = app.ctx.session.events.filter((event) => event.type === 'tool.finished').map((event) => event.result)
+    const sentTools = model.sent[1].messages.filter((message) => message.role === 'tool').map((message) => message.content)
+    assert.deepEqual(finished, ['final-text', 'hooked|final', 'sealed'])
+    assert.deepEqual(sentTools, finished)
+    const encoded = JSON.stringify(app.ctx.session.events)
+    assert.equal(encoded.includes('IMAGEPAYLOAD'), false)
+    assert.equal(encoded.includes('POSTED'), false)
+  } finally { await app.dispose() }
+})
+
 test('presentAs, restrict, run_code, and deferContext fail closed', async () => {
   const ctx = new Context()
   const tools = ctx.plugin(Tools)

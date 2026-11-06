@@ -1,11 +1,50 @@
 // Teaching subset of the DSH tool pipeline. Decisions that mini-dsh does not
 // implement fail closed. Model-facing text is what the JSONL log stores.
 
+import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
+
 const OUTCOME = Symbol('mini-dsh.tool-outcome')
 
 export function errorText(message) {
   const text = typeof message === 'string' && message ? message : 'tool execution failed'
   return text.startsWith('Error:') ? text : `Error: ${text}`
+}
+
+export function errorOutcome(message) {
+  const text = errorText(message)
+  return { isError: true, text, content: [{ type: 'text', text }], contexts: [] }
+}
+
+function isThenable(value) {
+  return Boolean(value && (typeof value === 'object' || typeof value === 'function') && typeof value.then === 'function')
+}
+
+/**
+ * Replace model-facing text with text ContentBlocks.
+ * `undefined` keeps the outcome. Anything else must be synchronous lossless text blocks.
+ */
+export function installContent(outcome, blocks, label) {
+  if (blocks === undefined) return outcome
+  if (isThenable(blocks)) throw new Error(`${label} must be synchronous`)
+  const text = textBlocks(blocks, label)
+  let content
+  try { content = snapshotJsonValue(blocks) }
+  catch { content = undefined }
+  if (content === undefined) throw new Error(`${label} must be lossless JSON`)
+  return { ...outcome, text, content }
+}
+
+/** Run one definition-owned content callback. A throw is labeled for the caller. */
+export function applyContentCallback(outcome, transform, execView, resultView, label) {
+  if (typeof transform !== 'function') return outcome
+  let blocks
+  try {
+    blocks = transform(execView, resultView)
+  } catch (error) {
+    const message = error instanceof Error && error.message ? error.message : 'content callback failed'
+    throw new Error(`${label} failed: ${message}`)
+  }
+  return installContent(outcome, blocks, label)
 }
 
 export function textBlocks(blocks, label) {

@@ -349,6 +349,44 @@ test('an aborted finish is recorded and is not turned into an assistant message'
   }
 })
 
+test('DeepSeek records defer_loading and rejects an all-deferred offer', async () => {
+  const deferred = { type: 'function', function: { name: 'later', description: 'Later.', parameters: { type: 'object' }, deferLoading: true } }
+  const eager = { type: 'function', function: { name: 'now', description: 'Now.', parameters: { type: 'object' } } }
+  const ctx = new Context()
+  const model = ctx.plugin(Model)
+  const fiber = ctx.plugin(deepseekProvider({ apiKey: 'sk-test', fetch: async () => { throw new Error('network') } }))
+  try {
+    await ready([model, fiber])
+    const prepared = ctx.model.prepare({ instructions: [], context: [], messages: [], tools: [eager, deferred] })
+    assert.equal(prepared.body.tools[0].function.defer_loading, undefined)
+    assert.equal(prepared.body.tools[0].function.deferLoading, undefined)
+    assert.equal(prepared.body.tools[1].function.defer_loading, true)
+    assert.equal(prepared.body.tools[1].function.deferLoading, undefined)
+    assert.equal(prepared.body.tools[1].function.name, 'later')
+    assert.throws(() => ctx.model.prepare({
+      instructions: [], context: [], messages: [], tools: [deferred],
+    }), /all-deferred/)
+  } finally {
+    await fiber.dispose()
+    await model.dispose()
+  }
+
+  const chosen = new Context()
+  const chosenModel = chosen.plugin(Model)
+  const chosenFiber = chosen.plugin(deepseekProvider({
+    apiKey: 'sk-test', toolChoice: 'later', fetch: async () => { throw new Error('network') },
+  }))
+  try {
+    await ready([chosenModel, chosenFiber])
+    assert.throws(() => chosen.model.prepare({
+      instructions: [], context: [], messages: [], tools: [eager, deferred],
+    }), /cannot name a deferred tool/)
+  } finally {
+    await chosenFiber.dispose()
+    await chosenModel.dispose()
+  }
+})
+
 test('disposing the deepseek plugin removes its registration', async () => {
   const ctx = new Context()
   const model = ctx.plugin(Model)
