@@ -187,6 +187,43 @@ export function additionalContexts(value) {
 }
 
 /**
+ * One text user message for `deferContext`. `id` and `source` are the DSH
+ * envelope and are not model input. Any other field, role, or block fails closed.
+ */
+export function deferredContextText(message) {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) {
+    throw new Error('deferContext context must be a user message')
+  }
+  for (const key of Object.keys(message)) {
+    if (key !== 'role' && key !== 'content' && key !== 'id' && key !== 'source') {
+      throw new Error(`Unsupported deferContext field '${key}'`)
+    }
+  }
+  if (message.role !== undefined && message.role !== 'user') {
+    throw new Error(`Unsupported deferContext context role: ${message.role}`)
+  }
+  if (message.id !== undefined && (typeof message.id !== 'string' || !message.id)) {
+    throw new Error('deferContext id must be a string')
+  }
+  if (message.source !== undefined && (!message.source || typeof message.source !== 'object' || Array.isArray(message.source))) {
+    throw new Error('deferContext source must be an object')
+  }
+  if (typeof message.content === 'string') {
+    if (!message.content) throw new Error('deferContext context has no text content')
+    return message.content
+  }
+  if (!Array.isArray(message.content)) throw new Error('deferContext context must be a user message')
+  const parts = []
+  for (const block of message.content) {
+    if (!exactTextBlock(block)) throw new Error('deferContext context: only text output blocks are supported')
+    parts.push(block.text)
+  }
+  const text = parts.join('\n')
+  if (!text) throw new Error('deferContext context has no text content')
+  return text
+}
+
+/**
  * Apply one post-execute decision to a normalized outcome.
  * `replaceValue(value)` revalidates and re-renders a canonical value.
  */

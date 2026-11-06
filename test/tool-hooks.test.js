@@ -628,7 +628,7 @@ export function apply(ctx) {
   } finally { await resumed.dispose() }
 })
 
-test('presentAs, restrict, run_code, and deferContext fail closed', async () => {
+test('presentAs, restrict, and run_code fail closed', async () => {
   const ctx = new Context()
   const tools = ctx.plugin(Tools)
   await tools.await()
@@ -637,12 +637,262 @@ test('presentAs, restrict, run_code, and deferContext fail closed', async () => 
   assert.throws(() => ctx.tools.register({
     name: 'run_code', description: 'no', parameters: objectParameters, execute: () => 'x',
   }), /Code Mode is not supported/)
-  ctx.tools.register({
-    name: 'defer', description: 'Defer.', parameters: objectParameters,
-    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
-    execute(_args, exec) { exec.deferContext({ role: 'user', content: 'later' }); return 'x' },
-  })
-  await assert.rejects(ctx.tools.run('defer', {}, { callId: 'c' }), /deferContext is not supported/)
   assert.deepEqual(ctx.tools.executionMode({ name: 'missing', arguments: {} }), { kind: 'exclusive' })
   await tools.dispose()
+})
+
+test('deferContext stores text on the call and rejects unsupported messages', async () => {
+  const ctx = new Context()
+  const tools = ctx.plugin(Tools)
+  await tools.await()
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+  const output = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }
+  const parameters = { type: 'object', properties: { op: { type: 'string' } }, required: ['op'], additionalProperties: false }
+  ctx.on('tools/execute', async (exec, next) => {
+    if (exec.name !== 'defer' || exec.arguments.op !== 'hook') return next()
+    exec.deferContext({ role: 'user', content: 'from-hook-before' })
+    const result = await next()
+    exec.deferContext({ role: 'user', content: 'from-hook-after' })
+    return result
+  })
+  ctx.on('tools/execute', async (exec, next) => {
+    if (exec.name !== 'defer' || exec.arguments.op !== 'wrap') return next()
+    await next()
+    return { isError: false, content: [{ type: 'text', text: 'wrapped' }] }
+  })
+  ctx.on('tools/post-execute', async (exec, _result, next) => {
+    const decision = await next()
+    if (exec.name === 'defer' && exec.arguments.op === 'ok') {
+      return { kind: 'accept', additionalContexts: [{ role: 'user', content: 'after-hook' }] }
+    }
+    if (exec.name === 'defer' && exec.arguments.op === 'blocked') {
+      return {
+        kind: 'block',
+        feedback: [{ type: 'text', text: 'stop' }],
+        additionalContexts: [{ role: 'user', content: 'block-only' }],
+      }
+    }
+    return decision
+  })
+  ctx.tools.register({
+    name: 'defer', description: 'Defer.', parameters, output,
+    execute(args, exec) {
+      if (args.op === 'ok') {
+        exec.deferContext({ role: 'user', content: 'later' })
+        exec.deferContext({
+          id: 'm1',
+          role: 'user',
+          source: { kind: 'plugin', plugin: 'SOURCESECRET' },
+          content: [{ type: 'text', text: 'block' }, { type: 'text', text: 'two' }],
+        })
+        return 'x'
+      }
+      if (args.op === 'hook') {
+        exec.deferContext({ content: 'from-body' })
+        return 'x'
+      }
+      if (args.op === 'wrap') {
+        exec.deferContext({ role: 'user', content: 'from-body' })
+        return 'x'
+      }
+      if (args.op === 'throw') {
+        exec.deferContext({ role: 'user', content: 'kept' })
+        throw new Error('outer failure')
+      }
+      if (args.op === 'blocked') {
+        exec.deferContext({ role: 'user', content: 'dropped-by-block' })
+        return 'x'
+      }
+      if (args.op === 'image') {
+        exec.deferContext({ role: 'user', content: [{ type: 'image', mediaType: 'image/png', data: png }] })
+        return 'x'
+      }
+      if (args.op === 'extra-block') {
+        exec.deferContext({ role: 'user', content: [{ type: 'text', text: 'hi', extra: 'BLOCKSECRET' }] })
+        return 'x'
+      }
+      if (args.op === 'role') {
+        exec.deferContext({ role: 'assistant', content: 'ROLESECRET' })
+        return 'x'
+      }
+      if (args.op === 'field') {
+        exec.deferContext({ role: 'user', content: 'EXTRASECRET', note: true })
+        return 'x'
+      }
+      if (args.op === 'empty') {
+        exec.deferContext({ role: 'user', content: '' })
+        return 'x'
+      }
+      return 'x'
+    },
+  })
+  ctx.tools.register({
+    name: 'bare', description: 'Bare.', parameters,
+    execute(_args, exec) {
+      exec.deferContext({ role: 'user', content: 'BARESECRET' })
+      return 'x'
+    },
+  })
+
+  async function settle(name, op) {
+    const tool = ctx.tools.items.get(name)
+    const exec = ctx.tools.createExecution({ callId: `${name}-${op}`, name, args: { op }, tool })
+    return ctx.tools.settle(exec, await ctx.tools.executeOnly(exec))
+  }
+
+  const ok = await settle('defer', 'ok')
+  assert.equal(ok.text, 'x')
+  assert.deepEqual(ok.contexts.map((event) => event.content), ['later', 'block\ntwo', 'after-hook'])
+  assert.equal(JSON.stringify(ok).includes('SOURCESECRET'), false)
+  assert.equal(JSON.stringify(ok).includes('m1'), false)
+
+  const hooked = await settle('defer', 'hook')
+  assert.deepEqual(hooked.contexts.map((event) => event.content), ['from-hook-before', 'from-body', 'from-hook-after'])
+
+  const wrapped = await settle('defer', 'wrap')
+  assert.equal(wrapped.text, 'wrapped')
+  assert.deepEqual(wrapped.contexts.map((event) => event.content), ['from-body'])
+
+  const thrown = await settle('defer', 'throw')
+  assert.match(thrown.text, /outer failure/)
+  assert.deepEqual(thrown.contexts.map((event) => event.content), ['kept'])
+
+  const blocked = await settle('defer', 'blocked')
+  assert.match(blocked.text, /stop/)
+  assert.deepEqual(blocked.contexts.map((event) => event.content), ['block-only'])
+  assert.equal(JSON.stringify(blocked).includes('dropped-by-block'), false)
+
+  const image = await settle('defer', 'image')
+  assert.match(image.text, /only text output blocks are supported/)
+  assert.equal(image.contexts.length, 0)
+  assert.equal(image.text.includes(png), false)
+
+  const extraBlock = await settle('defer', 'extra-block')
+  assert.match(extraBlock.text, /only text output blocks are supported/)
+  assert.equal(JSON.stringify(extraBlock).includes('BLOCKSECRET'), false)
+
+  const role = await settle('defer', 'role')
+  assert.match(role.text, /Unsupported deferContext context role: assistant/)
+  assert.equal(JSON.stringify(role).includes('ROLESECRET'), false)
+
+  const field = await settle('defer', 'field')
+  assert.match(field.text, /Unsupported deferContext field 'note'/)
+  assert.equal(JSON.stringify(field).includes('EXTRASECRET'), false)
+
+  const empty = await settle('defer', 'empty')
+  assert.match(empty.text, /no text content/)
+  assert.equal(empty.contexts.length, 0)
+
+  const bare = await settle('bare', 'x')
+  assert.match(bare.text, /deferContext requires an output schema/)
+  assert.equal(JSON.stringify(bare).includes('BARESECRET'), false)
+
+  await assert.rejects(ctx.tools.run('defer', { op: 'ok' }), /tools\.run\(\) does not store deferContext/)
+  await assert.rejects(ctx.tools.run('bare', { op: 'x' }), /deferContext requires an output schema/)
+  await tools.dispose()
+})
+
+test('deferContext is committed as tools.context and replayed from JSONL', async (t) => {
+  const dir = await workspace(t)
+  const sessionPath = join(dir, 'session.jsonl')
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+  const source = `
+export const inject = ['tools', 'permissions']
+export function apply(ctx) {
+  const parameters = { type: 'object', properties: { op: { type: 'string' } }, required: ['op'], additionalProperties: false }
+  const output = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }
+  ctx.effect(() => ctx.tools.register({
+    name: 'note', description: 'Note.', parameters, output,
+    execute(args, exec) {
+      if (args.op === 'plain') {
+        exec.deferContext({ role: 'user', content: 'plain-note' })
+        exec.deferContext({
+          id: 'm1',
+          role: 'user',
+          source: { kind: 'plugin', plugin: 'SOURCESECRET' },
+          content: [{ type: 'text', text: 'block-note' }],
+        })
+        return 'plain-result'
+      }
+      if (args.op === 'fail') {
+        exec.deferContext({ role: 'user', content: 'kept-after-throw' })
+        throw new Error('outer failure')
+      }
+      if (args.op === 'blocked') {
+        exec.deferContext({ role: 'user', content: 'dropped-by-block' })
+        return 'blocked-result'
+      }
+      if (args.op === 'image') {
+        exec.deferContext({ role: 'user', content: [{ type: 'image', mediaType: 'image/png', data: '${png}' }] })
+        return 'image-result'
+      }
+      return 'other'
+    },
+  }))
+  ctx.effect(() => ctx.permissions.register('note', 'allow'))
+  ctx.on('tools/post-execute', async (exec, _result, next) => {
+    const decision = await next()
+    if (exec.name !== 'note') return decision
+    if (exec.arguments.op === 'blocked') {
+      return { kind: 'block', feedback: [{ type: 'text', text: 'stop' }], additionalContexts: [{ role: 'user', content: 'block-only' }] }
+    }
+    if (exec.arguments.op === 'plain' && decision.kind === 'accept') {
+      return { kind: 'accept', additionalContexts: [{ role: 'user', content: 'after-hook' }] }
+    }
+    return decision
+  })
+}
+`
+  await writeFile(join(dir, 'hook.mjs'), source)
+  await writeFile(join(dir, 'plugins.json'), JSON.stringify({ plugins: [{ name: 'hook', module: './hook.mjs' }] }))
+  const model = fakeProvider([
+    calls([
+      ['plain', 'note', { op: 'plain' }],
+      ['fail', 'note', { op: 'fail' }],
+      ['blocked', 'note', { op: 'blocked' }],
+      ['image', 'note', { op: 'image' }],
+    ]),
+    { role: 'assistant', content: 'done' },
+  ])
+  const app = await boot({ workspace: dir, sessionPath, pluginConfig: 'plugins.json', web: false, provider: model })
+  try {
+    await app.ctx.agent.turn('go')
+    const contexts = app.ctx.session.events.filter((event) => event.type === 'tools.context')
+    assert.deepEqual(contexts.map((event) => [event.callId, event.content]), [
+      ['plain', 'plain-note'],
+      ['plain', 'block-note'],
+      ['plain', 'after-hook'],
+      ['fail', 'kept-after-throw'],
+      ['blocked', 'block-only'],
+    ])
+    const events = app.ctx.session.events
+    const lastTool = events.findLastIndex((event) => event.type === 'message' && event.message.role === 'tool')
+    const firstContext = events.findIndex((event) => event.type === 'tools.context')
+    assert.ok(lastTool >= 0 && firstContext > lastTool)
+    const encoded = JSON.stringify(events)
+    assert.equal(encoded.includes(png), false)
+    assert.equal(encoded.includes('SOURCESECRET'), false)
+    assert.equal(encoded.includes('dropped-by-block'), false)
+    const request = model.sent[1]
+    assert.deepEqual(request.messages.filter((message) => message.role === 'user').map((message) => message.content), [
+      'go', 'plain-note', 'block-note', 'after-hook', 'kept-after-throw', 'block-only',
+    ])
+    assert.equal(request.messages.some((message) => message.role === 'tool' && message.content === 'plain-result'), true)
+    assert.equal(request.messages.some((message) => message.role === 'tool' && String(message.content).includes('outer failure')), true)
+  } finally { await app.dispose() }
+
+  await writeFile(join(dir, 'hook.mjs'), source.replaceAll('plain-note', 'REPLAYSECRET'))
+  const reader = await boot({
+    workspace: dir,
+    sessionPath,
+    pluginConfig: 'plugins.json',
+    web: false,
+    writable: false,
+    provider: fakeProvider([]),
+  })
+  try {
+    assert.equal(reader.ctx.session.messages.some((message) => message.content === 'plain-note'), true)
+    assert.equal(reader.ctx.session.messages.some((message) => message.content === 'REPLAYSECRET'), false)
+    assert.equal(reader.ctx.session.events.some((event) => event.type === 'tool.started' && event.time && event.callId === 'plain'), true)
+  } finally { await reader.dispose() }
 })
