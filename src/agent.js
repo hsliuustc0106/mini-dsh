@@ -1,7 +1,7 @@
 import { Service } from '@deepseek-ai/cordis'
 import { completeFinish, observeStream, unknownReason } from './log.js'
 import { toPreStepMessages } from './agents.js'
-import { validateArguments } from './services.js'
+import { assertRunCodeArguments, validateArguments } from './services.js'
 
 function fail(message, code) {
   const error = new Error(message)
@@ -299,12 +299,18 @@ export class Agent extends Service {
       await this.toolError(id, 'invalid arguments', report)
       return null
     }
-    if (!tools.items.has(name)) {
+    // Code mode's only direct call is reserved run_code. Other names are
+    // unknown before policy. The reserved body does not dispatch nested tools.
+    const agent = this.ctx.agents.currentInitiator() ?? this.ctx.agents.primary
+    const tool = tools.callable(name, agent)
+    if (!tool) {
       await this.deny(id, name, args, 'unknown tool', report)
       return null
     }
-    const tool = tools.items.get(name)
-    try { validateArguments(tool.parameters, args) }
+    try {
+      validateArguments(tool.parameters, args)
+      if (tool.name === 'run_code') assertRunCodeArguments(args)
+    }
     catch (error) {
       await this.toolError(id, error.message, report)
       return null

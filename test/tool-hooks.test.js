@@ -632,11 +632,11 @@ test('presentAs, restrict, and run_code fail closed', async () => {
   const ctx = new Context()
   const tools = ctx.plugin(Tools)
   await tools.await()
-  assert.throws(() => ctx.tools.presentAs('code'), /tools\.presentAs is not supported/)
+  assert.throws(() => ctx.tools.presentAs('code'), /tools\.presentAs\(\) requires agent\.ctx/)
   assert.throws(() => ctx.tools.restrict({ deny: ['read'] }), /tools\.restrict\(\) requires agent\.ctx/)
   assert.throws(() => ctx.tools.register({
     name: 'run_code', description: 'no', parameters: objectParameters, execute: () => 'x',
-  }), /Code Mode is not supported/)
+  }), /Tool run_code is reserved/)
   assert.deepEqual(ctx.tools.executionMode({ name: 'missing', arguments: {} }), { kind: 'exclusive' })
   await tools.dispose()
 })
