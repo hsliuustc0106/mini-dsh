@@ -69,12 +69,14 @@ function admits(mask, name) {
 
 const RUN_CODE_NAME = 'run_code'
 
-const RUN_CODE_DESCRIPTION = 'Code Mode entry. Call this tool with a program in code and a short description. Nested tool dispatch is not supported.'
+const PROGRAM_NOT_EXECUTED = 'run_code program is stored and was not executed'
+
+const RUN_CODE_DESCRIPTION = 'Code Mode entry. Call this tool with code and a short description. code is stored and is not executed. A JSON array of { name, arguments } objects is dispatched as nested tool calls. Any other text fails closed.'
 
 const RUN_CODE_PARAMETERS = {
   type: 'object',
   properties: {
-    code: { type: 'string', description: 'Program text. It is recorded and is not executed.' },
+    code: { type: 'string', description: 'Program text. It is stored and is not executed. A JSON array of { name, arguments } tool calls is dispatched. Any other text fails closed.' },
     description: { type: 'string', description: 'Short summary of what this program does.' },
   },
   required: ['code', 'description'],
@@ -88,14 +90,39 @@ export function assertRunCodeArguments(args) {
   if (typeof args?.description !== 'string' || args.description.trim() === '') throw new Error('description must be a non-empty string')
 }
 
-function runCodeTool() {
+// Data only. JSON.parse does not run the program. Any other shape fails closed.
+export function parseNestedDispatch(code) {
+  let value
+  try { value = JSON.parse(code) }
+  catch { throw new Error(PROGRAM_NOT_EXECUTED) }
+  if (!Array.isArray(value)) throw new Error(PROGRAM_NOT_EXECUTED)
+  return value.map((call) => {
+    if (!call || typeof call !== 'object' || Array.isArray(call)) throw new Error(PROGRAM_NOT_EXECUTED)
+    for (const key of Object.keys(call)) {
+      if (key !== 'name' && key !== 'arguments') throw new Error(PROGRAM_NOT_EXECUTED)
+    }
+    if (typeof call.name !== 'string' || !call.name) throw new Error(PROGRAM_NOT_EXECUTED)
+    if (call.name === RUN_CODE_NAME) throw new Error('run_code nested dispatch cannot call run_code')
+    if (!call.arguments || typeof call.arguments !== 'object' || Array.isArray(call.arguments)) {
+      throw new Error(PROGRAM_NOT_EXECUTED)
+    }
+    let snapshot
+    try { snapshot = snapshotJsonValue(call.arguments) }
+    catch { snapshot = undefined }
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) throw new Error(PROGRAM_NOT_EXECUTED)
+    return { name: call.name, arguments: snapshot }
+  })
+}
+
+function createRunCodeTool(tools) {
   return {
     name: RUN_CODE_NAME,
     description: RUN_CODE_DESCRIPTION,
     parameters: RUN_CODE_PARAMETERS,
-    execute(args) {
+    async execute(args, execution) {
       assertRunCodeArguments(args)
-      throw new Error('run_code nested dispatch is not supported')
+      const calls = parseNestedDispatch(args.code)
+      return tools.dispatchRunCode(calls, execution)
     },
   }
 }
@@ -122,7 +149,19 @@ export class Tools extends Service {
     this.guards = []
     this.masks = []
     this.presentations = new Map()
-    this.runCode = runCodeTool()
+    this.runCode = createRunCodeTool(this)
+  }
+  async dispatchRunCode(calls, execution) {
+    const agent = this.ctx.reflect.get('agent', false)
+    if (!agent || typeof agent.dispatchNested !== 'function' || typeof execution?.deferContext !== 'function') {
+      throw new Error('run_code nested dispatch is unavailable')
+    }
+    return agent.dispatchNested({
+      parentId: execution.callId,
+      calls,
+      signal: execution.signal,
+      deferContext: (message) => execution.deferContext(message),
+    })
   }
   register(tool, options) {
     if (typeof tool?.name !== 'string' || !tool.name) throw new Error('Tool name is required')
@@ -226,13 +265,21 @@ export class Tools extends Service {
   }
   // Direct model calls. Code mode resolves only reserved run_code; every other
   // name is absent. run_code is absent unless this agent presented as code.
-  // This does not execute a program or dispatch nested tools.
+  // The program text is not executed here.
   callable(name, agent) {
     const agentId = agent && typeof agent === 'object' && typeof agent.id === 'string' ? agent.id : undefined
     const mode = agentId ? this.presentationMode(agentId) : undefined
     if (name === RUN_CODE_NAME) return mode === 'code' ? this.runCode : undefined
     if (mode === 'code') return undefined
     return typeof name === 'string' ? this.items.get(name) : undefined
+  }
+  // Nested calls from an admitted run_code. Code mode still hides these names
+  // from the model. restrict() denies them later, on the guard path.
+  dispatchable(name, agent) {
+    if (typeof name !== 'string' || !name || name === RUN_CODE_NAME) return undefined
+    const agentId = agent && typeof agent === 'object' && typeof agent.id === 'string' ? agent.id : undefined
+    if (!agentId || this.presentationMode(agentId) !== 'code') return undefined
+    return this.items.get(name)
   }
   project(agentId) {
     return [...this.items.values()]
@@ -527,7 +574,9 @@ export class Tools extends Service {
       signal: controller.signal,
       agent,
       deferContext(context) {
-        if (!output) throw new Error('deferContext requires an output schema')
+        // Nested child contexts ride the parent run_code call. Other tools
+        // still need an output schema, and tools.run() has nowhere to store them.
+        if (!output && tool.name !== RUN_CODE_NAME) throw new Error('deferContext requires an output schema')
         if (!deferred) throw new Error('tools.run() does not store deferContext')
         pushDeferred(true, deferred, context)
       },
